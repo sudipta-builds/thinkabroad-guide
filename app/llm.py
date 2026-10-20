@@ -10,7 +10,13 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 
-def chat(messages: list[dict[str, str]], *, temperature: float = 0.4, max_tokens: int = 1200) -> str:
+def chat(
+    messages: list[dict[str, str]],
+    *,
+    temperature: float = 0.4,
+    max_tokens: int = 1200,
+    timeout: float = 45.0,
+) -> str:
     """DeepSeek chat only."""
     settings = get_settings()
     if not settings.llm_ready:
@@ -23,7 +29,7 @@ def chat(messages: list[dict[str, str]], *, temperature: float = 0.4, max_tokens
         "max_tokens": max_tokens,
     }
     try:
-        with httpx.Client(timeout=60.0) as client:
+        with httpx.Client(timeout=timeout) as client:
             resp = client.post(
                 url,
                 headers={

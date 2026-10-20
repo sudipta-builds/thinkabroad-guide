@@ -22,5 +22,5 @@ def format_job_card(index: int, job: dict[str, Any]) -> str:
         f"{index}. *{job.get('title')}* @ {job.get('company')}\n"
         f"   {loc} · sponsor: {sponsor}\n"
         f"   {url}\n"
-        f"   reply *APPLY {index}* to proceed"
+        f"   say “apply to {index}” or “apply to the first one”"
     )

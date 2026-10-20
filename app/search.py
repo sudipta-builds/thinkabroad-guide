@@ -13,12 +13,12 @@ def find_sponsored_jobs(country: str, role: str = "", *, limit: int = 5) -> list
     role = (role or "").strip() or "jobs"
 
     grounded = llm.gemini_search(
-        f"Search the live web for up to {limit} currently open jobs in {country} "
-        f"related to: {role}. Prefer roles that mention visa sponsorship, skilled worker, "
-        f"work permit, or relocation for international candidates.\n"
-        "For each job return exactly one line in this format:\n"
+        f"Find up to {limit} LIVE job openings in {country} for: {role or 'professionals'}.\n"
+        "Priority: visa sponsorship / skilled worker / work permit / relocation for internationals. "
+        "Skip pure internship spam unless relevant.\n"
+        "For each job ONE line:\n"
         "TITLE | COMPANY | CITY | APPLY_URL | sponsorship note\n"
-        "Only real https URLs (LinkedIn, Greenhouse, Lever, company careers). Never invent URLs."
+        "Only real https apply URLs (Greenhouse, Lever, Ashby, company careers, LinkedIn jobs). Never invent URLs."
     )
     return _parse_pipe_lines(grounded, country)[:limit]
 

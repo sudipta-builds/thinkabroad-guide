@@ -2,19 +2,21 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
-from pathlib import Path
-
-from app import apply_browser, cv_builder, cv_export, db, jobs, llm, media_files, screenshots, vault
+from app import apply_browser, cv_builder, cv_export, db, intent, jobs, llm, media_files, screenshots, vault
 from app.config import get_settings
 from app.reply import Reply
 
 
 WELCOME = (
-    "Hello — I'm *Guide*, your personal AI assistant to help you find jobs "
-    "(including visa-sponsored roles).\n\n"
-    "Tell me which *country* you're interested in."
+    "Hello — I'm *Guide*, your personal AI for *sponsored jobs*.\n\n"
+    "Message me naturally, e.g.\n"
+    "_Software engineer jobs in Finland with visa sponsorship_\n"
+    "_Apply to the first one_\n"
+    "_Build my CV_\n\n"
+    "I search live, build a real PDF/Word CV, and can submit applications for you."
 )
 
 
@@ -35,43 +37,14 @@ def _set_pending(phone: str, interests: dict[str, Any], pending: dict[str, Any] 
     return data
 
 
-def _extract_country(text: str) -> str | None:
-    lower = text.lower().strip()
-    mapping = [
-        ("united kingdom", "United Kingdom"),
-        ("great britain", "United Kingdom"),
-        ("england", "United Kingdom"),
-        ("scotland", "United Kingdom"),
-        ("wales", "United Kingdom"),
-        ("uk", "United Kingdom"),
-        ("norway", "Norway"),
-        ("norwegian", "Norway"),
-        ("finland", "Finland"),
-        ("finnish", "Finland"),
-        ("germany", "Germany"),
-        ("netherlands", "Netherlands"),
-        ("ireland", "Ireland"),
-        ("sweden", "Sweden"),
-        ("denmark", "Denmark"),
-        ("canada", "Canada"),
-        ("australia", "Australia"),
-        ("usa", "United States"),
-        ("united states", "United States"),
-        ("america", "United States"),
-    ]
-    for key, label in mapping:
-        if re.search(rf"\b{re.escape(key)}\b", lower):
-            return label
-    if 2 <= len(text.strip()) <= 40 and "\n" not in text and not text.lower().startswith("save "):
-        if text.strip().upper() in {
-            "HI", "HELLO", "START", "HELP", "CV", "JOBS", "STATUS", "YES", "NO", "VAULT",
-        }:
-            return None
-        if re.match(r"^APPLY\s+\d+$", text.strip().upper()):
-            return None
-        if re.fullmatch(r"[A-Za-z][A-Za-z\s\-']{1,38}", text.strip()):
-            return text.strip().title()
-    return None
+def _merge_slots(interests: dict[str, Any], slots: dict[str, Any]) -> dict[str, Any]:
+    data = dict(interests)
+    if slots.get("country"):
+        data["country"] = slots["country"]
+        data["countries"] = [slots["country"]]
+    if slots.get("role"):
+        data["target_role"] = str(slots["role"])[:200]
+    return data
 
 
 def handle_message(phone: str, body: str) -> Reply:
@@ -82,24 +55,15 @@ def handle_message(phone: str, body: str) -> Reply:
     user = db.upsert_user(phone)
     interests = _load_interests(user)
     db.add_message(phone, "user", text)
-    cmd = text.strip().upper()
 
-    # SAVE PROFILE Name | email | phone
-    profile_m = re.match(
-        r"^SAVE\s+PROFILE\s+(.+)$",
-        text.strip(),
-        flags=re.IGNORECASE | re.DOTALL,
-    )
+    # Structured SAVE commands stay exact
+    profile_m = re.match(r"^SAVE\s+PROFILE\s+(.+)$", text, flags=re.I | re.S)
     if profile_m:
         reply = _save_profile(phone, interests, profile_m.group(1))
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply)
 
-    save_m = re.match(
-        r"^SAVE\s+(\w+)\s+(\S+)\s+(.+)$",
-        text.strip(),
-        flags=re.IGNORECASE | re.DOTALL,
-    )
+    save_m = re.match(r"^SAVE\s+(\w+)\s+(\S+)\s+(.+)$", text, flags=re.I | re.S)
     if save_m:
         site = save_m.group(1)
         if site.lower() == "profile":
@@ -109,29 +73,49 @@ def handle_message(phone: str, body: str) -> Reply:
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply)
 
-    if cmd in {"HI", "HELLO", "START", "HELP"}:
-        db.add_message(phone, "assistant", WELCOME)
-        return Reply.of(WELCOME)
+    parsed = intent.classify(text, interests)
+    intent_name = str(parsed.get("intent") or "chat").lower()
+    interests = _merge_slots(interests, parsed)
+    if parsed.get("country") or parsed.get("role"):
+        db.update_user(phone, interests=interests)
 
-    if cmd == "VAULT":
-        sites = vault.list_sites(phone)
-        reply = vault.vault_help()
-        if sites:
-            reply += "\n\nSaved logins: " + ", ".join(sites)
-        if interests.get("email"):
-            reply += f"\nProfile email: {interests.get('email')}"
+    # Pending YES short-circuit
+    if intent_name == "confirm_apply" or (
+        intent_name == "apply" and interests.get("_pending_apply") and parsed.get("auto_submit")
+    ):
+        out = _confirm_apply(phone, interests)
+        db.add_message(phone, "assistant", out.text)
+        return out
+
+    if intent_name == "cancel":
+        interests = _set_pending(phone, interests, None)
+        reply = "Cancelled."
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply)
 
-    if cmd == "CV":
+    if intent_name == "greet":
+        db.add_message(phone, "assistant", WELCOME)
+        return Reply.of(WELCOME)
+
+    if intent_name == "vault":
+        reply = vault.vault_help()
+        sites = vault.list_sites(phone)
+        if sites:
+            reply += "\n\nSaved logins: " + ", ".join(sites)
+        if interests.get("email"):
+            reply += f"\nProfile: {interests.get('name') or ''} {interests.get('email')}"
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply)
+
+    if intent_name == "cv":
         out = _build_and_send_cv(phone, interests, user)
         db.add_message(phone, "assistant", out.text)
         return out
 
-    if cmd == "STATUS":
+    if intent_name == "status":
         apps = db.list_applications(phone)
         if not apps:
-            reply = "No applications yet."
+            reply = "No applications yet. Tell me a country + role and I'll find sponsored jobs."
         else:
             lines = [
                 f"• {a.get('title') or a.get('job_id')} @ {a.get('company') or '?'} — *{a.get('status')}*"
@@ -141,87 +125,107 @@ def handle_message(phone: str, body: str) -> Reply:
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply)
 
-    if cmd == "JOBS" or "find job" in text.lower() or "search job" in text.lower():
-        out = _run_job_search(phone, interests, with_screenshots=True)
+    if intent_name == "apply":
+        idx = int(parsed.get("index") or 0)
+        auto = bool(parsed.get("auto_submit"))
+        out = _start_apply(phone, interests, idx)
+        # Agentic: user said apply for me / apply now → submit immediately if profile ready
+        if auto and interests.get("email") and interests.get("_pending_apply"):
+            out2 = _confirm_apply(phone, _load_interests(db.get_user(phone) or {}))
+            combined = Reply(
+                text=out.text + "\n\nSubmitting now…\n\n" + out2.text,
+                media_urls=(out.media_urls or []) + (out2.media_urls or []),
+            )
+            db.add_message(phone, "assistant", combined.text)
+            return combined
         db.add_message(phone, "assistant", out.text)
         return out
 
-    apply_m = re.match(r"^APPLY\s+(\d+)$", cmd)
-    if apply_m:
-        out = _start_apply(phone, interests, int(apply_m.group(1)) - 1)
-        db.add_message(phone, "assistant", out.text)
-        return out
-
-    if cmd == "YES":
-        out = _confirm_apply(phone, interests)
-        db.add_message(phone, "assistant", out.text)
-        return out
-
-    if cmd == "NO":
-        interests = _set_pending(phone, interests, None)
-        reply = "Cancelled."
-        db.add_message(phone, "assistant", reply)
-        return Reply.of(reply)
-
-    if not interests.get("country"):
-        country = _extract_country(text)
-        if country:
-            interests["country"] = country
-            interests["countries"] = [country]
-            db.update_user(phone, interests=interests)
+    if intent_name == "search":
+        if not interests.get("country"):
             reply = (
-                f"Got it — *{country}*.\n\n"
-                "What kind of job are you looking for? "
-                "(role, skills, experience — write it in your own words)"
+                "Which *country* should I search for sponsored roles?\n"
+                "(You can also send everything in one line: _data analyst, Norway, visa sponsorship_)"
             )
             db.add_message(phone, "assistant", reply)
             return Reply.of(reply)
-        db.add_message(phone, "assistant", WELCOME)
-        return Reply.of(WELCOME)
+        if not interests.get("target_role"):
+            # Use raw message as role if classifier didn't extract
+            interests["target_role"] = text[:200]
+            db.update_user(phone, interests=interests)
+        out = _run_job_search(phone, interests)
+        db.add_message(phone, "assistant", out.text)
+        return out
 
-    interests["target_role"] = text.strip()[:200]
-    interests["raw_notes"] = ((interests.get("raw_notes") or "") + "\n" + text.strip()).strip()[-2000:]
-    skills = list(interests.get("skills") or [])
-    for token in re.findall(
-        r"\b(python|java|react|node|typescript|sql|aws|azure|nursing|excel|salesforce|sap)\b",
-        text.lower(),
-    ):
-        if token not in skills:
-            skills.append(token)
-    if skills:
-        interests["skills"] = skills
-    db.update_user(phone, interests=interests)
+    # chat / set_profile / unknown — if looks like a job request, search; else short agent reply
+    if not interests.get("country") and intent._extract_slots(text).get("country"):
+        interests = _merge_slots(interests, intent._extract_slots(text))
+        db.update_user(phone, interests=interests)
 
-    history = db.recent_messages(phone, 20)
-    cv = cv_builder.build_cv_markdown(interests, history)
-    db.update_user(phone, cv_markdown=cv)
+    slots = intent._extract_slots(text)
+    if slots.get("country") or slots.get("role") or re.search(r"\b(job|sponsor|visa|role)\b", text, re.I):
+        interests = _merge_slots(interests, slots)
+        if not interests.get("target_role"):
+            interests["target_role"] = text[:200]
+        db.update_user(phone, interests=interests)
+        if not interests.get("country"):
+            reply = "Got it. Which *country* for sponsored jobs?"
+            db.add_message(phone, "assistant", reply)
+            return Reply.of(reply)
+        out = _run_job_search(phone, interests)
+        db.add_message(phone, "assistant", out.text)
+        return out
 
-    search_out = _run_job_search(phone, interests, with_screenshots=True)
-    intro = (
-        f"Thanks — searching live for *{interests.get('target_role')}* in "
-        f"*{interests.get('country')}* (preferring sponsorship where possible).\n\n"
+    # Lightweight chat (sponsored-jobs domain), no long essays
+    reply = _quick_chat(text, interests)
+    db.add_message(phone, "assistant", reply)
+    return Reply.of(reply)
+
+
+def _quick_chat(text: str, interests: dict[str, Any]) -> str:
+    country = interests.get("country") or "your target country"
+    role = interests.get("target_role") or "your target role"
+    answer = llm.chat(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "You are Guide, a WhatsApp agent that FINDS and APPLIES to sponsored jobs. "
+                    "Be short. Push toward action: search or apply. No fluff."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"User: {text}\nKnown: country={country}, role={role}\n"
+                    "Reply under 500 chars. If they want jobs, tell them to name country+role."
+                ),
+            },
+        ],
+        temperature=0.3,
+        max_tokens=220,
+        timeout=20.0,
     )
-    out = Reply(text=intro + search_out.text, media_urls=search_out.media_urls)
-    db.add_message(phone, "assistant", out.text)
-    return out
+    return answer or (
+        "I can search sponsored roles and apply for you. "
+        "Try: _software engineer in Finland with visa sponsorship_"
+    )
 
 
-def _run_job_search(phone: str, interests: dict[str, Any], *, with_screenshots: bool) -> Reply:
+def _run_job_search(phone: str, interests: dict[str, Any]) -> Reply:
     settings = get_settings()
     country = interests.get("country") or ""
     role = interests.get("target_role") or ""
     if not country:
-        return Reply.of(WELCOME)
-    if not settings.search_ready and not settings.llm_ready:
-        return Reply.of(
-            "Search isn't configured yet (need GEMINI_API_KEY + DEEPSEEK_API_KEY on the server)."
-        )
+        return Reply.of("Which country should I search?")
+    if not settings.search_ready:
+        return Reply.of("Search isn't configured (need GEMINI_API_KEY).")
 
-    matches = jobs.search_and_cache(str(country), str(role), limit=5)
+    matches = jobs.search_and_cache(str(country), str(role), limit=3)
     if not matches:
         return Reply.of(
-            f"I searched the live web for *{role or 'jobs'}* in *{country}* "
-            "but didn't get clean listings. Try a more specific role, or send *JOBS* again."
+            f"No clean sponsored listings for *{role or 'jobs'}* in *{country}* right now. "
+            "Try a more specific role."
         )
 
     interests = dict(interests)
@@ -229,26 +233,13 @@ def _run_job_search(phone: str, interests: dict[str, Any], *, with_screenshots: 
     db.update_user(phone, interests=interests)
 
     cards = "\n\n".join(jobs.format_job_card(i + 1, m) for i, m in enumerate(matches))
-    vault_hint = ""
-    if not vault.list_sites(phone):
-        vault_hint = "\n\nTo apply with your login later: send *VAULT*."
-
-    media: list[str] = []
-    if with_screenshots:
-        # Screenshot top 2 listing pages so user can preview before APPLY
-        for m in matches[:2]:
-            url = m.get("apply_url") or ""
-            shot = screenshots.screenshot_public_url(url) if url else None
-            if shot:
-                media.append(shot)
-
-    text = (
-        "Live web results (links below). I've attached page screenshots when available — "
-        "review them, then reply *APPLY 1* (or another number).\n\n"
-        + cards
-        + vault_hint
+    hint = (
+        "\n\nSay *apply to the first one* or *apply for me* — I'll prepare CV + submit."
+        if interests.get("email")
+        else "\n\nBefore I can submit: *SAVE PROFILE Name | email | phone*"
     )
-    return Reply(text=text, media_urls=media)
+    text = f"Sponsored / sponsor-likely roles in *{country}*:\n\n{cards}{hint}"
+    return Reply.of(text)
 
 
 def _save_profile(phone: str, interests: dict[str, Any], raw: str) -> str:
@@ -263,13 +254,13 @@ def _save_profile(phone: str, interests: dict[str, Any], raw: str) -> str:
     if phone_n:
         interests["phone"] = phone_n
     db.update_user(phone, interests=interests, display_name=name)
-    return f"Profile saved: *{name}* · {email}" + (f" · {phone_n}" if phone_n else "")
+    return f"Profile saved: *{name}* · {email}" + (f" · {phone_n}" if phone_n else "") + "\nI can apply for you now."
 
 
 def _ensure_cv_files(phone: str, interests: dict[str, Any], user: dict[str, Any]) -> dict[str, Path]:
     md = user.get("cv_markdown") or ""
     if not md:
-        history = db.recent_messages(phone, 20)
+        history = db.recent_messages(phone, 12)
         md = cv_builder.build_cv_markdown(interests, history)
         db.update_user(phone, cv_markdown=md)
     stem = re.sub(r"[^a-zA-Z0-9]+", "-", (interests.get("name") or "guide-cv"))[:30]
@@ -282,7 +273,7 @@ def _ensure_cv_files(phone: str, interests: dict[str, Any], user: dict[str, Any]
 
 
 def _build_and_send_cv(phone: str, interests: dict[str, Any], user: dict[str, Any]) -> Reply:
-    history = db.recent_messages(phone, 20)
+    history = db.recent_messages(phone, 12)
     cv = cv_builder.build_cv_markdown(interests, history)
     db.update_user(phone, cv_markdown=cv)
     files = _ensure_cv_files(phone, interests, {**user, "cv_markdown": cv})
@@ -291,78 +282,78 @@ def _build_and_send_cv(phone: str, interests: dict[str, Any], user: dict[str, An
         url = media_files.public_url_for(files[key])
         if url:
             media.append(url)
-    text = (
-        "Your CV is ready as *PDF* and *Word* (attached when the public URL is set).\n\n"
-        + cv[:2500]
-    )
+    text = "CV ready (PDF + Word attached when possible).\n\n" + cv[:2200]
     if not media:
-        text += (
-            "\n\n_(Files saved on server. Set GUIDE_PUBLIC_URL on Render so WhatsApp can attach them.)_"
-        )
+        text += "\n\n_Set GUIDE_PUBLIC_URL on Render to attach files on WhatsApp._"
     return Reply(text=text, media_urls=media)
 
 
 def _start_apply(phone: str, interests: dict[str, Any], idx: int) -> Reply:
     match_ids = interests.get("_last_matches") or []
+    if not match_ids:
+        return Reply.of("No jobs loaded yet. Tell me a country + role first (e.g. engineer in Norway).")
     if idx < 0 or idx >= len(match_ids):
-        return Reply.of("Send *JOBS* first, then *APPLY 1*.")
+        idx = 0
     job = db.get_job(match_ids[idx])
     if not job:
-        return Reply.of("That listing expired. Send *JOBS* to search again.")
+        return Reply.of("That listing expired — ask me to search again.")
 
     user = db.get_user(phone) or {}
     files = _ensure_cv_files(phone, interests, user)
     cover = _draft_cover(interests, job)
     db.upsert_application(phone, job["id"], "drafted", draft_cover=cover)
-    _set_pending(
+    interests = _set_pending(
         phone,
         interests,
         {"job_id": job["id"], "title": job.get("title"), "company": job.get("company")},
     )
 
     apply_url = job.get("apply_url") or ""
-    shot = screenshots.screenshot_public_url(apply_url) if apply_url else None
-    media = [m for m in [
-        shot,
-        media_files.public_url_for(files["pdf"]),
-        media_files.public_url_for(files["docx"]),
-    ] if m]
+    shot = screenshots.mshots_url(apply_url) if apply_url else None
+    media = [m for m in [shot, media_files.public_url_for(files["pdf"]), media_files.public_url_for(files["docx"])] if m]
 
     if not interests.get("email"):
         return Reply(
             text=(
-                f"Almost ready for *{job.get('title')}* @ {job.get('company')}.\n"
-                f"Link: {apply_url}\n\n"
-                "I need your details before I can submit.\n"
-                "Send: *SAVE PROFILE Full Name | you@email.com | +phone*\n"
-                "Then reply *APPLY " + str(idx + 1) + "* again, then *YES*."
+                f"Selected *{job.get('title')}* @ {job.get('company')}.\n{apply_url}\n\n"
+                "I need your details to submit:\n"
+                "*SAVE PROFILE Full Name | you@email.com | +phone*\n"
+                "Then say *apply for me* or *YES*."
             ),
             media_urls=media,
         )
 
-    text = (
-        f"Ready to *submit* for *{job.get('title')}* @ {job.get('company')} "
-        f"({job.get('country')}).\n\n"
-        f"Link: {apply_url}\n\n"
-        f"I'll upload your CV (PDF/Word), fill the form, and paste this cover note:\n"
-        f"{cover[:800]}\n\n"
-        "Screenshot of the posting is attached when available.\n\n"
-        "Reply *YES* to apply now, or *NO* to cancel."
+    return Reply(
+        text=(
+            f"Ready to submit *{job.get('title')}* @ {job.get('company')} ({job.get('country')}).\n"
+            f"{apply_url}\n\n"
+            f"CV attached. Cover note:\n{cover[:700]}\n\n"
+            "Reply *YES* / *apply now* and I'll submit in the browser."
+        ),
+        media_urls=media,
     )
-    return Reply(text=text, media_urls=media)
 
 
 def _confirm_apply(phone: str, interests: dict[str, Any]) -> Reply:
     pending = interests.get("_pending_apply") or {}
     if not pending.get("job_id"):
-        return Reply.of("Nothing pending. Search jobs, then *APPLY N*.")
+        # Agentic fallback: apply to first cached match
+        match_ids = interests.get("_last_matches") or []
+        if match_ids:
+            prepared = _start_apply(phone, interests, 0)
+            interests = _load_interests(db.get_user(phone) or {})
+            if not interests.get("email"):
+                return prepared
+            pending = interests.get("_pending_apply") or {}
+        if not pending.get("job_id"):
+            return Reply.of("Nothing to apply to yet. Search jobs first, then say *apply to the first one*.")
+
     job_id = pending["job_id"]
     job = db.get_job(job_id) or {}
     user = db.get_user(phone) or {}
     files = _ensure_cv_files(phone, interests, user)
     cover = ""
-    apps = db.list_applications(phone)
-    for a in apps:
+    for a in db.list_applications(phone):
         if a.get("job_id") == job_id and a.get("draft_cover"):
             cover = a["draft_cover"]
             break
@@ -375,6 +366,9 @@ def _confirm_apply(phone: str, interests: dict[str, Any]) -> Reply:
         "phone": str(interests.get("phone") or ""),
         "linkedin": "",
     }
+    if not profile["email"]:
+        return Reply.of("I need *SAVE PROFILE Name | email | phone* before I can submit.")
+
     creds = vault.unlock_login(phone, "linkedin") or vault.unlock_login(phone, "email")
     if creds and "@" in creds.get("username", "") and not profile["email"]:
         profile["email"] = creds["username"]
@@ -387,11 +381,10 @@ def _confirm_apply(phone: str, interests: dict[str, Any]) -> Reply:
         profile=profile,
         credentials=creds,
     )
-    status = "applied" if result.ok else "failed"
     db.upsert_application(
         phone,
         job_id,
-        status,
+        "applied" if result.ok else "failed",
         draft_cover=cover,
         notes=result.message[:500],
     )
@@ -408,7 +401,7 @@ def _confirm_apply(phone: str, interests: dict[str, Any]) -> Reply:
             media.append(u)
 
     text = (
-        f"{'Applied' if result.ok else 'Could not fully submit'} — "
+        f"{'Submitted' if result.ok else 'Tried to submit'} — "
         f"*{pending.get('title')}* @ {pending.get('company')}.\n"
         f"{result.message}\n"
         f"{result.final_url or job.get('apply_url') or ''}"
@@ -417,22 +410,25 @@ def _confirm_apply(phone: str, interests: dict[str, Any]) -> Reply:
 
 
 def _draft_cover(interests: dict[str, Any], job: dict[str, Any]) -> str:
-    prompt = (
-        f"Write a short cover note for this role.\n"
-        f"Job: {job.get('title')} at {job.get('company')} ({job.get('country')})\n"
-        f"Candidate: {json.dumps({k: v for k, v in interests.items() if not str(k).startswith('_')})}\n"
-        "Plain text, 3 short paragraphs max."
+    # Prefer fast template; LLM only if ready and quick
+    base = (
+        f"I am applying for {job.get('title')} at {job.get('company')}. "
+        f"I am seeking opportunities in {interests.get('country')} and am open to visa sponsorship."
     )
+    if not get_settings().llm_ready:
+        return base
     text = llm.chat(
         [
-            {"role": "system", "content": "You write tight job cover notes."},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": "Write a tight 2-paragraph cover note. Plain text only."},
+            {
+                "role": "user",
+                "content": (
+                    f"Job: {job.get('title')} @ {job.get('company')} ({job.get('country')})\n"
+                    f"Candidate role: {interests.get('target_role')}\nSkills: {interests.get('skills')}"
+                ),
+            },
         ],
-        max_tokens=400,
+        max_tokens=250,
+        timeout=15.0,
     )
-    if text:
-        return text
-    return (
-        f"I am applying for {job.get('title')} at {job.get('company')}. "
-        f"I am interested in opportunities in {interests.get('country')}."
-    )
+    return text or base

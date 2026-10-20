@@ -16,16 +16,17 @@ class Settings(BaseSettings):
     guide_public_url: str = ""
     guide_db_path: str = "data/guide.db"
 
-    # DeepSeek only — chat, CV, cover drafts (same stack as ThinkAbroad Compass)
+    # DeepSeek — chat, CV, cover drafts
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     deepseek_model: str = "deepseek-chat"
 
-    # Brave only — live web job search
-    brave_api_key: str = Field(
+    # Gemini — live job search (Google Search grounding). Same as ThinkAbroad.
+    gemini_api_key: str = Field(
         default="",
-        validation_alias=AliasChoices("BRAVE_API_KEY", "BRAVE_SEARCH_API_KEY"),
+        validation_alias=AliasChoices("GEMINI_API_KEY", "Gemini_API_KEY"),
     )
+    gemini_model: str = "gemini-flash-lite-latest"
 
     vault_secret_key: str = ""
     log_level: str = "INFO"
@@ -40,7 +41,7 @@ class Settings(BaseSettings):
 
     @property
     def search_ready(self) -> bool:
-        return bool(self.brave_api_key)
+        return bool(self.gemini_api_key)
 
     @property
     def vault_ready(self) -> bool:

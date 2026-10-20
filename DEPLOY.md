@@ -31,8 +31,9 @@ git push -u origin main
 | `TWILIO_ACCOUNT_SID` | Same as ThinkAbroad |
 | `TWILIO_AUTH_TOKEN` | Same as ThinkAbroad |
 | `TWILIO_WHATSAPP_FROM` | Same as ThinkAbroad (or a new Guide number) |
-| `DEEPSEEK_API_KEY` | Same as ThinkAbroad — chat/CV only |
-| `BRAVE_API_KEY` | Same as ThinkAbroad — live job search only |
+| `DEEPSEEK_API_KEY` | Same as ThinkAbroad — chat/CV |
+| `GEMINI_API_KEY` | Same as ThinkAbroad `Gemini_API_KEY` — live job search |
+| `GEMINI_MODEL` | `gemini-flash-lite-latest` |
 | `VAULT_SECRET_KEY` | New long random string (or Render generate) |
 | `GUIDE_DB_PATH` | `/var/data/guide.db` |
 | `GUIDE_PUBLIC_URL` | `https://YOUR-GUIDE-SERVICE.onrender.com` (set after first deploy) |

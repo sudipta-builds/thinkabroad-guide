@@ -13,13 +13,15 @@ No web UI. No ThinkAbroad linkage. Users only text Guide.
 5. User: `APPLY 1` → cover draft → `YES` to confirm.
 6. Optional: `SAVE LINKEDIN email password` stores encrypted logins in Guide's **vault** for future browser apply.
 
-## Providers (no fallbacks)
+## Providers
 
 | Service | Role |
 |--------|------|
 | **DeepSeek** | Chat, CV, cover drafts |
-| **Brave Search** | Live web job search |
+| **Gemini** (`gemini-flash-lite-latest` + Google Search) | Live job search |
 | **Twilio** | WhatsApp (same account as ThinkAbroad) |
+
+Brave is not used (it was rate-limited).
 
 ## Screenshots + links
 
@@ -45,7 +47,7 @@ Reuse the **existing ThinkAbroad Twilio account** — paste the same `TWILIO_*` 
 
 ## Env
 
-See `.env.example`. Required: `TWILIO_*` + `DEEPSEEK_API_KEY` + `BRAVE_API_KEY`. Vault: `VAULT_SECRET_KEY`.
+See `.env.example`. Required: `TWILIO_*` + `DEEPSEEK_API_KEY` + `GEMINI_API_KEY` (or `Gemini_API_KEY`). Vault: `VAULT_SECRET_KEY`.
 
 ## Commands
 

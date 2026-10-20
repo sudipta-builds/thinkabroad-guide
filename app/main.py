@@ -22,7 +22,7 @@ def on_startup() -> None:
     logging.getLogger().setLevel(settings.log_level.upper())
     db.init_db()
     logger.info(
-        "Guide ready v%s twilio=%s deepseek=%s brave=%s vault=%s public=%s",
+        "Guide ready v%s twilio=%s deepseek=%s gemini=%s vault=%s public=%s",
         __version__,
         settings.twilio_ready,
         settings.llm_ready,
@@ -43,7 +43,7 @@ def health() -> JSONResponse:
             "version": __version__,
             "twilio": settings.twilio_ready,
             "deepseek": settings.llm_ready,
-            "brave": settings.search_ready,
+            "gemini": settings.search_ready,
             "vault": settings.vault_ready,
         }
     )

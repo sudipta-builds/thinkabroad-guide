@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+from urllib.parse import parse_qs
 
-from fastapi import APIRouter, Form, Request, Response
+from fastapi import APIRouter, Request, Response
 from twilio.twiml.messaging_response import MessagingResponse
 
 from app import agent
@@ -15,21 +16,24 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+async def _form_fields(request: Request) -> dict[str, str]:
+    """Parse Twilio urlencoded POST without python-multipart / FastAPI Form()."""
+    raw = await request.body()
+    parsed = parse_qs(raw.decode("utf-8", errors="replace"), keep_blank_values=True)
+    return {k: (v[0] if v else "") for k, v in parsed.items()}
+
+
 @router.post("/whatsapp")
-async def twilio_whatsapp_inbound(
-    request: Request,
-    From: str = Form(default=""),
-    Body: str = Form(default=""),
-    MessageSid: str = Form(default=""),
-):
+async def twilio_whatsapp_inbound(request: Request):
     """Twilio WhatsApp webhook — HTTPS URL on Render.
 
     Example: https://YOUR-GUIDE-SERVICE.onrender.com/whatsapp
     """
-    _ = request
-    phone = digits_only(From)
-    body = (Body or "").strip()
-    logger.info("Inbound WA from %s sid=%s len=%s", phone, MessageSid, len(body))
+    fields = await _form_fields(request)
+    phone = digits_only(fields.get("From", ""))
+    body = (fields.get("Body") or "").strip()
+    message_sid = fields.get("MessageSid", "")
+    logger.info("Inbound WA from %s sid=%s len=%s", phone, message_sid, len(body))
 
     try:
         reply = agent.handle_message(phone, body)
@@ -38,7 +42,6 @@ async def twilio_whatsapp_inbound(
         reply = Reply.of("Something went wrong on my side. Try again in a moment.")
 
     settings = get_settings()
-    # Prefer REST when media (screenshots) is present — TwiML media is flaky with multiple URLs
     if reply.media_urls and settings.twilio_ready:
         send_whatsapp(phone, reply)
         return Response(content=str(MessagingResponse()), media_type="application/xml")

@@ -2,22 +2,14 @@
 
 Code is ready in `C:\thinkabroad-guide`. Finish these steps in the dashboards.
 
-## 1. Push this repo to GitHub
+## 1. GitHub — done
 
-```powershell
-cd C:\thinkabroad-guide
-git config user.email "you@example.com"
-git config user.name "Your Name"
-git add -A
-git commit -m "Guide WhatsApp agent: live search, screenshots, vault"
-# Create empty GitHub repo "thinkabroad-guide", then:
-git remote add origin https://github.com/YOUR_USER/thinkabroad-guide.git
-git push -u origin main
-```
+Repo: https://github.com/sudipta-builds/thinkabroad-guide  
+Branch `main` is pushed.
 
-## 2. New Render Web Service (same account as ThinkAbroad)
+## 2. New Render Web Service (same account as ThinkAbroad) — you do this
 
-- **New → Web Service** → connect `thinkabroad-guide`
+- **New → Web Service** → connect `sudipta-builds/thinkabroad-guide`
 - Instance: **Starter** (not free — free sleeps and breaks WhatsApp)
 - Build: `pip install -r requirements.txt`
 - Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`

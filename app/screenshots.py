@@ -68,9 +68,7 @@ def _download_mshot(page_url: str) -> Path | None:
 
 
 def media_path(filename: str) -> Path | None:
-    """Safe path resolve under data/media."""
-    name = Path(filename).name
-    if not re.fullmatch(r"[a-f0-9]{16,}\.(jpg|jpeg|png|webp)", name, flags=re.I):
-        return None
-    path = _MEDIA_DIR / name
-    return path if path.is_file() else None
+    """Safe path resolve under data/media (images + CV docs)."""
+    from app.media_files import media_path as _mp
+
+    return _mp(filename)

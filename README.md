@@ -1,64 +1,32 @@
 # Guide
 
-WhatsApp-only personal AI assistant that finds (and later applies to) jobs — including visa-sponsored roles.
+WhatsApp-only personal AI that finds **and applies** to jobs (including sponsored roles).
 
-No web UI. No ThinkAbroad linkage. Users only text Guide.
+No web UI. No ThinkAbroad linkage.
 
 ## Conversation
 
-1. Guide: *Hello — I'm Guide, your personal AI assistant to help you find jobs. Tell me which country you're interested in.*
-2. User types a country (free text — not a menu).
-3. Guide asks for the kind of job; user writes it in their own words.
-4. Guide **searches the live web** (no seeded job list), returns matches.
-5. User: `APPLY 1` → cover draft → `YES` to confirm.
-6. Optional: `SAVE LINKEDIN email password` stores encrypted logins in Guide's **vault** for future browser apply.
+1. `HI` → ask country (free text)
+2. User describes the job they want
+3. Live Gemini search → links + screenshots
+4. `SAVE PROFILE Name | email | phone` (required to submit)
+5. Optional: `SAVE LINKEDIN email password`
+6. `CV` → real **PDF + Word** CV (sent on WhatsApp when `GUIDE_PUBLIC_URL` is set)
+7. `APPLY N` → preview + CV files → `YES` → **Playwright submits** (Greenhouse / Lever / generic forms), uploads CV, fills cover note, returns result screenshot
+
+Sites with CAPTCHA / heavy auth may not fully submit; Guide says so clearly.
 
 ## Providers
 
 | Service | Role |
 |--------|------|
-| **DeepSeek** | Chat, CV, cover drafts |
-| **Gemini** (`gemini-flash-lite-latest` + Google Search) | Live job search |
-| **Twilio** | WhatsApp (same account as ThinkAbroad) |
+| **DeepSeek** | Chat, CV text, cover notes |
+| **Gemini** | Live job search |
+| **Twilio** | WhatsApp |
+| **Playwright (Chromium)** | Real form submit + CV upload |
 
-Brave is not used (it was rate-limited).
+## Deploy
 
-## Screenshots + links
+See [DEPLOY.md](DEPLOY.md). Render build installs Chromium via Playwright.
 
-After a live search, Guide sends **job links in text** and **page screenshots** (top results) on WhatsApp so you can review before `APPLY N`. On `APPLY N` it sends another screenshot of that listing plus the cover draft, then waits for `YES`.
-
-## Cloud — do you need a server?
-
-**Yes.** Twilio must POST inbound WhatsApp messages to a public HTTPS URL that is always on. See [DEPLOY.md](DEPLOY.md).
-
-| Need | Why |
-|------|-----|
-| **Always-on cloud API** (e.g. Render Starter) | WhatsApp webhook + Guide brain + SQLite + vault |
-| **Persistent disk** | Survive restarts (DB + vault ciphertext) |
-| **Cloud browser later** (Browserbase / similar) | Log into LinkedIn/ATS with vault credentials and submit applies |
-
-Render is enough for the brain + vault + web search. You do **not** need a separate VPS for v1. You **will** need a cloud browser service when auto-apply goes live.
-
-## Twilio
-
-Reuse the **existing ThinkAbroad Twilio account** — paste the same `TWILIO_*` env vars into Guide's Render service. Point the WhatsApp webhook (or a dedicated sender number) at:
-
-`https://YOUR-GUIDE-SERVICE.onrender.com/whatsapp`
-
-## Env
-
-See `.env.example`. Required: `TWILIO_*` + `DEEPSEEK_API_KEY` + `GEMINI_API_KEY` (or `Gemini_API_KEY`). Vault: `VAULT_SECRET_KEY`.
-
-## Commands
-
-| Message | Action |
-|---------|--------|
-| `HI` | Welcome + ask country |
-| free text | Country → role → live search |
-| `JOBS` | Search again |
-| `APPLY N` | Draft cover + confirm |
-| `YES` / `NO` | Confirm / cancel apply |
-| `CV` | Show CV draft |
-| `STATUS` | Applications |
-| `VAULT` | How to save logins |
-| `SAVE LINKEDIN email pass` | Encrypt login into vault |
+Required env: `TWILIO_*`, `DEEPSEEK_API_KEY`, `GEMINI_API_KEY`, `VAULT_SECRET_KEY`, `GUIDE_PUBLIC_URL`, `GUIDE_DB_PATH`.

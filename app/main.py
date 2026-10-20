@@ -56,12 +56,19 @@ def root() -> dict:
 
 @app.get("/media/{filename}")
 def serve_media(filename: str):
-    """Public screenshot files for Twilio WhatsApp MediaUrl."""
+    """Public screenshots + CV files for Twilio WhatsApp MediaUrl."""
     path = screenshots.media_path(filename)
     if not path:
         raise HTTPException(status_code=404, detail="Not found")
     suffix = path.suffix.lower()
-    media = "image/jpeg" if suffix in {".jpg", ".jpeg"} else "image/png"
+    media = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }.get(suffix, "application/octet-stream")
     return FileResponse(path, media_type=media)
 
 

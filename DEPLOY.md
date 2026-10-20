@@ -56,11 +56,16 @@ Twilio Console → Messaging → WhatsApp sandbox / sender:
 1. Text `HI` on WhatsApp → Guide welcome + ask country  
 2. Type a country → describe a job  
 3. You should get **live links + screenshots** of top results  
-4. `APPLY 1` → screenshot again + cover draft → `YES`
+4. `SAVE PROFILE Your Name | you@email.com | +phone`
+5. `APPLY 1` → CV PDF/Word + screenshot → `YES` → Guide attempts real browser submit
+
+## Apply automation note
+
+Render build runs `playwright install chromium`. Prefer a **Starter** instance with enough RAM; apply runs headless Chromium on the same service.
 
 ## What I cannot do from here
 
 - Create the Render service in your account  
 - Paste secrets into Render  
 - Change Twilio webhook  
-- Create GitHub remote without your login (`gh` not installed; git user identity not set)  
+- Create GitHub remote without your login  

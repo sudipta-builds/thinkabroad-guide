@@ -22,11 +22,10 @@ def on_startup() -> None:
     logging.getLogger().setLevel(settings.log_level.upper())
     db.init_db()
     logger.info(
-        "Guide ready v%s twilio=%s gemini=%s deepseek=%s search=%s vault=%s public=%s",
+        "Guide ready v%s twilio=%s deepseek=%s brave=%s vault=%s public=%s",
         __version__,
         settings.twilio_ready,
-        settings.gemini_ready,
-        settings.deepseek_ready,
+        settings.llm_ready,
         settings.search_ready,
         settings.vault_ready,
         bool(settings.guide_public_url),
@@ -43,9 +42,8 @@ def health() -> JSONResponse:
             "channel": "whatsapp",
             "version": __version__,
             "twilio": settings.twilio_ready,
-            "gemini": settings.gemini_ready,
-            "deepseek": settings.deepseek_ready,
-            "search": settings.search_ready,
+            "deepseek": settings.llm_ready,
+            "brave": settings.search_ready,
             "vault": settings.vault_ready,
         }
     )

@@ -198,8 +198,7 @@ def _run_job_search(phone: str, interests: dict[str, Any], *, with_screenshots: 
         return Reply.of(WELCOME)
     if not settings.search_ready and not settings.llm_ready:
         return Reply.of(
-            "I need GEMINI_API_KEY (or BRAVE_API_KEY + DEEPSEEK_API_KEY) on the server "
-            "before I can search the web."
+            "Search isn't configured yet (need BRAVE_API_KEY + DEEPSEEK_API_KEY on the server)."
         )
 
     matches = jobs.search_and_cache(str(country), str(role), limit=5)

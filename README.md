@@ -13,15 +13,13 @@ No web UI. No ThinkAbroad linkage. Users only text Guide.
 5. User: `APPLY 1` → cover draft → `YES` to confirm.
 6. Optional: `SAVE LINKEDIN email password` stores encrypted logins in Guide's **vault** for future browser apply.
 
-## LLM choice
+## Providers (no fallbacks)
 
-| Model | Role |
+| Service | Role |
 |--------|------|
-| **Gemini** (+ Google Search grounding) | Best for *finding* real jobs on the web |
-| **DeepSeek** | Best cheap chat + CV / cover drafts |
-| **Brave Search** | Fallback search if Gemini grounding isn't available |
-
-Set both Gemini + DeepSeek when possible. Guide will use each where it's strongest.
+| **DeepSeek** | Chat, CV, cover drafts |
+| **Brave Search** | Live web job search |
+| **Twilio** | WhatsApp (same account as ThinkAbroad) |
 
 ## Screenshots + links
 
@@ -47,7 +45,7 @@ Reuse the **existing ThinkAbroad Twilio account** — paste the same `TWILIO_*` 
 
 ## Env
 
-See `.env.example`. Minimum to search jobs: `TWILIO_*` + (`GEMINI_API_KEY` or `BRAVE_API_KEY`) + preferably `DEEPSEEK_API_KEY`. For vault: `VAULT_SECRET_KEY`.
+See `.env.example`. Required: `TWILIO_*` + `DEEPSEEK_API_KEY` + `BRAVE_API_KEY`. Vault: `VAULT_SECRET_KEY`.
 
 ## Commands
 

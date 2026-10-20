@@ -27,8 +27,11 @@ Branch `main` is pushed.
 | `GEMINI_API_KEY` | Same as ThinkAbroad `Gemini_API_KEY` — live job search |
 | `GEMINI_MODEL` | `gemini-flash-lite-latest` |
 | `VAULT_SECRET_KEY` | New long random string (or Render generate) |
-| `GUIDE_DB_PATH` | `/var/data/guide.db` |
+| `GUIDE_DB_PATH` | Prefer `/var/data/guide.db` **only if** you attached a disk at `/var/data`. Otherwise use `data/guide.db` (or omit — Guide falls back automatically). |
+| `PYTHON_VERSION` | `3.12.8` (optional but recommended) |
 | `GUIDE_PUBLIC_URL` | `https://YOUR-GUIDE-SERVICE.onrender.com` (set after first deploy) |
+
+**Disk:** Render → Guide service → **Disks** → add disk, mount path `/var/data`. If you skip the disk, remove `GUIDE_DB_PATH=/var/data/...` or set it to `data/guide.db`.
 
 ## 3. Twilio WhatsApp webhook
 

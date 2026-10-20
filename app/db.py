@@ -11,15 +11,53 @@ from typing import Any, Iterator
 from app.config import get_settings
 
 _lock = threading.Lock()
+_resolved_db_path: Path | None = None
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def resolve_db_path() -> Path:
+    """Pick a writable SQLite path. /var/data needs a Render disk mount."""
+    global _resolved_db_path
+    if _resolved_db_path is not None:
+        return _resolved_db_path
+
+    candidates = [
+        Path(get_settings().guide_db_path or "data/guide.db"),
+        Path("data/guide.db"),
+        Path("/tmp/guide.db"),
+    ]
+    # de-dupe while preserving order
+    seen: set[str] = set()
+    ordered: list[Path] = []
+    for p in candidates:
+        key = str(p)
+        if key not in seen:
+            seen.add(key)
+            ordered.append(p)
+
+    last_err: Exception | None = None
+    for path in ordered:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # prove writable
+            probe = path.parent / ".guide_write_probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            _resolved_db_path = path
+            return path
+        except OSError as exc:
+            last_err = exc
+            continue
+    raise PermissionError(
+        f"No writable DB path. Tried {[str(p) for p in ordered]}. Last error: {last_err}"
+    )
+
+
 def _connect() -> sqlite3.Connection:
-    path = Path(get_settings().guide_db_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = resolve_db_path()
     conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")

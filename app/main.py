@@ -20,10 +20,12 @@ app.include_router(whatsapp_router)
 def on_startup() -> None:
     settings = get_settings()
     logging.getLogger().setLevel(settings.log_level.upper())
+    db_path = db.resolve_db_path()
     db.init_db()
     logger.info(
-        "Guide ready v%s twilio=%s deepseek=%s gemini=%s vault=%s public=%s",
+        "Guide ready v%s db=%s twilio=%s deepseek=%s gemini=%s vault=%s public=%s",
         __version__,
+        db_path,
         settings.twilio_ready,
         settings.llm_ready,
         settings.search_ready,

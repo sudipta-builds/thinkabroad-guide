@@ -32,9 +32,10 @@ def on_startup() -> None:
         threading.Thread(target=ensure_chromium, name="chromium-install", daemon=True).start()
     start_price_watch()
     logger.info(
-        "Guide travel agent ready v%s db=%s twilio=%s deepseek=%s gemini=%s vault=%s public=%s chromium=%s",
+        "Guide travel agent ready v%s db=%s meta_wa=%s twilio=%s deepseek=%s gemini=%s vault=%s public=%s chromium=%s",
         __version__,
         db_path,
+        settings.meta_wa_ready,
         settings.twilio_ready,
         settings.llm_ready,
         settings.search_ready,
@@ -57,6 +58,8 @@ def health() -> JSONResponse:
             "agent": "travel",
             "channel": "whatsapp",
             "version": __version__,
+            "meta_wa": settings.meta_wa_ready,
+            "meta_verify": settings.meta_verify_ready,
             "twilio": settings.twilio_ready,
             "deepseek": settings.llm_ready,
             "gemini": settings.search_ready,

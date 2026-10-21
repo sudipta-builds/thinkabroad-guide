@@ -13,6 +13,19 @@ class Settings(BaseSettings):
     twilio_auth_token: str = ""
     twilio_whatsapp_from: str = ""
 
+    # Meta WhatsApp Cloud API (preferred for Guide when set)
+    whatsapp_token: str = Field(default="", validation_alias=AliasChoices("WHATSAPP_TOKEN", "META_WA_TOKEN"))
+    whatsapp_phone_number_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("WHATSAPP_PHONE_NUMBER_ID", "META_WA_PHONE_NUMBER_ID"),
+    )
+    whatsapp_verify_token: str = Field(
+        default="",
+        validation_alias=AliasChoices("WHATSAPP_VERIFY_TOKEN", "META_WA_VERIFY_TOKEN"),
+    )
+    whatsapp_graph_version: str = Field(default="v21.0", validation_alias=AliasChoices("GRAPH_API_VERSION", "WHATSAPP_GRAPH_VERSION"))
+    meta_app_secret: str = Field(default="", validation_alias=AliasChoices("META_APP_SECRET", "APP_SECRET"))
+
     guide_public_url: str = ""
     guide_db_path: str = "data/guide.db"
 
@@ -35,6 +48,14 @@ class Settings(BaseSettings):
     @property
     def twilio_ready(self) -> bool:
         return bool(self.twilio_account_sid and self.twilio_auth_token and self.twilio_whatsapp_from)
+
+    @property
+    def meta_wa_ready(self) -> bool:
+        return bool(self.whatsapp_token and self.whatsapp_phone_number_id)
+
+    @property
+    def meta_verify_ready(self) -> bool:
+        return bool(self.whatsapp_verify_token)
 
     @property
     def llm_ready(self) -> bool:

@@ -137,6 +137,26 @@ class IntentGuards(unittest.TestCase):
         self.assertNotIn("once more", spoken.lower())
 
 
+class MetaWebhookVerify(unittest.TestCase):
+    def test_verify_challenge_matches_token(self) -> None:
+        from app import meta_wa
+        from app.config import get_settings
+
+        get_settings.cache_clear()
+        os.environ["WHATSAPP_VERIFY_TOKEN"] = "guide_wa_verify_2026"
+        get_settings.cache_clear()
+        try:
+            self.assertEqual(
+                meta_wa.verify_challenge("subscribe", "guide_wa_verify_2026", "CHALLENGE99"),
+                "CHALLENGE99",
+            )
+            self.assertIsNone(meta_wa.verify_challenge("subscribe", "wrong", "CHALLENGE99"))
+            self.assertIsNone(meta_wa.verify_challenge("unsubscribe", "guide_wa_verify_2026", "CHALLENGE99"))
+        finally:
+            os.environ.pop("WHATSAPP_VERIFY_TOKEN", None)
+            get_settings.cache_clear()
+
+
 class TypingAndSpeed(unittest.TestCase):
     def test_typing_form_is_the_whatsapp_indicator(self) -> None:
         url, payload = typing_form("SMabc123")

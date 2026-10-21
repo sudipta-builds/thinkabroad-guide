@@ -56,6 +56,10 @@ def composing(phone: str):
 
 def send_typing(message_sid: str) -> bool:
     settings = get_settings()
+    if settings.meta_wa_ready:
+        from app.meta_wa import send_typing as meta_typing
+
+        return meta_typing(message_sid)
     url, payload = typing_form(message_sid)
     if not settings.twilio_ready or not payload["messageId"]:
         return False
@@ -132,10 +136,14 @@ def send_whatsapp_text(to_phone: str, body: str) -> bool:
 
 
 def send_whatsapp(to_phone: str, reply: Reply) -> bool:
-    """Send text and optional media (screenshots) via Twilio REST."""
+    """Send text and optional media via Meta Cloud API when configured, else Twilio."""
     settings = get_settings()
+    if settings.meta_wa_ready:
+        from app.meta_wa import send_whatsapp as meta_send
+
+        return meta_send(to_phone, reply)
     if not settings.twilio_ready:
-        logger.warning("Twilio not configured — skip send")
+        logger.warning("WhatsApp not configured (Meta or Twilio) — skip send")
         return False
     from_num = settings.twilio_whatsapp_from
     if not from_num.startswith("whatsapp:"):

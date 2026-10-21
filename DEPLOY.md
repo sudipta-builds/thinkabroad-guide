@@ -34,18 +34,33 @@ Branch `main` is pushed.
 
 **Disk:** Render → Guide service → **Disks** → add disk, mount path `/var/data`. If you skip the disk, remove `GUIDE_DB_PATH=/var/data/...` or set it to `data/guide.db`.
 
-## 3. Twilio WhatsApp webhook
+## 3. Meta WhatsApp Cloud API (preferred)
 
-Twilio Console → Messaging → WhatsApp sandbox / sender:
+Meta App → WhatsApp → Configuration → Webhook:
 
-- When a message comes in: `https://YOUR-GUIDE-SERVICE.onrender.com/whatsapp`
+- **Callback URL:** `https://thinkabroad-guide.onrender.com/webhook/whatsapp`
+- **Verify token:** same as Render env `WHATSAPP_VERIFY_TOKEN` (e.g. `guide_wa_verify_2026`)
+- Subscribe to **messages**
+
+Render env (required for Meta):
+
+| Key | Notes |
+|-----|--------|
+| `WHATSAPP_TOKEN` | Graph API access token |
+| `WHATSAPP_PHONE_NUMBER_ID` | From API setup |
+| `WHATSAPP_VERIFY_TOKEN` | Must match Meta form |
+| `GRAPH_API_VERSION` | `v21.0` (optional) |
+
+Deploy this code **before** clicking **Verify and save** in Meta.
+
+### Twilio (legacy fallback)
+
+Twilio Console → WhatsApp sender:
+
+- When a message comes in: `https://thinkabroad-guide.onrender.com/whatsapp`
 - Method: **HTTP POST**
 
-**Important:** If the same number still points at ThinkAbroad, inbound chat will go there instead. Either:
-
-- Point this number’s webhook at Guide, or  
-- Use the WhatsApp **sandbox** for Guide first, or  
-- Buy/add a second WhatsApp sender for Guide.
+If Meta is configured, outbound replies use Meta even when inbound still arrives via Twilio.
 
 ## 4. Smoke test
 

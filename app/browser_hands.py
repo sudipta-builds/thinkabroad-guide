@@ -7,6 +7,8 @@ import logging
 import os
 import re
 import socket
+import subprocess
+import sys
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
@@ -37,22 +39,86 @@ REFUSE_CARD = "Refused. Card numbers, CVV, and OTP are not typed or saved."
 
 
 def chromium_ready() -> bool:
-    """True when the Playwright package can see a Chromium binary. Cached."""
-    cached = getattr(chromium_ready, "_value", None)
-    if cached is not None:
-        return bool(cached)
-    ok = False
-    try:
-        _prefer_render_browsers()
-        from playwright.sync_api import sync_playwright
+    """True when a Chromium binary is already on disk. A miss is not cached."""
+    if getattr(chromium_ready, "_ok", False):
+        return True
+    root = _find_browser_root()
+    if root is None:
+        return False
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(root)
+    setattr(chromium_ready, "_ok", True)
+    logger.info("Chromium found at %s", root)
+    return True
 
-        with sync_playwright() as playwright:
-            ok = Path(playwright.chromium.executable_path).is_file()
+
+def ensure_chromium() -> None:
+    """Download Chromium onto the persistent disk if the build did not ship it."""
+    if chromium_ready():
+        return
+    dest = _install_dir()
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("Cannot create Chromium dir %s: %s", dest, exc)
+        return
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(dest)
+    logger.info("Installing Chromium into %s", dest)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            timeout=600,
+            check=False,
+        )
     except Exception as exc:
-        logger.warning("Chromium check failed: %s", type(exc).__name__)
-        ok = False
-    setattr(chromium_ready, "_value", ok)
-    return ok
+        logger.warning("Chromium install failed: %s", type(exc).__name__)
+        return
+    if result.returncode != 0:
+        logger.warning("Chromium install exited %s", result.returncode)
+        return
+    setattr(chromium_ready, "_ok", False)
+    chromium_ready()
+
+
+def _install_dir() -> Path:
+    data = Path("/var/data")
+    if data.is_dir() and os.access(data, os.W_OK):
+        return data / "ms-playwright"
+    return Path(__file__).resolve().parents[1] / ".playwright"
+
+
+def _find_browser_root() -> Path | None:
+    roots: list[Path] = []
+    env = (os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or "").strip()
+    if env and env != "0":
+        roots.append(Path(env))
+    app_root = Path(__file__).resolve().parents[1]
+    roots.extend(
+        [
+            _install_dir(),
+            app_root / ".playwright",
+            Path("/opt/render/project/src/.playwright"),
+            Path.home() / ".cache" / "ms-playwright",
+            Path.home() / "AppData" / "Local" / "ms-playwright",
+        ]
+    )
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _has_chromium(root):
+            return root
+    return None
+
+
+def _has_chromium(root: Path) -> bool:
+    if not root.is_dir():
+        return False
+    for name in ("chrome", "chrome.exe", "headless_shell"):
+        if any(root.glob(f"chromium*/**/{name}")):
+            return True
+    return False
 
 
 def prices_in(text: str) -> list[int]:
@@ -108,9 +174,9 @@ def url_allowed(url: str, *, allow_local: bool = False) -> str | None:
 
 
 def _prefer_render_browsers() -> None:
-    custom = Path("/opt/render/project/src/.playwright")
-    if custom.is_dir():
-        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(custom)
+    root = _find_browser_root()
+    if root is not None:
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(root)
 
 
 def _profile_dir(phone: str) -> Path:

@@ -11,7 +11,7 @@ Branch `main` is pushed.
 
 - **New → Web Service** → connect `sudipta-builds/thinkabroad-guide`
 - Instance: **Starter** (not free — free sleeps and breaks WhatsApp)
-- Build: `pip install -r requirements.txt && PLAYWRIGHT_BROWSERS_PATH=/opt/render/project/src/.playwright python -m playwright install chromium`
+- Build: `pip install -r requirements.txt && python -m playwright install-deps chromium && PLAYWRIGHT_BROWSERS_PATH="$PWD/.playwright" python -m playwright install chromium`
 - Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
 - **Disk**: 1 GB at `/var/data`
 - Health check path: `/health`

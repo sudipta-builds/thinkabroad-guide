@@ -22,10 +22,14 @@ def on_startup() -> None:
     logging.getLogger().setLevel(settings.log_level.upper())
     db_path = db.resolve_db_path()
     db.init_db()
-    from app.browser_hands import chromium_ready
+    from app.browser_hands import chromium_ready, ensure_chromium
     from app.travel_agent import start_price_watch
 
     browser_ok = chromium_ready()
+    if not browser_ok:
+        import threading
+
+        threading.Thread(target=ensure_chromium, name="chromium-install", daemon=True).start()
     start_price_watch()
     logger.info(
         "Guide travel agent ready v%s db=%s twilio=%s deepseek=%s gemini=%s vault=%s public=%s chromium=%s",

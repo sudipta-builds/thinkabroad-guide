@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 import re
 from datetime import date, timedelta
 from typing import Any
@@ -215,9 +216,55 @@ def _clean_place(raw: str) -> str:
     return text
 
 
+def week_window(text: str) -> tuple[str, str] | None:
+    """First/second/third/fourth/last week of a named month, as ISO start and end."""
+    lower = (text or "").lower()
+    month_names = "|".join(sorted(_MONTHS, key=len, reverse=True))
+    match = re.search(
+        rf"\b(first|1st|second|2nd|third|3rd|fourth|4th|last)\s+week(?:\s+of)?(?:\s+({month_names}))?\b",
+        lower,
+    )
+    if not match or not match.group(2):
+        return None
+    month = _MONTHS[match.group(2)]
+    today = date.today()
+    year = today.year
+    start_day, end_day = _week_span(match.group(1), year, month)
+    end = _safe_date(year, month, end_day, today)
+    if end < today:
+        year += 1
+        start_day, end_day = _week_span(match.group(1), year, month)
+    start = _safe_date(year, month, start_day, today)
+    end = _safe_date(year, month, end_day, today)
+    return start.isoformat(), end.isoformat()
+
+
+def _week_span(which: str, year: int, month: int) -> tuple[int, int]:
+    last = calendar.monthrange(year, month)[1]
+    table = {
+        "first": (1, 7),
+        "1st": (1, 7),
+        "second": (8, 14),
+        "2nd": (8, 14),
+        "third": (15, 21),
+        "3rd": (15, 21),
+        "fourth": (22, min(28, last)),
+        "4th": (22, min(28, last)),
+        "last": (max(1, last - 6), last),
+    }
+    return table[which]
+
+
 def _extract_date(text: str) -> tuple[date, bool]:
     today = date.today()
     lower = text.lower()
+
+    if re.search(r"\b(?:first|1st|second|2nd|third|3rd|fourth|4th|last)\s+week\b", lower):
+        window = week_window(text)
+        if window:
+            year, month, day = (int(part) for part in window[0].split("-"))
+            return date(year, month, day), False
+        return today, True
 
     iso = re.search(r"\b(20\d{2})-(\d{2})-(\d{2})\b", lower)
     if iso:
@@ -298,9 +345,14 @@ def parse_updates(text: str) -> dict[str, Any]:
             out["origin"], out["destination"] = names[0], names[1]
         elif len(names) == 1:
             out["place"] = names[0]
-    when = explicit_date(text)
-    if when:
-        out["depart"] = when
+    window = week_window(text)
+    if window:
+        out["depart"], out["depart_until"] = window
+    else:
+        when = explicit_date(text)
+        if when:
+            out["depart"] = when
+            out["depart_until"] = ""
     if re.search(r"\bone[\s-]?way\b|\boneway\b", text or "", re.I):
         out["round_trip"] = False
     elif re.search(r"\b(return|round[\s-]?trip|two[\s-]?way)\b", text or "", re.I):

@@ -212,6 +212,11 @@ def _merge(state: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
             data["_place_action"] = "swap"
     if updates.get("depart"):
         data["depart"] = updates["depart"]
+    if "depart_until" in updates:
+        if updates.get("depart_until"):
+            data["depart_until"] = updates["depart_until"]
+        else:
+            data.pop("depart_until", None)
     if "round_trip" in updates:
         data["trip_type"] = "return" if updates["round_trip"] else "one_way"
     return data

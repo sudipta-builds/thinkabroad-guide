@@ -9,7 +9,7 @@ from pathlib import Path
 
 from app.browser_hands import looks_like_card, payment_control, should_capture
 from app.config import get_settings
-from app.intent import explicit_date
+from app.intent import explicit_date, week_window
 from app.travel_agent import (
     _force_browse,
     _human_reply,
@@ -26,6 +26,16 @@ class DateAndMemory(unittest.TestCase):
         self.assertEqual(explicit_date("check for 30th Nov"), "2026-11-30")
         self.assertEqual(explicit_date("jorhat to bengaluru, 23rd nov, cheapest"), "2026-11-23")
         self.assertEqual(explicit_date("Nov 30"), "2026-11-30")
+
+    def test_first_week_of_december_is_not_1_november(self) -> None:
+        self.assertIsNone(explicit_date("1st week"))
+        self.assertEqual(explicit_date("jorhat to bengaluru, 1st week of december"), "2026-12-01")
+        self.assertEqual(week_window("first week of dec"), ("2026-12-01", "2026-12-07"))
+        prior = [{"role": "user", "body": "jorhat to bengaluru, 1st week of december"}]
+        state = _recover_trip({"depart": "2026-11-01"}, prior, "1st week")
+        self.assertEqual(state["depart"], "2026-12-01")
+        self.assertEqual(state["depart_until"], "2026-12-07")
+        self.assertIn("2026-12-01 through 2026-12-07", " ".join(_memory_lines(state)))
 
     def test_same_ones_keeps_the_saved_trip(self) -> None:
         prior = [{"role": "user", "body": "jorhat to bengaluru, 23rd nov, cheapest"}]
@@ -75,10 +85,28 @@ class IntentGuards(unittest.TestCase):
         self.assertIn("Jorhat", spoken)
         self.assertIn("2026-11-23", spoken)
 
+    def test_busy_keeps_the_agents_own_sentence(self) -> None:
+        trip = {"origin": "Jorhat", "destination": "Bengaluru", "depart": "2026-12-01", "depart_until": "2026-12-07"}
+        spoken = _human_reply(trip, "Cleartrip is open and I'm reading the fares.", browsing=False, busy=True)
+        self.assertEqual(spoken, "Cleartrip is open and I'm reading the fares.")
+
+    def test_denial_is_replaced_with_the_saved_week(self) -> None:
+        trip = {"origin": "Jorhat", "destination": "Bengaluru", "depart": "2026-12-01", "depart_until": "2026-12-07"}
+        spoken = _human_reply(
+            trip,
+            "I don't have those details saved on my side yet. Please send them once more.",
+            browsing=False,
+            busy=True,
+        )
+        self.assertIn("2026-12-01 through 2026-12-07", spoken)
+        self.assertNotIn("once more", spoken.lower())
+
 
 class LivePageGuards(unittest.TestCase):
     def test_blank_page_is_not_sent(self) -> None:
-        self.assertFalse(should_capture("Google Flights\nWhere from?"))
+        self.assertFalse(should_capture(""))
+        self.assertFalse(should_capture("Loading"))
+        self.assertTrue(should_capture("Google Flights\nWhere from?"))
         self.assertTrue(should_capture("IndiGo 6E 123 Rs 11,620"))
         self.assertTrue(should_capture("Please verify you are not a robot"))
 

@@ -139,11 +139,15 @@ def page_blocked(text: str) -> bool:
 
 
 def should_capture(text: str) -> bool:
-    """Keep a screenshot when the page has fares, a block, or real text. Skip a blank load."""
+    """Keep a screenshot of a real page. Skip a blank or still-loading document."""
     if prices_in(text) or page_blocked(text):
         return True
     body = re.sub(r"\s+", " ", text or "").strip()
-    return len(body) > 180
+    if len(body) > 180:
+        return True
+    return len(body) > 20 and bool(
+        re.search(r"flight|fare|passenger|cleartrip|indigo|makemytrip|where from|where to", body, re.I)
+    )
 
 
 def looks_like_card(value: str) -> bool:
@@ -209,6 +213,7 @@ class BrowserSession:
         self.unsent: list[Path] = []
         self.last_text = ""
         self.allow_local = False
+        self.progress = 0
         self._pw: object | None = None
         self._browser: object | None = None
         self._context: object | None = None
@@ -270,12 +275,12 @@ class BrowserSession:
         if not allowed:
             return "That address is not a public web page, so it was not opened."
         assert self.page is not None
-        self.page.goto(allowed, wait_until="domcontentloaded", timeout=45000)
+        self.page.goto(allowed, wait_until="domcontentloaded", timeout=28000)
         self._dismiss()
         try:
-            self.page.wait_for_selector("text=/₹|Rs\\.?\\s*\\d|INR\\s*\\d/", timeout=8000)
+            self.page.wait_for_selector("text=/₹|Rs\\.?\\s*\\d|INR\\s*\\d/", timeout=6000)
         except Exception:
-            self.page.wait_for_timeout(2500)
+            self.page.wait_for_timeout(2000)
         return self._observe(shoot=True)
 
     def read_page(self) -> str:

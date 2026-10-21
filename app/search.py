@@ -12,6 +12,10 @@ _PLACES: dict[str, tuple[str, str, bool]] = {
     "rowriah": ("JRH", "Jorhat", True),
     "bengaluru": ("BLR", "Bengaluru", True),
     "bangalore": ("BLR", "Bengaluru", True),
+    "begaluru": ("BLR", "Bengaluru", True),
+    "bangaluru": ("BLR", "Bengaluru", True),
+    "banglore": ("BLR", "Bengaluru", True),
+    "bangalor": ("BLR", "Bengaluru", True),
     "bengaluru airport": ("BLR", "Bengaluru", True),
     "blr": ("BLR", "Bengaluru", True),
     "delhi": ("DEL", "Delhi", True),
@@ -99,7 +103,14 @@ _PLACES: dict[str, tuple[str, str, bool]] = {
 
 def resolve_place(name: str) -> tuple[str, str, bool] | None:
     key = re.sub(r"\s+", " ", (name or "").strip().lower())
-    return _PLACES.get(key)
+    if key in _PLACES:
+        return _PLACES[key]
+    if len(key) < 5 or not key.replace(" ", "").isalpha():
+        return None
+    import difflib
+
+    match = difflib.get_close_matches(key, [item for item in _PLACES if len(item) > 4], n=1, cutoff=0.82)
+    return _PLACES[match[0]] if match else None
 
 
 def mentioned_places(text: str) -> list[str]:
@@ -114,6 +125,18 @@ def mentioned_places(text: str) -> list[str]:
                 continue
             occupied.append(span)
             found.append((span[0], name))
+    for token in re.finditer(r"[A-Za-z]{5,}", raw):
+        span = token.span()
+        if any(span[0] < end and span[1] > start for start, end in occupied):
+            continue
+        hit = resolve_place(token.group(0))
+        if not hit:
+            continue
+        key = hit[1].lower() if hit[1].lower() in _PLACES else ""
+        if not key:
+            continue
+        occupied.append(span)
+        found.append((span[0], key))
     ordered = [name for _, name in sorted(found)]
     out: list[str] = []
     seen: set[str] = set()

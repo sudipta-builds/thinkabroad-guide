@@ -26,30 +26,41 @@ def whatsapp_address(phone: str) -> str:
 
 
 def send_reaction(to_phone: str, message_sid: str, emoji: str) -> bool:
-    """Attach an emoji to the inbound WhatsApp message.
-
-    Twilio's public send API often rejects this. A False return means the
-    caller should show the emoji on the reply instead.
-    """
+    """React on the inbound WhatsApp bubble. Never sends the emoji as a new text."""
     settings = get_settings()
     emoji = (emoji or "").strip()
     message_sid = (message_sid or "").strip()
     if not settings.twilio_ready or not emoji or not message_sid:
         return False
+    from_num = settings.twilio_whatsapp_from
+    if not from_num.startswith("whatsapp:"):
+        from_num = whatsapp_address(from_num)
+    auth = (settings.twilio_account_sid, settings.twilio_auth_token)
+    attempts = [
+        (
+            f"https://api.twilio.com/2010-04-01/Accounts/{settings.twilio_account_sid}/Messages.json",
+            {
+                "From": from_num,
+                "To": whatsapp_address(to_phone),
+                "ReactionEmoji": emoji,
+                "ReactionMessageSid": message_sid,
+            },
+        ),
+        (
+            f"https://api.twilio.com/2010-04-01/Accounts/{settings.twilio_account_sid}/Messages/{message_sid}/Reactions.json",
+            {"Emoji": emoji},
+        ),
+    ]
     try:
-        with httpx.Client(timeout=8.0) as client:
-            resp = client.post(
-                f"https://api.twilio.com/2010-04-01/Accounts/{settings.twilio_account_sid}/Messages/{message_sid}/Reactions.json",
-                data={"Emoji": emoji},
-                auth=(settings.twilio_account_sid, settings.twilio_auth_token),
-            )
-        if resp.status_code >= 300:
-            logger.info("WhatsApp reaction not accepted %s", resp.status_code)
-            return False
-        return True
+        with httpx.Client(timeout=6.0) as client:
+            for url, payload in attempts:
+                resp = client.post(url, data=payload, auth=auth)
+                if resp.status_code < 300:
+                    return True
+                logger.info("WhatsApp reaction not accepted %s", resp.status_code)
     except Exception as exc:
         logger.info("WhatsApp reaction failed: %s", type(exc).__name__)
-        return False
+    return False
 
 
 def send_whatsapp_text(to_phone: str, body: str) -> bool:

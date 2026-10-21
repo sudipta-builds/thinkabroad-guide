@@ -41,9 +41,8 @@ async def twilio_whatsapp_inbound(request: Request):
         logger.exception("Guide agent failed")
         reply = Reply.of("Something went wrong on my side. Try again in a moment.", emoji="⚠️")
 
-    if reply.emoji and not send_reaction(phone, message_sid, reply.emoji):
-        if not (reply.text or "").startswith(reply.emoji):
-            reply.text = f"{reply.emoji} {reply.text}".strip()
+    if reply.emoji and message_sid:
+        send_reaction(phone, message_sid, reply.emoji)
 
     settings = get_settings()
     if reply.media_urls and settings.twilio_ready:

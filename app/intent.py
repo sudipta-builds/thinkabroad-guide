@@ -262,6 +262,18 @@ def _extract_date(text: str) -> tuple[date, bool]:
             if delta == 0 or re.search(rf"\bnext {name}\b", lower):
                 delta = 7 if delta == 0 else delta
             return today + timedelta(days=delta), False
+    bare = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)\b", lower)
+    if bare:
+        day = int(bare.group(1))
+        year, month = today.year, today.month
+        found = _safe_date(year, month, day, today)
+        if found < today:
+            month += 1
+            if month == 13:
+                month, year = 1, year + 1
+            found = _safe_date(year, month, day, today)
+        if found != today or day == today.day:
+            return found, False
     return today + timedelta(days=1), True
 
 

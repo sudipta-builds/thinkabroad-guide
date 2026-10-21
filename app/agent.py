@@ -16,6 +16,7 @@ _VOICE = (
     "reply: 1 or 2 short sentences. No bullets, no \"Reply YES\", no option menus.\n"
     "Do not invent prices, airlines, or flight times. A screenshot shows the fares.\n"
     "Never say a ticket is booked or that payment happened.\n"
+    "Never say a search is still running, and never promise screenshots later.\n"
     "Do not start with Yes unless allowed_to_agree is true.\n"
     "Ask only for the missing piece. If when is already filled, do not ask the date again.\n"
     "reaction: one emoji for their message. 👍 when you understood, ✈️ when results are ready, "
@@ -90,19 +91,26 @@ def handle_message(phone: str, body: str) -> Reply:
     flights: list[dict[str, Any]] = []
     if action == "search":
         flights, state = _search(phone, state)
-        facts = _facts(state)
-        facts["action"] = "search"
+        spoken = _results_line(state)
+        link = _google_link(flights)
+        if link and link not in spoken:
+            spoken = spoken.rstrip() + "\n" + link
+        reaction = reaction or "👍"
+    elif action == "show":
+        flights = _cached(state)
+        spoken = _results_line(state)
+        link = _google_link(flights)
+        if link and link not in spoken:
+            spoken = spoken.rstrip() + "\n" + link
+        reaction = reaction or "👍"
+        action = "search"
     if action == "status":
         facts["bookings"] = _status_text(phone)
     if spoken is None:
         spoken, reaction = _speak(action, facts, prior, text)
     elif not reaction:
         reaction = _default_reaction(action)
-    if action == "search":
-        link = _google_link(flights)
-        if link and link not in spoken:
-            spoken = spoken.rstrip() + "\n" + link
-    elif action == "book_yes":
+    if action == "book_yes":
         pending = state.get("_pending_book") or {}
         job = db.get_job(str(pending.get("flight_id") or "")) or {}
         url = str(pending.get("url") or job.get("apply_url") or "")
@@ -143,20 +151,31 @@ def _resolve(
     if kind == "vault":
         return "chat", state, _facts(state, "chat"), vault.vault_help(), "🔐"
 
+    if _wants_results(text):
+        if _ready(state):
+            state["route_explicit"] = True
+            state["asking"] = ""
+            return "search", state, _facts(state, "search"), None, "👍"
+        if state.get("_last_matches"):
+            return "show", state, _facts(state, "search"), None, "👍"
+        facts = _facts(state, "ask")
+        state["asking"] = _missing(state) or "route"
+        return "ask", state, facts, _fallback("ask", facts), "👍"
+
     if kind == "confirm":
         if state.get("asking") == "book" and state.get("_pending_book"):
             facts = _facts(state, "book_yes", allowed=True)
             facts["option"] = str((state.get("_pending_book") or {}).get("company") or "")
             return "book_yes", state, facts, None, ""
-        if state.get("asking") == "confirm" and _ready(state):
+        if _ready(state):
             state["route_explicit"] = True
             state["asking"] = ""
-            return "search", state, _facts(state, "search"), None, ""
+            return "search", state, _facts(state, "search"), None, "👍"
         if state.get("_last_matches") and state.get("asking") not in {"confirm", "date", "route", "trip_type"}:
             return _arm_book(state, 0)
-        missing = _missing(state)
-        state["asking"] = missing or "route"
-        return "ask", state, _facts(state, "ask"), None, ""
+        facts = _facts(state, "ask")
+        state["asking"] = _missing(state) or "route"
+        return "ask", state, facts, _fallback("ask", facts), "👍"
 
     picked = _book_choice(text, updates)
     if picked is not None and not (updates.get("origin") and updates.get("destination")):
@@ -178,16 +197,19 @@ def _resolve(
 
     if state.get("origin") and state.get("destination") and state.get("depart") and not state.get("trip_type"):
         state["asking"] = "trip_type"
-        return "ask", state, _facts(state, "ask"), None, ""
+        facts = _facts(state, "ask")
+        return "ask", state, facts, _fallback("ask", facts), "👍"
 
     if state.get("origin") and state.get("destination") and not state.get("route_explicit") and updates:
         state["asking"] = "confirm"
-        return "confirm", state, _facts(state, "confirm"), None, ""
+        facts = _facts(state, "confirm")
+        return "confirm", state, facts, _fallback("confirm", facts), "👍"
 
     if not state.get("origin") or not state.get("destination") or not state.get("depart"):
         if updates or kind in {"search", "book"}:
             state["asking"] = _missing(state) or "route"
-            return "ask", state, _facts(state, "ask"), None, ""
+            facts = _facts(state, "ask")
+            return "ask", state, facts, _fallback("ask", facts), "👍"
 
     data = llm.converse(_READ, _packet(state, prior, text))
     action, state, facts, spoken, reaction = _apply_model(data, state, text, prior)
@@ -205,12 +227,18 @@ def _merge(state: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
         if data.get("asking") == "confirm" and _same_place(place, str(data.get("destination") or "")):
             data["route_explicit"] = True
             data["_place_action"] = "echo"
+        elif not data.get("origin") and not data.get("destination") and updates.get("depart"):
+            data["destination"] = place
+            data["_place_action"] = "fill"
         elif not data.get("origin"):
             data["origin"] = place
+            if data.get("destination"):
+                data["route_explicit"] = True
             data["_place_action"] = "fill"
         elif not data.get("destination"):
             data["destination"] = place
-            data["route_explicit"] = True
+            if data.get("origin"):
+                data["route_explicit"] = True
             data["_place_action"] = "fill"
         else:
             data["destination"] = place
@@ -390,6 +418,19 @@ def _speak(action: str, facts: dict[str, Any], prior: list[dict[str, Any]], text
     return reply, reaction
 
 
+def _wants_results(text: str) -> bool:
+    raw = (text or "").strip()
+    if re.fullmatch(r"\?+|how long\??", raw, re.I):
+        return True
+    return bool(re.search(r"\b(screenshots?|show me|the results|the flights|the options)\b", raw, re.I))
+
+
+def _results_line(state: dict[str, Any]) -> str:
+    facts = _facts(state, "search")
+    trip = facts["trip"] if facts["trip"] != "not said" else "one way"
+    return f"{facts['origin']} to {facts['destination']}, {facts['when']}, {trip}. Nothing booked."
+
+
 def _fallback(action: str, facts: dict[str, Any]) -> str:
     origin = facts.get("origin") or ""
     dest = facts.get("destination") or ""
@@ -422,8 +463,12 @@ def _fallback(action: str, facts: dict[str, Any]) -> str:
         if facts.get("missing") in {"date", "trip_type"}:
             return f"{route}. Which date, and one-way or return?" if route else "Which date, and one-way or return?"
         if origin and not dest:
+            if when:
+                return f"From {origin} on {when}. Where to, and one-way or return?"
             return f"From {origin}. Where to?"
         if dest and not origin:
+            if when:
+                return f"{dest} on {when}. Flying from where, and one-way or return?"
             return f"To {dest}. Flying from where?"
         return "Where from and where to?"
     return "Tell me the cities and a date and I'll pull the flights."

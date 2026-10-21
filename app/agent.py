@@ -65,7 +65,7 @@ def _finish(phone: str, state: dict[str, Any], reply: Reply) -> Reply:
     return reply
 
 
-def handle_message(phone: str, body: str) -> Reply:
+def handle_message(phone: str, body: str, message_sid: str = "") -> Reply:
     text = (body or "").strip()
     if not text:
         return Reply.of("Hey. Where are you flying, and when?", emoji="👋")
@@ -88,7 +88,7 @@ def handle_message(phone: str, body: str) -> Reply:
 
     from app.travel_agent import handle_turn
 
-    return handle_turn(phone, text, state, prior)
+    return handle_turn(phone, text, state, prior, message_sid=message_sid)
 
 
 def _resolve(

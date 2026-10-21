@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 
 from app.browser_hands import looks_like_card, payment_control, should_capture
+from app.search import cleartrip_results_url, flight_results_url
+from app.twilio_wa import TYPING_REFRESH_SECONDS, composing, remember_inbound, typing_form
 from app.config import get_settings
 from app.db import choose_db_path
 from app.intent import explicit_date, week_window
@@ -133,6 +135,53 @@ class IntentGuards(unittest.TestCase):
         )
         self.assertIn("2026-12-01 through 2026-12-07", spoken)
         self.assertNotIn("once more", spoken.lower())
+
+
+class TypingAndSpeed(unittest.TestCase):
+    def test_typing_form_is_the_whatsapp_indicator(self) -> None:
+        url, payload = typing_form("SMabc123")
+        self.assertTrue(url.endswith("/Indicators/Typing.json"))
+        self.assertEqual(payload["channel"], "whatsapp")
+        self.assertEqual(payload["messageId"], "SMabc123")
+        self.assertLessEqual(TYPING_REFRESH_SECONDS, 25)
+
+    def test_typing_is_on_while_the_reply_is_written(self) -> None:
+        import app.twilio_wa as wa
+
+        events: list[str] = []
+
+        def fake_send(message_sid: str) -> bool:
+            events.append(f"typing:{message_sid}")
+            return True
+
+        original = wa.send_typing
+        wa.send_typing = fake_send
+        try:
+            remember_inbound("9199990000", "SMabc123")
+            with composing("9199990000"):
+                events.append("writing")
+            events.append("sent")
+        finally:
+            wa.send_typing = original
+        self.assertEqual(events, ["typing:SMabc123", "writing", "sent"])
+
+    def test_known_trip_has_a_results_url_without_a_model(self) -> None:
+        from app.travel_agent import _direct_results
+
+        trip = {"origin": "Guwahati", "destination": "Delhi", "depart": "2026-12-01", "depart_until": "2026-12-07"}
+        self.assertTrue(_direct_results(trip, "yes"))
+        self.assertFalse(_direct_results(trip, "log in and fill the passenger form"))
+        week = flight_results_url("Guwahati", "Delhi", "2026-12-01", "2026-12-07")
+        self.assertIn("google.com/travel/flights", week)
+        self.assertIn("2026-12-01", week)
+        self.assertIn("2026-12-07", week)
+        day = flight_results_url("Jorhat", "Bengaluru", "2026-12-01")
+        self.assertIn("google.com/travel/flights", day)
+        self.assertIn("curr=INR", day)
+        clear = cleartrip_results_url("Guwahati", "Delhi", "2026-12-01")
+        self.assertIn("cleartrip.com", clear)
+        self.assertIn("GAU", clear)
+        self.assertIn("DEL", clear)
 
 
 class LivePageGuards(unittest.TestCase):

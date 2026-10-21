@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
+from contextlib import contextmanager
 
 import httpx
 
@@ -9,6 +11,68 @@ from app.config import get_settings
 from app.reply import Reply
 
 logger = logging.getLogger(__name__)
+
+# WhatsApp clears the bubble when the message arrives, or after about 25s.
+TYPING_REFRESH_SECONDS = 20
+_TYPING_URL = "https://messaging.twilio.com/v2/Indicators/Typing.json"
+_INBOUND: dict[str, str] = {}
+
+
+def typing_form(message_sid: str) -> tuple[str, dict[str, str]]:
+    """Body of Twilio's WhatsApp typing indicator. Same bubble a person gets while writing."""
+    return _TYPING_URL, {"messageId": (message_sid or "").strip(), "channel": "whatsapp"}
+
+
+def remember_inbound(phone: str, message_sid: str) -> None:
+    sid = (message_sid or "").strip()
+    if phone and sid:
+        _INBOUND[digits_only(phone)] = sid
+
+
+def inbound_sid(phone: str) -> str:
+    return _INBOUND.get(digits_only(phone), "")
+
+
+@contextmanager
+def composing(phone: str):
+    """Typing bubble only while the reply text is being written. The send clears it."""
+    sid = inbound_sid(phone)
+    stop = threading.Event()
+    if sid:
+        send_typing(sid)
+
+        def _refresh() -> None:
+            while not stop.is_set():
+                if stop.wait(TYPING_REFRESH_SECONDS):
+                    return
+                send_typing(sid)
+
+        threading.Thread(target=_refresh, name="wa-typing", daemon=True).start()
+    try:
+        yield
+    finally:
+        stop.set()
+
+
+def send_typing(message_sid: str) -> bool:
+    settings = get_settings()
+    url, payload = typing_form(message_sid)
+    if not settings.twilio_ready or not payload["messageId"]:
+        return False
+    try:
+        with httpx.Client(timeout=4.0) as client:
+            resp = client.post(
+                url,
+                data=payload,
+                auth=(settings.twilio_account_sid, settings.twilio_auth_token),
+            )
+        if resp.status_code >= 300:
+            logger.info("Typing indicator not accepted %s", resp.status_code)
+            return False
+        return True
+    except Exception as exc:
+        logger.info("Typing indicator failed: %s", type(exc).__name__)
+        return False
 
 
 def digits_only(raw: str) -> str:

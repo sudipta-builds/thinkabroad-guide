@@ -15,6 +15,7 @@ from app.browser_hands import (
     REFUSE_CARD,
     BrowserSession,
     chromium_ready,
+    dollar_fares,
     looks_like_card,
     page_blocked,
     prices_in,
@@ -24,6 +25,7 @@ from app.browser_hands import (
 from app.config import get_settings
 from app.media_files import public_url_for
 from app.reply import Reply
+from app.twilio_wa import composing, remember_inbound
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +93,13 @@ _TOOLS: list[dict[str, Any]] = [
 ]
 
 
-def handle_turn(phone: str, text: str, state: dict[str, Any], prior: list[dict[str, Any]]) -> Reply:
+def handle_turn(
+    phone: str,
+    text: str,
+    state: dict[str, Any],
+    prior: list[dict[str, Any]],
+    message_sid: str = "",
+) -> Reply:
     before = {
         "origin": state.get("origin"),
         "destination": state.get("destination"),
@@ -109,9 +117,22 @@ def handle_turn(phone: str, text: str, state: dict[str, Any], prior: list[dict[s
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="⚠️")
 
+    if message_sid:
+        remember_inbound(phone, message_sid)
     busy = _busy(state)
     changed = _trip_changed(before, state)
-    decision = llm.converse(_PLANNER, _planner_payload(phone, text, state, prior, busy=busy), timeout=7)
+    if _should_browse(state, text, busy=busy, changed=changed) and _direct_results(state, text) and chromium_ready():
+        state["busy_at"] = f"{time.time():.3f}"
+        _save(phone, state)
+        threading.Thread(
+            target=_run_browse,
+            args=(phone, text, state.get("busy_at")),
+            name="guide-browse",
+            daemon=True,
+        ).start()
+        return Reply.of("")
+    with composing(phone):
+        decision = llm.converse(_PLANNER, _planner_payload(phone, text, state, prior, busy=busy), timeout=7)
     action = str(decision.get("action") or "reply").lower()
     reply = str(decision.get("reply") or "").strip()
     emoji = str(decision.get("emoji") or "").strip() or ("👀" if busy else "👍")
@@ -168,6 +189,16 @@ _SELLER = re.compile(
     r"\b(cleartrip|makemytrip|mmt|goibibo|easemytrip|ixigo|indigo|air\s?india|akasa|spicejet|vistara)\b",
     re.I,
 )
+
+
+_FORM = re.compile(r"\b(log ?in|sign ?in|password|passenger|book this|book it|fill)\b", re.I)
+
+
+def _direct_results(state: dict[str, Any], text: str) -> bool:
+    """A known trip opens the results page itself. Login and forms still use the tool loop."""
+    if _FORM.search(text or ""):
+        return False
+    return bool(state.get("origin") and state.get("destination") and state.get("depart"))
 
 
 def _should_browse(state: dict[str, Any], text: str, *, busy: bool, changed: bool) -> bool:
@@ -458,6 +489,75 @@ def _task_payload(phone: str, text: str, state: dict[str, Any]) -> str:
     )
 
 
+def _fare_line(result: str, state: dict[str, Any]) -> str:
+    trip = _trip_line(state) or _window_phrase(state)
+    rupees = prices_in(result)
+    dollars = dollar_fares(result)
+    if rupees:
+        shown = ", ".join(f"Rs {n}" for n in rupees[:4])
+        return f"{trip}. Visible fares {shown}. Nothing is booked."
+    if dollars:
+        shown = ", ".join(f"${n}" for n in dollars[:4])
+        return f"{trip}. The page shows {shown}. Nothing is booked."
+    return f"{trip}. No fare list on that page. Nothing is booked."
+
+
+def _publish_fares(
+    phone: str,
+    text: str,
+    session: BrowserSession,
+    secrets: list[str],
+    started_at: float | str | None,
+) -> None:
+    """Open the results page now. Typing starts only while the recommendation is written."""
+    from app.search import cleartrip_results_url, flight_results_url
+
+    state = _load(phone)
+    origin, destination, depart = str(state.get("origin") or ""), str(state.get("destination") or ""), str(state.get("depart") or "")
+    if re.search(r"\bcleartrip\b", text or "", re.I):
+        url = cleartrip_results_url(origin, destination, depart)
+    else:
+        url = flight_results_url(origin, destination, depart, str(state.get("depart_until") or ""))
+    result = session.open_url(url)
+    if _stale(phone, started_at):
+        return
+    if result.startswith("URL:"):
+        _note_live(phone, result)
+        _deliver(phone, _fare_line(result, _load(phone)), session, secrets)
+    if (
+        "Prices visible" not in result
+        and not dollar_fares(result)
+        and "cleartrip.com" not in url
+        and not _stale(phone, started_at)
+    ):
+        result = session.open_url(cleartrip_results_url(origin, destination, depart))
+        if result.startswith("URL:") and not _stale(phone, started_at):
+            _note_live(phone, result)
+            _deliver(phone, _fare_line(result, _load(phone)), session, secrets)
+    page = session.last_text
+    if _stale(phone, started_at) or not (prices_in(page) or dollar_fares(page)):
+        return
+    snippet = re.sub(r"\s+", " ", page)[:1800]
+    with composing(phone):
+        blurb = llm.chat(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Write 3 or 4 short WhatsApp lines. Use only fares and times in the page text. "
+                        "If prices are in dollars, say so and do not convert them. Recommend one option. "
+                        "Say nothing is booked. Start with one emoji.\n\n"
+                        f"Trip: {_window_phrase(state)}\nPage:\n{snippet}"
+                    ),
+                }
+            ],
+            max_tokens=180,
+            timeout=8,
+        )
+    if blurb and not _stale(phone, started_at):
+        _deliver(phone, blurb, session, secrets)
+
+
 def _run_browse(phone: str, text: str, started_at: float | None = None) -> None:
     secrets: list[str] = []
     acquired = False
@@ -468,10 +568,14 @@ def _run_browse(phone: str, text: str, started_at: float | None = None) -> None:
             _clear_busy(phone, started_at)
             return
         try:
-            with BrowserSession(phone) as session:
-                sent = _loop(phone, text, session, secrets, started_at)
-                if not sent and not _stale(phone, started_at):
-                    _deliver(phone, "I opened the page but didn't get a clean read. Nothing is booked.", session, secrets)
+            direct = _direct_results(_load(phone), text)
+            with BrowserSession(phone, fresh=direct) as session:
+                if direct:
+                    _publish_fares(phone, text, session, secrets, started_at)
+                else:
+                    sent = _loop(phone, text, session, secrets, started_at)
+                    if not sent and not _stale(phone, started_at):
+                        _deliver(phone, "I opened the page but didn't get a clean read. Nothing is booked.", session, secrets)
         finally:
             _LOCK.release()
     except Exception:
@@ -514,7 +618,11 @@ def _loop(phone: str, text: str, session: BrowserSession, secrets: list[str], st
                 continue
             if _stale(phone, started_at):
                 return sent or session.progress > 0
-            final = _clean(_recommendation(saw_price, messages, str(msg.get("content") or "")), secrets).strip()
+            if saw_price:
+                with composing(phone):
+                    final = _clean(_recommendation(saw_price, messages, str(msg.get("content") or "")), secrets).strip()
+            else:
+                final = _clean(_recommendation(saw_price, messages, str(msg.get("content") or "")), secrets).strip()
             if saw_price and final and final != last_sent:
                 _deliver(phone, final, session, secrets)
                 sent = True
@@ -563,10 +671,11 @@ def _loop(phone: str, text: str, session: BrowserSession, secrets: list[str], st
             "content": "Stop browsing. Write the WhatsApp update from pages you actually saw. Do not invent prices. Say that nothing has been paid.",
         }
     )
-    closer = llm.complete(messages, tools=None, timeout=18, max_tokens=500)
+    with composing(phone):
+        closer = llm.complete(messages, tools=None, timeout=18, max_tokens=500)
+        final = _clean(_recommendation(saw_price, messages, str(closer.get("content") or "")), secrets).strip()
     if _stale(phone, started_at):
         return sent or session.progress > 0
-    final = _clean(_recommendation(saw_price, messages, str(closer.get("content") or "")), secrets).strip()
     if final and final != last_sent:
         _deliver(phone, final, session, secrets)
         sent = True

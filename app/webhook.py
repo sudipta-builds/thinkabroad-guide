@@ -9,7 +9,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 from app import agent
 from app.config import get_settings
 from app.reply import Reply
-from app.twilio_wa import digits_only, send_whatsapp
+from app.twilio_wa import digits_only, remember_inbound, send_whatsapp
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +34,16 @@ async def twilio_whatsapp_inbound(request: Request):
     body = (fields.get("Body") or "").strip()
     message_sid = fields.get("MessageSid", "")
     logger.info("Inbound WA from %s sid=%s len=%s", phone, message_sid, len(body))
+    remember_inbound(phone, message_sid)
 
     try:
-        reply = agent.handle_message(phone, body)
+        reply = agent.handle_message(phone, body, message_sid=message_sid)
     except Exception:
         logger.exception("Guide agent failed")
         reply = Reply.of("Something went wrong on my side. Try again in a moment.", emoji="⚠️")
+
+    if not (reply.text or "").strip() and not reply.media_urls:
+        return Response(content=str(MessagingResponse()), media_type="application/xml")
 
     # Twilio cannot tap-back WhatsApp messages. Keep the emoji on the reply text.
     if reply.emoji and not (reply.text or "").startswith(reply.emoji):

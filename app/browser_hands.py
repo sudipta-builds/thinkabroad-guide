@@ -121,6 +121,14 @@ def _has_chromium(root: Path) -> bool:
     return False
 
 
+def dollar_fares(text: str) -> list[str]:
+    found: list[str] = []
+    for raw in re.findall(r"\$\s*([0-9]{2,5})", text or ""):
+        if raw not in found:
+            found.append(raw)
+    return found[:6]
+
+
 def prices_in(text: str) -> list[int]:
     found: list[int] = []
     for raw in _PRICE.findall(text or ""):
@@ -208,12 +216,13 @@ def _shot_path() -> Path:
 
 
 class BrowserSession:
-    def __init__(self, phone: str = ""):
+    def __init__(self, phone: str = "", fresh: bool = False):
         self.phone = phone
         self.unsent: list[Path] = []
         self.last_text = ""
         self.allow_local = False
         self.progress = 0
+        self.fresh = fresh
         self._pw: object | None = None
         self._browser: object | None = None
         self._context: object | None = None
@@ -237,8 +246,15 @@ class BrowserSession:
             "args": _LAUNCH_ARGS,
             "viewport": {"width": 1200, "height": 1400},
             "user_agent": _UA,
-            "timeout": 25000,
+            "timeout": 20000,
         }
+        if self.fresh:
+            self._browser = playwright.chromium.launch(headless=True, args=_LAUNCH_ARGS, timeout=20000)
+            self._context = self._browser.new_context(viewport=kwargs["viewport"], user_agent=_UA)
+            self.page = self._context.new_page()
+            self.page.set_default_timeout(15000)
+            self._context.route("**/*", self._gate)
+            return
         try:
             self._context = playwright.chromium.launch_persistent_context(str(_profile_dir(self.phone)), **kwargs)
             self.page = self._context.pages[0] if self._context.pages else self._context.new_page()
@@ -271,17 +287,17 @@ class BrowserSession:
             return
         route.abort()
 
-    def open_url(self, url: str) -> str:
+    def open_url(self, url: str, *, goto_timeout: int = 18000, price_wait: int = 4000) -> str:
         allowed = url_allowed(url, allow_local=self.allow_local)
         if not allowed:
             return "That address is not a public web page, so it was not opened."
         assert self.page is not None
-        self.page.goto(allowed, wait_until="domcontentloaded", timeout=28000)
+        self.page.goto(allowed, wait_until="domcontentloaded", timeout=goto_timeout)
         self._dismiss()
         try:
-            self.page.wait_for_selector("text=/₹|Rs\\.?\\s*\\d|INR\\s*\\d/", timeout=6000)
+            self.page.wait_for_selector("text=/₹|Rs\\.?\\s*\\d|INR\\s*\\d|\\$\\s*\\d/", timeout=price_wait)
         except Exception:
-            self.page.wait_for_timeout(2000)
+            self.page.wait_for_timeout(1200)
         return self._observe(shoot=True)
 
     def read_page(self) -> str:

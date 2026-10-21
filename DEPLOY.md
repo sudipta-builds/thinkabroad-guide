@@ -54,9 +54,9 @@ Twilio Console → Messaging → WhatsApp sandbox / sender:
 4. `SAVE PROFILE Your Name | you@email.com | +phone`
 5. `APPLY 1` → CV PDF/Word + screenshot → `YES` → Guide attempts real browser submit
 
-## Apply automation note
+## Build note
 
-Render build runs `playwright install chromium`. Prefer a **Starter** instance with enough RAM; apply runs headless Chromium on the same service.
+Flight search uses booking links + mShots screenshots. Do **not** add `playwright install chromium` to the Render build — that download often stalls deploys for 10–20+ minutes and is unused by the travel agent.
 
 ## What I cannot do from here
 

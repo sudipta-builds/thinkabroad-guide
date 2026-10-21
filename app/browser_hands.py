@@ -262,9 +262,12 @@ class BrowserSession:
         if not allowed:
             return "That address is not a public web page, so it was not opened."
         assert self.page is not None
-        self.page.goto(allowed, wait_until="domcontentloaded", timeout=40000)
-        self.page.wait_for_timeout(1500)
+        self.page.goto(allowed, wait_until="domcontentloaded", timeout=45000)
         self._dismiss()
+        try:
+            self.page.wait_for_selector("text=/₹|Rs\\.?\\s*\\d|INR\\s*\\d/", timeout=8000)
+        except Exception:
+            self.page.wait_for_timeout(2500)
         return self._observe(shoot=True)
 
     def read_page(self) -> str:
@@ -441,6 +444,20 @@ class BrowserSession:
             title = self.page.title()
         except Exception:
             title = ""
+        prices = prices_in(self.last_text)
+        blocked = bool(_BLOCK.search(self.last_text))
+        flag = ""
+        if blocked:
+            flag = (
+                "\nThis page looks like a bot check or an access block. "
+                "Open a different seller now. Do not ask the traveller to repeat the trip."
+            )
+        elif not prices:
+            flag = (
+                "\nNO FARES RENDERED. Open a different seller in this same run. "
+                "Do not ask the traveller for the route, date, or preference."
+            )
+            shoot = False
         shot_note = ""
         if shoot:
             path = self._screenshot()
@@ -448,10 +465,6 @@ class BrowserSession:
                 self.unsent.append(path)
                 shot_note = "\nScreenshot captured."
         body = re.sub(r"\n{3,}", "\n\n", self.last_text).strip()[:3500]
-        flag = ""
-        if _BLOCK.search(self.last_text):
-            flag = "\nThis page looks like a bot check or an access block."
-        prices = prices_in(self.last_text)
         price_line = f"\nPrices visible: {prices}" if prices else ""
         return f"URL: {self.page.url}\nTitle: {title}{price_line}{flag}\n{body}{shot_note}"
 

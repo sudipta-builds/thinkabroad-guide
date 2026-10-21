@@ -223,23 +223,23 @@ def _extract_date(text: str) -> tuple[date, bool]:
     if iso:
         return _safe_date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)), today), False
 
-    named = re.search(
-        r"\b(\d{1,2})(?:st|nd|rd|th)?(?:\s+of)?\s+([a-z]{3,9})(?:\s+(20\d{2}))?\b"
-        r"|\b([a-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(20\d{2}))?\b",
-        lower,
+    month_names = "|".join(sorted(_MONTHS, key=len, reverse=True))
+    named_re = re.compile(
+        rf"\b(\d{{1,2}})(?:st|nd|rd|th)?(?:\s+of)?\s+({month_names})(?:\s+(20\d{{2}}))?\b"
+        rf"|\b({month_names})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:\s+(20\d{{2}}))?\b"
     )
+    named = named_re.search(lower)
     if named:
         if named.group(1):
             day, month_name, year = int(named.group(1)), named.group(2), named.group(3)
         else:
             day, month_name, year = int(named.group(5)), named.group(4), named.group(6)
-        month = _MONTHS.get(month_name)
-        if month:
-            year_n = int(year) if year else today.year
-            found = _safe_date(year_n, month, day, today)
-            if not year and found < today:
-                found = _safe_date(year_n + 1, month, day, today)
-            return found, False
+        month = _MONTHS[month_name]
+        year_n = int(year) if year else today.year
+        found = _safe_date(year_n, month, day, today)
+        if not year and found < today:
+            found = _safe_date(year_n + 1, month, day, today)
+        return found, False
 
     slash = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](20\d{2}))?\b", lower)
     if slash:

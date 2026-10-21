@@ -56,6 +56,7 @@ _PLANNER = (
 _BROWSER = (
     "You are Guide, a travel agent on WhatsApp, with a live browser.\n"
     "You choose which airline or seller to open. No site is preselected. "
+    "If the traveller named a seller, open that seller first. Do not open https://www.google.com/ or a blank search box. "
     "If a tool result says NO FARES RENDERED or a bot check, call open_url on a different seller in this same run. "
     "Do not stop, and do not ask the traveller to repeat the route, date, or preference.\n"
     "The origin, destination, and depart in Memory are final. A depart_until is the end of a week, not a return ticket. Do not change the date.\n"
@@ -113,11 +114,13 @@ def handle_turn(phone: str, text: str, state: dict[str, Any], prior: list[dict[s
     action = str(decision.get("action") or "reply").lower()
     reply = str(decision.get("reply") or "").strip()
     emoji = str(decision.get("emoji") or "").strip() or ("👀" if busy else "👍")
-    if busy and not changed:
-        action = "reply"
-    elif changed or _force_browse(state, text):
+    if _should_browse(state, text, busy=busy, changed=changed):
         action = "browse"
-    reply = _human_reply(state, reply, browsing=action == "browse", busy=busy and not changed)
+    elif busy:
+        action = "reply"
+    reply = _human_reply(state, reply, browsing=action == "browse", busy=busy and action != "browse")
+    if action != "browse" and _OPENING.search(reply):
+        reply = _grounded(state, browsing=False, busy=busy)
     if action == "browse":
         if re.search(r"₹|Rs\.?\s*\d", reply):
             reply = "Opening live pages for that trip. I'll send what actually loads. Nothing is booked."
@@ -157,6 +160,26 @@ def _recover_trip(state: dict[str, Any], prior: list[dict[str, Any]], text: str)
             data = absorb_trip(data, str(item.get("body") or ""))
             data = absorb_details(data, str(item.get("body") or ""))
     return absorb_details(absorb_trip(data, text), text)
+
+
+_OPENING = re.compile(r"\b(opening|i'?ll open|i will open)\b", re.I)
+_SELLER = re.compile(
+    r"\b(cleartrip|makemytrip|mmt|goibibo|easemytrip|ixigo|indigo|air\s?india|akasa|spicejet|vistara)\b",
+    re.I,
+)
+
+
+def _should_browse(state: dict[str, Any], text: str, *, busy: bool, changed: bool) -> bool:
+    """A named seller or a new trip starts Chromium even if another page is open."""
+    if re.search(r"\b(stop|cancel|never mind)\b", text or "", re.I):
+        return False
+    if not (state.get("origin") and state.get("destination") and state.get("depart")):
+        return False
+    if changed or _SELLER.search(text or ""):
+        return True
+    if busy:
+        return False
+    return _force_browse(state, text)
 
 
 _REASK = re.compile(
@@ -334,7 +357,7 @@ def _run_browse(phone: str, text: str, started_at: float | None = None) -> None:
     secrets: list[str] = []
     acquired = False
     try:
-        acquired = _LOCK.acquire(timeout=25)
+        acquired = _LOCK.acquire(timeout=40)
         if not acquired:
             _deliver(phone, "Another live page is still open. I'll send that result first.", None, secrets)
             _clear_busy(phone, started_at)
@@ -367,6 +390,7 @@ def _loop(phone: str, text: str, session: BrowserSession, secrets: list[str], st
     deadline = time.time() + 100
     for step in range(6):
         if _stale(phone, started_at) or time.time() > deadline:
+            _say_if_stuck(phone, session, secrets, started_at, saw_price=saw_price, hosts=hosts)
             return sent or session.progress > 0
         msg = llm.complete(messages, tools=_TOOLS, timeout=22, max_tokens=700)
         calls = msg.get("tool_calls") or []
@@ -397,6 +421,9 @@ def _loop(phone: str, text: str, session: BrowserSession, secrets: list[str], st
                     secrets,
                 )
                 sent = True
+            elif len(hosts) < 2 and not saw_price:
+                _say_if_stuck(phone, session, secrets, started_at, saw_price=saw_price, hosts=hosts)
+                sent = True
             else:
                 sent = True
             return sent
@@ -423,6 +450,7 @@ def _loop(phone: str, text: str, session: BrowserSession, secrets: list[str], st
                 sent = True
             messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": result[:4000]})
     if _stale(phone, started_at) or not saw_price:
+        _say_if_stuck(phone, session, secrets, started_at, saw_price=saw_price, hosts=hosts)
         return sent or session.progress > 0 or bool(last_sent)
     messages.append(
         {
@@ -440,7 +468,24 @@ def _loop(phone: str, text: str, session: BrowserSession, secrets: list[str], st
     return sent or bool(last_sent)
 
 
+def _say_if_stuck(
+    phone: str,
+    session: BrowserSession,
+    secrets: list[str],
+    started_at: float | str | None,
+    *,
+    saw_price: bool,
+    hosts: set[str],
+) -> None:
+    """The last WhatsApp line must not be a promise that another seller is opening."""
+    if saw_price or len(hosts) >= 2 or _stale(phone, started_at):
+        return
+    _deliver(phone, "The next seller never opened. Nothing is booked.", session, secrets)
+
+
 def _dispatch(phone: str, session: BrowserSession, call: dict[str, Any], secrets: list[str], started_at: float | None = None) -> str:
+    if _stale(phone, started_at):
+        return "Stopped. A newer request took over this browser."
     name = str(call.get("name") or "")
     args = call.get("arguments") or {}
     if not isinstance(args, dict):

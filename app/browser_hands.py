@@ -237,13 +237,14 @@ class BrowserSession:
             "args": _LAUNCH_ARGS,
             "viewport": {"width": 1200, "height": 1400},
             "user_agent": _UA,
+            "timeout": 25000,
         }
         try:
             self._context = playwright.chromium.launch_persistent_context(str(_profile_dir(self.phone)), **kwargs)
             self.page = self._context.pages[0] if self._context.pages else self._context.new_page()
         except Exception:
             logger.warning("Persistent browser profile failed; opening a fresh window")
-            self._browser = playwright.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+            self._browser = playwright.chromium.launch(headless=True, args=_LAUNCH_ARGS, timeout=25000)
             self._context = self._browser.new_context(viewport=kwargs["viewport"], user_agent=_UA)
             self.page = self._context.new_page()
         self.page.set_default_timeout(20000)

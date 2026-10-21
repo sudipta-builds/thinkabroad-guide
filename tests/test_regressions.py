@@ -13,6 +13,7 @@ from app.intent import explicit_date, week_window
 from app.travel_agent import (
     _force_browse,
     _human_reply,
+    _should_browse,
     _memory_lines,
     _reasks,
     _recommendation,
@@ -73,6 +74,11 @@ class IntentGuards(unittest.TestCase):
         self.assertTrue(_force_browse(self.trip, "yes, yes and cheapest"))
         self.assertFalse(_force_browse(self.trip, "stop"))
         self.assertFalse(_force_browse({}, "jorhat"))
+
+    def test_named_seller_restarts_while_a_search_is_open(self) -> None:
+        self.assertTrue(_should_browse(self.trip, "what about cleartrip?", busy=True, changed=False))
+        self.assertFalse(_should_browse(self.trip, "?", busy=True, changed=False))
+        self.assertFalse(_should_browse(self.trip, "what did you get?", busy=True, changed=False))
 
     def test_reask_wording_is_caught(self) -> None:
         self.assertTrue(_reasks("What route and date should I search, and do you care most about cheapest?"))

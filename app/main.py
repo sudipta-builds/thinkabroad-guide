@@ -22,8 +22,13 @@ def on_startup() -> None:
     logging.getLogger().setLevel(settings.log_level.upper())
     db_path = db.resolve_db_path()
     db.init_db()
+    from app.browser_hands import chromium_ready
+    from app.travel_agent import start_price_watch
+
+    browser_ok = chromium_ready()
+    start_price_watch()
     logger.info(
-        "Guide travel agent ready v%s db=%s twilio=%s deepseek=%s gemini=%s vault=%s public=%s",
+        "Guide travel agent ready v%s db=%s twilio=%s deepseek=%s gemini=%s vault=%s public=%s chromium=%s",
         __version__,
         db_path,
         settings.twilio_ready,
@@ -31,11 +36,14 @@ def on_startup() -> None:
         settings.search_ready,
         settings.vault_ready,
         bool(settings.guide_public_url),
+        browser_ok,
     )
 
 
 @app.get("/health")
 def health() -> JSONResponse:
+    from app.browser_hands import chromium_ready
+
     settings = get_settings()
     return JSONResponse(
         {
@@ -48,6 +56,7 @@ def health() -> JSONResponse:
             "deepseek": settings.llm_ready,
             "gemini": settings.search_ready,
             "vault": settings.vault_ready,
+            "chromium": chromium_ready(),
         }
     )
 

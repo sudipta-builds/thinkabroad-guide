@@ -160,6 +160,12 @@ def upsert_user(phone: str) -> dict[str, Any]:
         return dict(row)
 
 
+def list_users() -> list[dict[str, Any]]:
+    with db() as conn:
+        rows = conn.execute("SELECT phone, interests_json, display_name FROM users").fetchall()
+    return [dict(row) for row in rows]
+
+
 def get_user(phone: str) -> dict[str, Any] | None:
     with db() as conn:
         row = conn.execute("SELECT * FROM users WHERE phone = ?", (phone,)).fetchone()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import re
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -11,7 +12,10 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-KNOWN_SITES = ("linkedin", "indeed", "glassdoor", "email", "other")
+
+def site_slug(site: str) -> str:
+    slug = re.sub(r"[^a-z0-9_-]", "", (site or "").lower())[:32]
+    return slug or "other"
 
 
 def _fernet() -> Fernet | None:
@@ -29,23 +33,20 @@ def save_login(phone: str, site: str, username: str, password: str) -> str:
         return (
             "Vault isn't configured yet (missing VAULT_SECRET_KEY on the server)."
         )
-    site = (site or "other").strip().lower()
-    if site not in KNOWN_SITES:
-        site = "other"
+    site = site_slug(site)
     username = (username or "").strip()
     password = password or ""
     if not username or not password:
-        return "Send both username/email and password.\nExample: SAVE LINKEDIN me@email.com mypassword"
+        return "Send both username/email and password.\nExample: SAVE cleartrip you@email.com yourpassword"
     token_user = f.encrypt(username.encode("utf-8")).decode("ascii")
     token_pass = f.encrypt(password.encode("utf-8")).decode("ascii")
     db.upsert_vault_secret(phone, site, token_user, token_pass)
-    return (
-        f"Saved *{site}* login (encrypted). Used only when you reply *YES* to apply."
-    )
+    return f"Saved {site} login, encrypted. I'll use it only when that site asks me to sign in."
 
 
 def unlock_login(phone: str, site: str) -> dict[str, str] | None:
     f = _fernet()
+    site = site_slug(site)
     row = db.get_vault_secret(phone, site)
     if not f or not row:
         return None
@@ -67,6 +68,8 @@ def list_sites(phone: str) -> list[str]:
 def vault_help() -> str:
     return (
         "Passenger details, if you want them on file:\n"
-        "*SAVE PROFILE Full Name | you@email.com | +phone*\n\n"
-        "I ask permission before I book, and I never enter payment."
+        "SAVE PROFILE Full Name | you@email.com | +phone\n\n"
+        "A site login, if a page asks for one:\n"
+        "SAVE cleartrip you@email.com yourpassword\n\n"
+        "I stop on the payment button. I never store a card."
     )

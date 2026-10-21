@@ -1,30 +1,31 @@
 # Guide
 
-WhatsApp travel agent. Say a route and it replies immediately with live booking links and screenshots. It asks permission before it agrees to book.
-
-No web UI. Flight search does not wait on an LLM.
+WhatsApp travel agent. DeepSeek chooses what to do. Chromium opens live booking pages, logs in when needed, fills passenger forms, and stops before payment.
 
 ## Conversation
 
-1. Say it like you would to a person: `Jorhat to Bengaluru`, then `2nd December one way`
-2. Guide keeps the trip in mind. If it has to guess the route, it asks you to confirm before searching
-3. A clear route and date gets flight links and screenshots, with a line that nothing is booked
-4. `book the first one` asks before it agrees. `YES` is the only time it says yes, and it stops before payment
-5. Wording comes from DeepSeek, or Gemini if DeepSeek is down. The booking decision stays in code
+1. Say a trip the way you would to a person, for example Jorhat to Bengaluru on a date
+2. Guide asks what you care about if you have not said: cheapest, time of day, fewer stops
+3. It opens live sites itself. If one blocks it, it tries another and tells you
+4. You get a recommendation from prices that actually loaded, plus a screenshot
+5. For booking it asks for name, email, phone, date of birth, and gender, saves them, fills the form, and shows the total. It never pays
 
-Optional passenger details: `SAVE PROFILE Full Name | email | phone`
+Optional shortcuts:
+
+- `SAVE PROFILE Full Name | email | phone | DOB | Gender`
+- `SAVE cleartrip you@email.com yourpassword`
 
 ## Providers
 
 | Service | Role |
 |--------|------|
-| **DeepSeek** | WhatsApp wording. Gemini is the fallback |
-| **Twilio** | WhatsApp text, emoji reaction, screenshot images |
-| **MakeMyTrip / Google Flights / Skyscanner** | Live booking links |
-| **mShots** | Page screenshots attached to the reply |
+| **DeepSeek** | Decides the next step and writes WhatsApp replies |
+| **Chromium / Playwright** | Opens pages, clicks, types, screenshots |
+| **Twilio** | WhatsApp delivery |
+| **Vault** | Encrypted site logins and passenger profile |
 
 ## Deploy
 
-See [DEPLOY.md](DEPLOY.md). Render build installs Chromium via Playwright.
+See [DEPLOY.md](DEPLOY.md). Health should show `"version": "0.3.0"` and `"chromium": true`.
 
-Required env: `TWILIO_*`, `DEEPSEEK_API_KEY`, `GEMINI_API_KEY`, `VAULT_SECRET_KEY`, `GUIDE_PUBLIC_URL`, `GUIDE_DB_PATH`.
+Required env: `TWILIO_*`, `DEEPSEEK_API_KEY`, `VAULT_SECRET_KEY`, `GUIDE_PUBLIC_URL`, `GUIDE_DB_PATH`, `PLAYWRIGHT_BROWSERS_PATH`.

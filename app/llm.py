@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -8,6 +9,65 @@ import httpx
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def complete(
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    temperature: float = 0.3,
+    max_tokens: int = 700,
+    timeout: float = 40.0,
+) -> dict[str, Any]:
+    """One DeepSeek turn. Tool calls are returned, not run."""
+    settings = get_settings()
+    if not settings.llm_ready:
+        return {"content": "", "tool_calls": []}
+    url = settings.deepseek_base_url.rstrip("/") + "/chat/completions"
+    payload: dict[str, Any] = {
+        "model": settings.deepseek_model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if tools:
+        payload["tools"] = tools
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {settings.deepseek_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+        resp.raise_for_status()
+        message = resp.json()["choices"][0]["message"] or {}
+    except Exception as exc:
+        logger.warning("DeepSeek failed: %s", type(exc).__name__)
+        return {"content": "", "tool_calls": []}
+    calls = []
+    for call in message.get("tool_calls") or []:
+        fn = call.get("function") or {}
+        raw_args = fn.get("arguments") or "{}"
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                args = {}
+        elif isinstance(raw_args, dict):
+            args = raw_args
+        else:
+            args = {}
+        calls.append(
+            {
+                "id": str(call.get("id") or f"call-{len(calls)}"),
+                "name": str(fn.get("name") or ""),
+                "arguments": args if isinstance(args, dict) else {},
+            }
+        )
+    return {"content": (message.get("content") or "").strip(), "tool_calls": calls}
 
 
 def chat(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import re
 from datetime import date, timedelta
 from typing import Any
@@ -169,20 +170,28 @@ def find_flights(
     blurb = _when_blurb(when, round_trip)
     google = _google_url(origin_label, origin_code, dest_label, dest_code, when, round_trip)
 
-    flights: list[dict[str, Any]] = []
-    if origin_code and dest_code:
-        flights.append(
-            _row("MakeMyTrip", route, dest_label, origin_label, _mmt_url(origin_code, dest_code, when, round_trip, domestic), blurb, when)
-        )
-    flights.append(_row("Google Flights", route, dest_label, origin_label, google, blurb, when))
+    flights: list[dict[str, Any]] = [
+        _row("Google Flights", route, dest_label, origin_label, google, blurb, when)
+    ]
     if origin_code and dest_code:
         flights.append(
             _row(
-                "Skyscanner",
+                "Kayak",
                 route,
                 dest_label,
                 origin_label,
-                _sky_url(origin_code, dest_code, when, round_trip),
+                _kayak_url(origin_code, dest_code, when, round_trip),
+                blurb,
+                when,
+            )
+        )
+        flights.append(
+            _row(
+                "MakeMyTrip",
+                route,
+                dest_label,
+                origin_label,
+                _mmt_url(origin_code, dest_code, when, round_trip, domestic),
                 blurb,
                 when,
             )
@@ -244,14 +253,68 @@ def _google_url(
     when: date,
     round_trip: bool,
 ) -> str:
+    if origin_code and dest_code:
+        tfs = _google_tfs(origin_code, dest_code, when, round_trip)
+        return "https://www.google.com/travel/flights/search?" + urlencode(
+            {"tfs": tfs, "hl": "en", "curr": "INR"}
+        )
     left = f"{origin} {origin_code}".strip()
     right = f"{dest} {dest_code}".strip()
-    if round_trip:
-        back = when + timedelta(days=7)
-        q = f"round trip flights from {left} to {right} on {when.isoformat()} returning {back.isoformat()}"
-    else:
-        q = f"one way flights from {left} to {right} on {when.isoformat()}"
+    q = f"Flights to {right} from {left} on {when.isoformat()}"
     return "https://www.google.com/travel/flights?" + urlencode({"hl": "en", "curr": "INR", "q": q})
+
+
+def _google_tfs(origin: str, dest: str, when: date, round_trip: bool) -> str:
+    """Minimal Google Flights protobuf (airport codes + date)."""
+    legs = _pb_leg(when, origin.upper(), dest.upper())
+    if round_trip:
+        legs += _pb_leg(when + timedelta(days=7), dest.upper(), origin.upper())
+    body = (
+        legs
+        + _pb_varint_field(8, 1)  # 1 adult
+        + _pb_varint_field(9, 1)  # economy
+        + _pb_varint_field(19, 1 if round_trip else 2)  # 1=round trip, 2=one way
+    )
+    return base64.urlsafe_b64encode(body).decode("ascii").rstrip("=")
+
+
+def _pb_leg(when: date, origin: str, dest: str) -> bytes:
+    date_s = when.isoformat().encode("ascii")
+    airport = lambda code: _pb_bytes_field(2, code.encode("ascii"))
+    leg = (
+        _pb_bytes_field(2, date_s)
+        + _pb_len_field(13, airport(origin))
+        + _pb_len_field(14, airport(dest))
+    )
+    return _pb_len_field(3, leg)
+
+
+def _pb_varint(value: int) -> bytes:
+    out = bytearray()
+    while value > 0x7F:
+        out.append((value & 0x7F) | 0x80)
+        value >>= 7
+    out.append(value & 0x7F)
+    return bytes(out)
+
+
+def _pb_varint_field(field: int, value: int) -> bytes:
+    return bytes([(field << 3) | 0]) + _pb_varint(value)
+
+
+def _pb_bytes_field(field: int, value: bytes) -> bytes:
+    return bytes([(field << 3) | 2]) + _pb_varint(len(value)) + value
+
+
+def _pb_len_field(field: int, value: bytes) -> bytes:
+    return _pb_bytes_field(field, value)
+
+
+def _kayak_url(origin: str, dest: str, when: date, round_trip: bool) -> str:
+    path = f"{origin.upper()}-{dest.upper()}/{when.isoformat()}"
+    if round_trip:
+        path += f"/{(when + timedelta(days=7)).isoformat()}"
+    return f"https://www.kayak.co.in/flights/{path}?sort=bestflight_a&fs=cfc=0"
 
 
 def _mmt_url(origin: str, dest: str, when: date, round_trip: bool, domestic: bool) -> str:
@@ -276,18 +339,3 @@ def _mmt_url(origin: str, dest: str, when: date, round_trip: bool, domestic: boo
     )
 
 
-def _sky_url(origin: str, dest: str, when: date, round_trip: bool) -> str:
-    o = origin.lower()
-    d = dest.lower()
-    start = when.strftime("%y%m%d")
-    if round_trip:
-        back = (when + timedelta(days=7)).strftime("%y%m%d")
-        path = f"{o}/{d}/{start}/{back}"
-        rtn = "1"
-    else:
-        path = f"{o}/{d}/{start}"
-        rtn = "0"
-    return (
-        f"https://www.skyscanner.co.in/transport/flights/{path}/"
-        f"?adultsv2=1&cabinclass=economy&rtn={rtn}"
-    )

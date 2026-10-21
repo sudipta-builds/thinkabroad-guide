@@ -25,7 +25,7 @@ _VOICE = (
     "- Which date, and one-way or return?\n"
     "- Got it, 2 Dec one way. Jorhat to Bengaluru, right? Just confirm and I search.\n"
     "- Searching Jorhat to Bengaluru for 2 Dec now. I'll bring back options before booking anything.\n"
-    "- Jorhat to Bengaluru results, 2 Dec. Nothing booked.\n"
+    "- Jorhat to Bengaluru for 2 Dec — live options below. I have not bought a ticket.\n"
     "- Want me to book the first one? I won't confirm the ticket until you say so.\n"
     "- Yes. Opening that page. I stop before payment."
 )
@@ -68,8 +68,7 @@ def _finish(phone: str, state: dict[str, Any], reply: Reply) -> Reply:
 def handle_message(phone: str, body: str) -> Reply:
     text = (body or "").strip()
     if not text:
-        reply, _ = _speak("greet", _facts({}), [], "")
-        return Reply.of(reply, emoji="👋")
+        return Reply.of("Hey. Where are you flying, and when?", emoji="👋")
 
     user = db.upsert_user(phone)
     state = _load(user)
@@ -87,43 +86,9 @@ def handle_message(phone: str, body: str) -> Reply:
         reply = vault.save_login(phone, save_m.group(1), save_m.group(2), save_m.group(3).strip())
         return _finish(phone, state, Reply.of(reply, emoji="🔐"))
 
-    action, state, facts, spoken, reaction = _resolve(text, state, prior)
-    flights: list[dict[str, Any]] = []
-    if action == "search":
-        flights, state = _search(phone, state)
-        spoken = _results_line(state)
-        link = _google_link(flights)
-        if link and link not in spoken:
-            spoken = spoken.rstrip() + "\n" + link
-        reaction = reaction or "👍"
-    elif action == "show":
-        flights = _cached(state)
-        spoken = _results_line(state)
-        link = _google_link(flights)
-        if link and link not in spoken:
-            spoken = spoken.rstrip() + "\n" + link
-        reaction = reaction or "👍"
-        action = "search"
-    if action == "status":
-        facts["bookings"] = _status_text(phone)
-    if spoken is None:
-        spoken, reaction = _speak(action, facts, prior, text)
-    elif not reaction:
-        reaction = _default_reaction(action)
-    if action == "book_yes":
-        pending = state.get("_pending_book") or {}
-        job = db.get_job(str(pending.get("flight_id") or "")) or {}
-        url = str(pending.get("url") or job.get("apply_url") or "")
-        if url and url not in spoken:
-            spoken = spoken.rstrip() + "\n" + url
-        if pending.get("flight_id"):
-            db.upsert_application(phone, pending["flight_id"], "allowed", notes="User allowed this booking")
-        state.pop("_pending_book", None)
-        state["asking"] = ""
-        flights = [{"apply_url": url}] if url else []
+    from app.travel_agent import handle_turn
 
-    media = _shots(flights) if action in {"search", "book_yes"} else []
-    return _finish(phone, state, Reply.of(spoken, *media, emoji=reaction))
+    return handle_turn(phone, text, state, prior)
 
 
 def _resolve(
@@ -428,7 +393,10 @@ def _wants_results(text: str) -> bool:
 def _results_line(state: dict[str, Any]) -> str:
     facts = _facts(state, "search")
     trip = facts["trip"] if facts["trip"] != "not said" else "one way"
-    return f"{facts['origin']} to {facts['destination']}, {facts['when']}, {trip}. Nothing booked."
+    return (
+        f"{facts['origin']} to {facts['destination']}, {facts['when']}, {trip}. "
+        "Live options in the screenshot. I have not bought a ticket."
+    )
 
 
 def _fallback(action: str, facts: dict[str, Any]) -> str:
@@ -453,10 +421,10 @@ def _fallback(action: str, facts: dict[str, Any]) -> str:
         kind = f", {trip}" if trip and trip != "not said" else ""
         return (
             f"Searching {route} for {when}{kind}. I'll bring back options before booking anything.\n\n"
-            f"{route} results, {when}. Nothing booked."
+            f"{route} for {when} — live options below. I have not bought a ticket."
         )
     if action == "status":
-        return "Nothing booked yet. Where do you want to fly?"
+        return "No ticket bought yet. Where do you want to fly?"
     if action == "ask":
         if facts.get("missing") == "trip_type" and route and when:
             return f"{route} on {when}. One-way or return?"
@@ -567,30 +535,41 @@ def _google_link(flights: list[dict[str, Any]]) -> str:
 
 
 def _shots(flights: list[dict[str, Any]]) -> list[str]:
-    ordered = sorted(flights, key=lambda flight: 0 if "google" in str(flight.get("company") or "").lower() else 1)
+    prefer = ("google", "kayak", "makemytrip")
+    ordered = sorted(
+        flights,
+        key=lambda flight: next(
+            (i for i, name in enumerate(prefer) if name in str(flight.get("company") or "").lower()),
+            99,
+        ),
+    )
     urls = []
-    for flight in ordered:
+    for flight in ordered[:2]:
         page = str(flight.get("apply_url") or "")
         if page.startswith("http"):
             urls.append(screenshots.mshots_url(page))
-        if len(urls) == 2:
-            break
     return urls
 
 
 def _save_profile(phone: str, state: dict[str, Any], raw: str) -> str:
     parts = [p.strip() for p in raw.split("|")]
     if len(parts) < 2:
-        return "Send it like: SAVE PROFILE Full Name | you@email.com | +phone"
+        return "Send it like: SAVE PROFILE Full Name | you@email.com | +phone | DOB | Gender"
     name, email = parts[0], parts[1]
     phone_n = parts[2] if len(parts) > 2 else ""
+    dob = parts[3] if len(parts) > 3 else ""
+    gender = parts[4] if len(parts) > 4 else ""
     data = dict(state)
     data["name"] = name
     data["email"] = email
     if phone_n:
         data["phone"] = phone_n
+    if dob:
+        data["dob"] = dob
+    if gender:
+        data["gender"] = gender
     db.update_user(phone, interests=data, display_name=name)
-    return f"Saved, {name}. I'll still ask before I book anything."
+    return f"Saved, {name}. I'll use this on booking forms and still stop before payment."
 
 
 def _status_text(phone: str) -> str:

@@ -7,12 +7,30 @@ from pathlib import Path
 
 from app.config import get_settings
 
-_MEDIA = Path("data/media")
+def media_dirs() -> list[Path]:
+    dirs = [Path("data/media")]
+    try:
+        extra = Path(get_settings().guide_db_path).parent / "media"
+    except Exception:
+        extra = None
+    if extra is not None and str(extra) not in {str(path) for path in dirs}:
+        dirs.append(extra)
+    return dirs
 
 
 def ensure_media_dir() -> Path:
-    _MEDIA.mkdir(parents=True, exist_ok=True)
-    return _MEDIA
+    for folder in media_dirs():
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            probe = folder / ".write_probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return folder
+        except OSError:
+            continue
+    fallback = Path("data/media")
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
 
 
 def public_url_for(path: Path) -> str | None:
@@ -32,5 +50,8 @@ def media_path(filename: str) -> Path | None:
     name = Path(filename).name
     if not re.fullmatch(r"[A-Za-z0-9._-]{8,120}", name):
         return None
-    path = _MEDIA / name
-    return path if path.is_file() else None
+    for folder in media_dirs():
+        path = folder / name
+        if path.is_file():
+            return path
+    return None

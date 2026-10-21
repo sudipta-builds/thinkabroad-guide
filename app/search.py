@@ -1,74 +1,270 @@
 from __future__ import annotations
 
 import re
+from datetime import date, timedelta
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlencode
 
-from app import llm
+# name or IATA -> (IATA, label, domestic India)
+_PLACES: dict[str, tuple[str, str, bool]] = {
+    "jorhat": ("JRH", "Jorhat", True),
+    "jrh": ("JRH", "Jorhat", True),
+    "rowriah": ("JRH", "Jorhat", True),
+    "bengaluru": ("BLR", "Bengaluru", True),
+    "bangalore": ("BLR", "Bengaluru", True),
+    "bengaluru airport": ("BLR", "Bengaluru", True),
+    "blr": ("BLR", "Bengaluru", True),
+    "delhi": ("DEL", "Delhi", True),
+    "new delhi": ("DEL", "Delhi", True),
+    "del": ("DEL", "Delhi", True),
+    "mumbai": ("BOM", "Mumbai", True),
+    "bombay": ("BOM", "Mumbai", True),
+    "bom": ("BOM", "Mumbai", True),
+    "kolkata": ("CCU", "Kolkata", True),
+    "calcutta": ("CCU", "Kolkata", True),
+    "ccu": ("CCU", "Kolkata", True),
+    "chennai": ("MAA", "Chennai", True),
+    "madras": ("MAA", "Chennai", True),
+    "maa": ("MAA", "Chennai", True),
+    "hyderabad": ("HYD", "Hyderabad", True),
+    "hyd": ("HYD", "Hyderabad", True),
+    "goa": ("GOI", "Goa", True),
+    "dabolim": ("GOI", "Goa", True),
+    "goi": ("GOI", "Goa", True),
+    "pune": ("PNQ", "Pune", True),
+    "pnq": ("PNQ", "Pune", True),
+    "ahmedabad": ("AMD", "Ahmedabad", True),
+    "amd": ("AMD", "Ahmedabad", True),
+    "jaipur": ("JAI", "Jaipur", True),
+    "jai": ("JAI", "Jaipur", True),
+    "lucknow": ("LKO", "Lucknow", True),
+    "lko": ("LKO", "Lucknow", True),
+    "guwahati": ("GAU", "Guwahati", True),
+    "gau": ("GAU", "Guwahati", True),
+    "dibrugarh": ("DIB", "Dibrugarh", True),
+    "dib": ("DIB", "Dibrugarh", True),
+    "silchar": ("IXS", "Silchar", True),
+    "ixs": ("IXS", "Silchar", True),
+    "imphal": ("IMF", "Imphal", True),
+    "imf": ("IMF", "Imphal", True),
+    "agartala": ("IXA", "Agartala", True),
+    "ixa": ("IXA", "Agartala", True),
+    "kochi": ("COK", "Kochi", True),
+    "cochin": ("COK", "Kochi", True),
+    "cok": ("COK", "Kochi", True),
+    "thiruvananthapuram": ("TRV", "Thiruvananthapuram", True),
+    "trivandrum": ("TRV", "Thiruvananthapuram", True),
+    "trv": ("TRV", "Thiruvananthapuram", True),
+    "varanasi": ("VNS", "Varanasi", True),
+    "vns": ("VNS", "Varanasi", True),
+    "patna": ("PAT", "Patna", True),
+    "pat": ("PAT", "Patna", True),
+    "bhubaneswar": ("BBI", "Bhubaneswar", True),
+    "bbi": ("BBI", "Bhubaneswar", True),
+    "bagdogra": ("IXB", "Bagdogra", True),
+    "ixb": ("IXB", "Bagdogra", True),
+    "srinagar": ("SXR", "Srinagar", True),
+    "sxr": ("SXR", "Srinagar", True),
+    "chandigarh": ("IXC", "Chandigarh", True),
+    "ixc": ("IXC", "Chandigarh", True),
+    "indore": ("IDR", "Indore", True),
+    "idr": ("IDR", "Indore", True),
+    "nagpur": ("NAG", "Nagpur", True),
+    "nag": ("NAG", "Nagpur", True),
+    "coimbatore": ("CJB", "Coimbatore", True),
+    "cjb": ("CJB", "Coimbatore", True),
+    "visakhapatnam": ("VTZ", "Visakhapatnam", True),
+    "vizag": ("VTZ", "Visakhapatnam", True),
+    "vtz": ("VTZ", "Visakhapatnam", True),
+    "dubai": ("DXB", "Dubai", False),
+    "dxb": ("DXB", "Dubai", False),
+    "london": ("LHR", "London", False),
+    "lhr": ("LHR", "London", False),
+    "singapore": ("SIN", "Singapore", False),
+    "sin": ("SIN", "Singapore", False),
+    "bangkok": ("BKK", "Bangkok", False),
+    "bkk": ("BKK", "Bangkok", False),
+    "kathmandu": ("KTM", "Kathmandu", False),
+    "ktm": ("KTM", "Kathmandu", False),
+    "doha": ("DOH", "Doha", False),
+    "doh": ("DOH", "Doha", False),
+    "abu dhabi": ("AUH", "Abu Dhabi", False),
+    "auh": ("AUH", "Abu Dhabi", False),
+    "new york": ("JFK", "New York", False),
+    "jfk": ("JFK", "New York", False),
+    "paris": ("CDG", "Paris", False),
+    "cdg": ("CDG", "Paris", False),
+}
 
 
-def find_sponsored_jobs(country: str, role: str = "", *, limit: int = 5) -> list[dict[str, Any]]:
-    """Live job search via Gemini + Google Search grounding only."""
-    country = (country or "").strip()
-    role = (role or "").strip() or "jobs"
-
-    grounded = llm.gemini_search(
-        f"Find up to {limit} LIVE job openings in {country} for: {role or 'professionals'}.\n"
-        "Priority: visa sponsorship / skilled worker / work permit / relocation for internationals. "
-        "Skip pure internship spam unless relevant.\n"
-        "For each job ONE line:\n"
-        "TITLE | COMPANY | CITY | APPLY_URL | sponsorship note\n"
-        "Only real https apply URLs (Greenhouse, Lever, Ashby, company careers, LinkedIn jobs). Never invent URLs."
-    )
-    return _parse_pipe_lines(grounded, country)[:limit]
+def resolve_place(name: str) -> tuple[str, str, bool] | None:
+    key = re.sub(r"\s+", " ", (name or "").strip().lower())
+    return _PLACES.get(key)
 
 
-def _parse_pipe_lines(text: str, country: str) -> list[dict[str, Any]]:
-    if not text:
-        return []
-    out: list[dict[str, Any]] = []
-    for line in text.splitlines():
-        if "|" not in line:
+def mentioned_places(text: str) -> list[str]:
+    """City or airport names in left-to-right order, one hit per airport."""
+    raw = text or ""
+    occupied: list[tuple[int, int]] = []
+    found: list[tuple[int, str]] = []
+    for name in sorted(_PLACES, key=len, reverse=True):
+        for match in re.finditer(rf"\b{re.escape(name)}\b", raw, flags=re.I):
+            span = match.span()
+            if any(span[0] < end and span[1] > start for start, end in occupied):
+                continue
+            occupied.append(span)
+            found.append((span[0], name))
+    ordered = [name for _, name in sorted(found)]
+    out: list[str] = []
+    seen: set[str] = set()
+    for name in ordered:
+        code = _PLACES[name][0]
+        if code in seen:
             continue
-        parts = [p.strip() for p in line.split("|")]
-        if len(parts) < 4:
-            continue
-        title, company, city, url = parts[0], parts[1], parts[2], parts[3]
-        url = _extract_url(url)
-        if not url or not title:
-            continue
-        title = re.sub(r"^[\d\.\)\-\*\s]+", "", title).strip()
-        out.append(
-            {
-                "id": _job_id(url),
-                "title": title[:160],
-                "company": (company[:120] or _guess_company(title, url)),
-                "country": country.lower(),
-                "city": city[:80],
-                "apply_url": url,
-                "sponsor_status": "likely",
-                "tags": [],
-                "description": parts[4] if len(parts) > 4 else "",
-                "source": "gemini",
-            }
-        )
+        seen.add(code)
+        out.append(name)
     return out
 
 
-def _extract_url(raw: str) -> str:
-    m = re.search(r"https?://\S+", raw or "")
-    return (m.group(0).rstrip(").,]\"'") if m else "").strip()
+def find_flights(
+    origin: str,
+    destination: str,
+    depart: date | str,
+    *,
+    round_trip: bool = False,
+) -> list[dict[str, Any]]:
+    """Build live booking links instantly. No network and no LLM."""
+    when = depart if isinstance(depart, date) else date.fromisoformat(str(depart)[:10])
+    origin_hit = resolve_place(origin)
+    dest_hit = resolve_place(destination)
+    origin_label = origin_hit[1] if origin_hit else _title_place(origin)
+    dest_label = dest_hit[1] if dest_hit else _title_place(destination)
+    origin_code = origin_hit[0] if origin_hit else ""
+    dest_code = dest_hit[0] if dest_hit else ""
+    domestic = bool(origin_hit and dest_hit and origin_hit[2] and dest_hit[2])
+    route = _route_label(origin_label, origin_code, dest_label, dest_code)
+    blurb = _when_blurb(when, round_trip)
+    google = _google_url(origin_label, origin_code, dest_label, dest_code, when, round_trip)
+
+    flights: list[dict[str, Any]] = []
+    if origin_code and dest_code:
+        flights.append(
+            _row("MakeMyTrip", route, dest_label, origin_label, _mmt_url(origin_code, dest_code, when, round_trip, domestic), blurb, when)
+        )
+    flights.append(_row("Google Flights", route, dest_label, origin_label, google, blurb, when))
+    if origin_code and dest_code:
+        flights.append(
+            _row(
+                "Skyscanner",
+                route,
+                dest_label,
+                origin_label,
+                _sky_url(origin_code, dest_code, when, round_trip),
+                blurb,
+                when,
+            )
+        )
+    return flights
 
 
-def _job_id(url: str) -> str:
-    host = urlparse(url).netloc.replace("www.", "")
-    path = urlparse(url).path.rstrip("/")
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", f"{host}{path}").strip("-").lower()
-    return (slug or "job")[:80]
+def _row(
+    company: str,
+    route: str,
+    destination: str,
+    origin: str,
+    url: str,
+    blurb: str,
+    when: date,
+) -> dict[str, Any]:
+    return {
+        "id": _flight_id(company, route, when),
+        "title": route,
+        "company": company,
+        "country": destination.lower(),
+        "city": origin,
+        "apply_url": url,
+        "sponsor_status": "flight",
+        "tags": [],
+        "description": blurb,
+        "source": "links",
+    }
 
 
-def _guess_company(title: str, url: str) -> str:
-    if " at " in title.lower():
-        return title.split(" at ")[-1][:80].strip()
-    host = urlparse(url).netloc.replace("www.", "").split(".")[0]
-    return host[:80] or "Employer"
+def _flight_id(company: str, route: str, when: date) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", f"{company}-{route}-{when.isoformat()}").strip("-").lower()
+    return slug[:80]
+
+
+def _route_label(origin: str, origin_code: str, dest: str, dest_code: str) -> str:
+    left = f"{origin} ({origin_code})" if origin_code else origin
+    right = f"{dest} ({dest_code})" if dest_code else dest
+    return f"{left} → {right}"
+
+
+def _title_place(name: str) -> str:
+    return " ".join(part.capitalize() for part in (name or "").split()) or "City"
+
+
+def _when_blurb(when: date, round_trip: bool) -> str:
+    start = when.strftime("%a %d %b %Y")
+    if not round_trip:
+        return f"{start} · 1 adult · one way"
+    back = (when + timedelta(days=7)).strftime("%a %d %b %Y")
+    return f"{start} → {back} · 1 adult · round trip"
+
+
+def _google_url(
+    origin: str,
+    origin_code: str,
+    dest: str,
+    dest_code: str,
+    when: date,
+    round_trip: bool,
+) -> str:
+    left = f"{origin} {origin_code}".strip()
+    right = f"{dest} {dest_code}".strip()
+    if round_trip:
+        back = when + timedelta(days=7)
+        q = f"round trip flights from {left} to {right} on {when.isoformat()} returning {back.isoformat()}"
+    else:
+        q = f"one way flights from {left} to {right} on {when.isoformat()}"
+    return "https://www.google.com/travel/flights?" + urlencode({"hl": "en", "curr": "INR", "q": q})
+
+
+def _mmt_url(origin: str, dest: str, when: date, round_trip: bool, domestic: bool) -> str:
+    depart = when.strftime("%d/%m/%Y")
+    if round_trip:
+        back = (when + timedelta(days=7)).strftime("%d/%m/%Y")
+        itinerary = f"{origin}-{dest}-{depart}_{dest}-{origin}-{back}"
+        trip = "R"
+    else:
+        itinerary = f"{origin}-{dest}-{depart}"
+        trip = "O"
+    return "https://www.makemytrip.com/flight/search?" + urlencode(
+        {
+            "itinerary": itinerary,
+            "tripType": trip,
+            "paxType": "A-1_C-0_I-0",
+            "intl": "false" if domestic else "true",
+            "cabinClass": "E",
+            "ccde": "IN",
+            "lang": "eng",
+        }
+    )
+
+
+def _sky_url(origin: str, dest: str, when: date, round_trip: bool) -> str:
+    o = origin.lower()
+    d = dest.lower()
+    start = when.strftime("%y%m%d")
+    if round_trip:
+        back = (when + timedelta(days=7)).strftime("%y%m%d")
+        path = f"{o}/{d}/{start}/{back}"
+        rtn = "1"
+    else:
+        path = f"{o}/{d}/{start}"
+        rtn = "0"
+    return (
+        f"https://www.skyscanner.co.in/transport/flights/{path}/"
+        f"?adultsv2=1&cabinclass=economy&rtn={rtn}"
+    )

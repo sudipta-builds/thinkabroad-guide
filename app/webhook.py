@@ -9,7 +9,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 from app import agent
 from app.config import get_settings
 from app.reply import Reply
-from app.twilio_wa import digits_only, send_whatsapp
+from app.twilio_wa import digits_only, send_reaction, send_whatsapp
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,11 @@ async def twilio_whatsapp_inbound(request: Request):
         reply = agent.handle_message(phone, body)
     except Exception:
         logger.exception("Guide agent failed")
-        reply = Reply.of("Something went wrong on my side. Try again in a moment.")
+        reply = Reply.of("Something went wrong on my side. Try again in a moment.", emoji="⚠️")
+
+    if reply.emoji and not send_reaction(phone, message_sid, reply.emoji):
+        if not (reply.text or "").startswith(reply.emoji):
+            reply.text = f"{reply.emoji} {reply.text}".strip()
 
     settings = get_settings()
     if reply.media_urls and settings.twilio_ready:

@@ -66,10 +66,7 @@ def list_sites(phone: str) -> list[str]:
 
 def vault_help() -> str:
     return (
-        "Before I can apply for you, save:\n\n"
-        "1) Profile (name | email | phone):\n"
-        "*SAVE PROFILE Ada Lovelace | ada@email.com | +441234567890*\n\n"
-        "2) Optional site login:\n"
-        "*SAVE LINKEDIN ada@email.com yourpassword*\n\n"
-        "Then search jobs → *APPLY N* → *YES*."
+        "Passenger details, if you want them on file:\n"
+        "*SAVE PROFILE Full Name | you@email.com | +phone*\n\n"
+        "I ask permission before I book, and I never enter payment."
     )

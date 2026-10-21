@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     deepseek_model: str = "deepseek-chat"
 
-    # Gemini — live job search (Google Search grounding). Same as ThinkAbroad.
+    # Gemini — optional. Flight search itself does not wait on it.
     gemini_api_key: str = Field(
         default="",
         validation_alias=AliasChoices("GEMINI_API_KEY", "Gemini_API_KEY"),

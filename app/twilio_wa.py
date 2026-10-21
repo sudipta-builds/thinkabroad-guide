@@ -25,6 +25,33 @@ def whatsapp_address(phone: str) -> str:
     return f"whatsapp:+{digits_only(value).lstrip('+')}"
 
 
+def send_reaction(to_phone: str, message_sid: str, emoji: str) -> bool:
+    """Attach an emoji to the inbound WhatsApp message.
+
+    Twilio's public send API often rejects this. A False return means the
+    caller should show the emoji on the reply instead.
+    """
+    settings = get_settings()
+    emoji = (emoji or "").strip()
+    message_sid = (message_sid or "").strip()
+    if not settings.twilio_ready or not emoji or not message_sid:
+        return False
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.post(
+                f"https://api.twilio.com/2010-04-01/Accounts/{settings.twilio_account_sid}/Messages/{message_sid}/Reactions.json",
+                data={"Emoji": emoji},
+                auth=(settings.twilio_account_sid, settings.twilio_auth_token),
+            )
+        if resp.status_code >= 300:
+            logger.info("WhatsApp reaction not accepted %s", resp.status_code)
+            return False
+        return True
+    except Exception as exc:
+        logger.info("WhatsApp reaction failed: %s", type(exc).__name__)
+        return False
+
+
 def send_whatsapp_text(to_phone: str, body: str) -> bool:
     return send_whatsapp(to_phone, Reply(text=body))
 

@@ -23,7 +23,7 @@ def on_startup() -> None:
     db_path = db.resolve_db_path()
     db.init_db()
     logger.info(
-        "Guide ready v%s db=%s twilio=%s deepseek=%s gemini=%s vault=%s public=%s",
+        "Guide travel agent ready v%s db=%s twilio=%s deepseek=%s gemini=%s vault=%s public=%s",
         __version__,
         db_path,
         settings.twilio_ready,
@@ -41,6 +41,7 @@ def health() -> JSONResponse:
         {
             "ok": True,
             "service": "guide",
+            "agent": "travel",
             "channel": "whatsapp",
             "version": __version__,
             "twilio": settings.twilio_ready,
@@ -53,7 +54,7 @@ def health() -> JSONResponse:
 
 @app.get("/")
 def root() -> dict:
-    return {"service": "guide", "channel": "whatsapp", "health": "/health"}
+    return {"service": "guide", "agent": "travel", "channel": "whatsapp", "health": "/health"}
 
 
 @app.get("/media/{filename}")

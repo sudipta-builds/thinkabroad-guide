@@ -45,6 +45,81 @@ def chat(
         return ""
 
 
+def gemini_chat(prompt: str, *, timeout: float = 8.0, max_tokens: int = 220) -> str:
+    """Short Gemini reply with no search tool, used when DeepSeek is down."""
+    settings = get_settings()
+    if not settings.gemini_api_key:
+        return ""
+    model = (settings.gemini_model or "gemini-flash-lite-latest").strip()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    body: dict[str, Any] = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.4, "maxOutputTokens": max_tokens},
+    }
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.post(
+                url,
+                headers={
+                    "x-goog-api-key": settings.gemini_api_key.strip(),
+                    "Content-Type": "application/json",
+                },
+                json=body,
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        parts = data["candidates"][0]["content"]["parts"]
+        return "".join(p.get("text") or "" for p in parts).strip()
+    except Exception as exc:
+        logger.warning("Gemini chat failed: %s", type(exc).__name__)
+        return ""
+
+
+def converse(system: str, user: str, *, timeout: float = 6.0) -> dict[str, Any]:
+    """One short turn from a single model, so WhatsApp is not left waiting on two calls."""
+    if get_settings().llm_ready:
+        raw = chat(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.4,
+            max_tokens=220,
+            timeout=timeout,
+        )
+        data = _parse_json_obj(raw)
+        if data:
+            return data
+        # DeepSeek spoke in plain text. Use it instead of starting Gemini.
+        if raw:
+            return {"reply": raw[:500]}
+        return {}
+    raw = gemini_chat(system + "\n\n" + user, timeout=timeout, max_tokens=220)
+    return _parse_json_obj(raw) or ({"reply": raw[:500]} if raw else {})
+
+
+def _parse_json_obj(raw: str) -> dict[str, Any]:
+    import json
+    import re
+
+    if not raw:
+        return {}
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.S)
+        if not match:
+            return {}
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return {}
+    return data if isinstance(data, dict) else {}
+
+
 def gemini_search(prompt: str) -> str:
     """Gemini + Google Search grounding — live job discovery (ThinkAbroad model)."""
     settings = get_settings()

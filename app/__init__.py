@@ -1,3 +1,3 @@
-"""Guide — standalone WhatsApp agent for sponsored jobs (UK, Norway, Finland)."""
+"""Guide — WhatsApp travel agent. Fast flight search, screenshots, permission before booking."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

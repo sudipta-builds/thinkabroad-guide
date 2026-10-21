@@ -1,29 +1,27 @@
 # Guide
 
-WhatsApp-only personal AI that finds **and applies** to jobs (including sponsored roles).
+WhatsApp travel agent. Say a route and it replies immediately with live booking links and screenshots. It asks permission before it agrees to book.
 
-No web UI. No ThinkAbroad linkage.
+No web UI. Flight search does not wait on an LLM.
 
 ## Conversation
 
-1. `HI` → ask country (free text)
-2. User describes the job they want
-3. Live Gemini search → links + screenshots
-4. `SAVE PROFILE Name | email | phone` (required to submit)
-5. Optional: `SAVE LINKEDIN email password`
-6. `CV` → real **PDF + Word** CV (sent on WhatsApp when `GUIDE_PUBLIC_URL` is set)
-7. `APPLY N` → preview + CV files → `YES` → **Playwright submits** (Greenhouse / Lever / generic forms), uploads CV, fills cover note, returns result screenshot
+1. Say it like you would to a person: `Jorhat to Bengaluru`, then `2nd December one way`
+2. Guide keeps the trip in mind. If it has to guess the route, it asks you to confirm before searching
+3. A clear route and date gets flight links and screenshots, with a line that nothing is booked
+4. `book the first one` asks before it agrees. `YES` is the only time it says yes, and it stops before payment
+5. Wording comes from DeepSeek, or Gemini if DeepSeek is down. The booking decision stays in code
 
-Sites with CAPTCHA / heavy auth may not fully submit; Guide says so clearly.
+Optional passenger details: `SAVE PROFILE Full Name | email | phone`
 
 ## Providers
 
 | Service | Role |
 |--------|------|
-| **DeepSeek** | Chat, CV text, cover notes |
-| **Gemini** | Live job search |
-| **Twilio** | WhatsApp |
-| **Playwright (Chromium)** | Real form submit + CV upload |
+| **DeepSeek** | WhatsApp wording. Gemini is the fallback |
+| **Twilio** | WhatsApp text, emoji reaction, screenshot images |
+| **MakeMyTrip / Google Flights / Skyscanner** | Live booking links |
+| **mShots** | Page screenshots attached to the reply |
 
 ## Deploy
 

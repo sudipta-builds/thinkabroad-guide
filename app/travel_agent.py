@@ -110,7 +110,7 @@ def handle_turn(phone: str, text: str, state: dict[str, Any], prior: list[dict[s
         reply = reply or "Still on a live page. I'll message you when it loads."
     elif _force_browse(state, text):
         action = "browse"
-        if not reply or re.search(r"what route|which date|what date|do you care|where are you flying|one-way or return", reply, re.I):
+        if not reply or _reasks(reply):
             pref = state.get("preference") or "best fare"
             reply = (
                 f"Checking live sites for {state.get('origin')} to {state.get('destination')} "
@@ -155,6 +155,16 @@ def _recover_trip(state: dict[str, Any], prior: list[dict[str, Any]], text: str)
             data = absorb_trip(data, str(item.get("body") or ""))
             data = absorb_details(data, str(item.get("body") or ""))
     return absorb_details(absorb_trip(data, text), text)
+
+
+_REASK = re.compile(
+    r"what route|which date|what date|do you care|where are you flying|one-way or return",
+    re.I,
+)
+
+
+def _reasks(reply: str) -> bool:
+    return bool(_REASK.search(reply or ""))
 
 
 def _force_browse(state: dict[str, Any], text: str) -> bool:
@@ -315,7 +325,7 @@ def _loop(phone: str, text: str, session: BrowserSession, secrets: list[str]) ->
                     }
                 )
                 continue
-            final = _clean(str(msg.get("content") or ""), secrets).strip()
+            final = _clean(_recommendation(saw_price, messages, str(msg.get("content") or "")), secrets).strip()
             if final and final != last_sent:
                 _deliver(phone, final, session, secrets)
             elif not last_sent:
@@ -347,7 +357,7 @@ def _loop(phone: str, text: str, session: BrowserSession, secrets: list[str]) ->
         }
     )
     closer = llm.complete(messages, tools=None, timeout=25, max_tokens=500)
-    final = _clean(str(closer.get("content") or ""), secrets).strip()
+    final = _clean(_recommendation(saw_price, messages, str(closer.get("content") or "")), secrets).strip()
     if final and final != last_sent:
         _deliver(phone, final, session, secrets)
 
@@ -404,6 +414,21 @@ def _dispatch(phone: str, session: BrowserSession, call: dict[str, Any], secrets
     except Exception as exc:
         logger.exception("Tool %s failed", name)
         return f"Tool failed: {type(exc).__name__}"
+
+
+def _recommendation(saw_price: bool, messages: list[dict[str, Any]], fallback: str) -> str:
+    """DeepSeek reasoner judges live page evidence. The tool model only drives the browser."""
+    if not saw_price:
+        return fallback
+    evidence = [
+        str(item.get("content") or "")[:1500]
+        for item in messages
+        if item.get("role") == "tool" and ("Prices visible" in str(item.get("content") or "") or "NO FARES" in str(item.get("content") or ""))
+    ]
+    if not evidence:
+        return fallback
+    judged = llm.reason("Live pages:\n\n" + "\n\n".join(evidence))
+    return judged.strip() or fallback
 
 
 def _memory_lines(state: dict[str, Any]) -> list[str]:

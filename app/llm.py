@@ -70,6 +70,69 @@ def complete(
     return {"content": (message.get("content") or "").strip(), "tool_calls": calls}
 
 
+def reason(prompt: str, *, timeout: float = 40.0) -> str:
+    """Judge live evidence. Uses the reasoning model, then the chat model if that fails."""
+    settings = get_settings()
+    if not settings.llm_ready or not (prompt or "").strip():
+        return ""
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are judging a live flight search for a WhatsApp traveller. "
+                "Use only prices, times, and stops that appear in the evidence. "
+                "Say which site failed if the evidence says so. Recommend one option and why. "
+                "Say nothing has been paid. Start with one emoji. Keep it under 8 short lines."
+            ),
+        },
+        {"role": "user", "content": prompt[:12000]},
+    ]
+    models = [settings.deepseek_reason_model, settings.deepseek_model]
+    seen: set[str] = set()
+    for model in models:
+        if not model or model in seen:
+            continue
+        seen.add(model)
+        text = _raw_chat(model, messages, max_tokens=900, timeout=timeout, temperature=0.2)
+        if text:
+            return text
+    return ""
+
+
+def _raw_chat(
+    model: str,
+    messages: list[dict[str, Any]],
+    *,
+    max_tokens: int,
+    timeout: float,
+    temperature: float,
+) -> str:
+    settings = get_settings()
+    url = settings.deepseek_base_url.rstrip("/") + "/chat/completions"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {settings.deepseek_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+        resp.raise_for_status()
+        message = resp.json()["choices"][0]["message"] or {}
+    except Exception as exc:
+        logger.warning("DeepSeek %s failed: %s", model, type(exc).__name__)
+        return ""
+    return (message.get("content") or "").strip()
+
+
 def chat(
     messages: list[dict[str, str]],
     *,

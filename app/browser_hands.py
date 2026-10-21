@@ -138,6 +138,11 @@ def page_blocked(text: str) -> bool:
     return bool(_BLOCK.search(text or ""))
 
 
+def should_capture(text: str) -> bool:
+    """Keep a screenshot only when the page shows fares or a block, not a blank load."""
+    return bool(prices_in(text) or page_blocked(text))
+
+
 def looks_like_card(value: str) -> bool:
     digits = re.sub(r"\D", "", value or "")
     return 13 <= len(digits) <= 19 and len(digits) >= len(re.sub(r"\s", "", value or "")) - 2
@@ -445,7 +450,7 @@ class BrowserSession:
         except Exception:
             title = ""
         prices = prices_in(self.last_text)
-        blocked = bool(_BLOCK.search(self.last_text))
+        blocked = page_blocked(self.last_text)
         flag = ""
         if blocked:
             flag = (

@@ -1,3 +1,3 @@
 """Guide — WhatsApp travel agent. Fast flight search, screenshots, permission before booking."""
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"

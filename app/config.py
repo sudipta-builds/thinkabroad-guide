@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     deepseek_model: str = "deepseek-chat"
+    deepseek_reason_model: str = "deepseek-reasoner"
 
     # Gemini — optional. Flight search itself does not wait on it.
     gemini_api_key: str = Field(

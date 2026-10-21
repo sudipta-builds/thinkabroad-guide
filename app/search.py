@@ -45,6 +45,8 @@ _PLACES: dict[str, tuple[str, str, bool]] = {
     "lucknow": ("LKO", "Lucknow", True),
     "lko": ("LKO", "Lucknow", True),
     "guwahati": ("GAU", "Guwahati", True),
+    "gauhati": ("GAU", "Guwahati", True),
+    "ghy": ("GAU", "Guwahati", True),
     "gau": ("GAU", "Guwahati", True),
     "dibrugarh": ("DIB", "Dibrugarh", True),
     "dib": ("DIB", "Dibrugarh", True),

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from app.browser_hands import looks_like_card, payment_control, should_capture
 from app.config import get_settings
+from app.db import choose_db_path
 from app.intent import explicit_date, week_window
 from app.travel_agent import (
     _force_browse,
@@ -37,6 +38,32 @@ class DateAndMemory(unittest.TestCase):
         self.assertEqual(state["depart"], "2026-12-01")
         self.assertEqual(state["depart_until"], "2026-12-07")
         self.assertIn("2026-12-01 through 2026-12-07", " ".join(_memory_lines(state)))
+
+    def test_a_second_route_does_not_delete_the_first(self) -> None:
+        state = _recover_trip({}, [], "jorhat to bengaluru, 1st week of december")
+        state = _recover_trip(state, [], "also guwahati to delhi")
+        self.assertEqual(state["origin"].lower(), "guwahati")
+        self.assertEqual(state["destination"].lower(), "delhi")
+        self.assertFalse(state.get("depart"))
+        text = " ".join(_memory_lines(state)).lower()
+        self.assertIn("guwahati", text)
+        self.assertIn("jorhat", text)
+        self.assertIn("2026-12-01", text)
+        restored = _recover_trip(state, [], "jorhat")
+        self.assertEqual(restored["depart"], "2026-12-01")
+        self.assertIn("bengaluru", restored["destination"].lower())
+
+    def test_repo_database_is_not_the_one_that_survives_deploy(self) -> None:
+        project = Path("/opt/render/project/src")
+        mount = Path("/var/data")
+        self.assertEqual(choose_db_path(Path("data/guide.db"), project=project, mount=mount), mount / "guide.db")
+        self.assertEqual(
+            choose_db_path(project / "data" / "guide.db", project=project, mount=mount),
+            mount / "guide.db",
+        )
+        outside = Path("C:/outside/custom.db") if os.name == "nt" else Path("/tmp/custom.db")
+        self.assertEqual(choose_db_path(outside, project=project, mount=mount), outside)
+        self.assertEqual(choose_db_path(Path("data/guide.db"), project=project, mount=None), Path("data/guide.db"))
 
     def test_same_ones_keeps_the_saved_trip(self) -> None:
         prior = [{"role": "user", "body": "jorhat to bengaluru, 23rd nov, cheapest"}]

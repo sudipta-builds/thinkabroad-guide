@@ -192,9 +192,9 @@ def _prefer_render_browsers() -> None:
 
 
 def _profile_dir(phone: str) -> Path:
-    from app.config import get_settings
+    from app import db
 
-    root = Path(get_settings().guide_db_path).parent / "browser-profiles"
+    root = db.resolve_db_path().parent / "browser-profiles"
     safe = re.sub(r"\W", "", phone or "")[:20] or "anon"
     path = root / safe
     path.mkdir(parents=True, exist_ok=True)

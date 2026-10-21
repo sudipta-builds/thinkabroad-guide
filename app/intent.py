@@ -34,7 +34,7 @@ _BOOK_NUM = re.compile(
     re.I,
 )
 _LEAD = re.compile(
-    r"^(?:please|kindly|book|find|search|show|get|need|want|looking|a|an|the|me|for|flight|flights|ticket|tickets|from|one|way|ow)\s+",
+    r"^(?:please|kindly|book|find|search|show|get|need|want|looking|a|an|the|me|for|flight|flights|ticket|tickets|from|one|way|ow|also|another|include|too)\s+",
     re.I,
 )
 _TAIL = re.compile(

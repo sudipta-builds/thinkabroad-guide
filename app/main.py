@@ -49,6 +49,7 @@ def health() -> JSONResponse:
     from app.browser_hands import chromium_ready
 
     settings = get_settings()
+    db_path = db.resolve_db_path()
     return JSONResponse(
         {
             "ok": True,
@@ -61,6 +62,8 @@ def health() -> JSONResponse:
             "gemini": settings.search_ready,
             "vault": settings.vault_ready,
             "chromium": chromium_ready(),
+            "memory": "persistent" if str(db_path).startswith("/var/data") else "ephemeral",
+            "db": str(db_path),
         }
     )
 

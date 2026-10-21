@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -18,17 +20,46 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def choose_db_path(configured: Path, *, project: Path, mount: Path | None) -> Path:
+    """A file inside the repo is replaced on every Render deploy. The disk mount is not."""
+    if mount is not None:
+        inside_project = False
+        if configured.is_absolute():
+            try:
+                inside_project = configured.resolve().is_relative_to(project.resolve())
+            except (OSError, ValueError):
+                inside_project = False
+        if not configured.is_absolute() or inside_project:
+            return mount / "guide.db"
+    return configured
+
+
+def _mount_dir() -> Path | None:
+    mount = Path("/var/data")
+    if mount.is_dir() and os.access(mount, os.W_OK):
+        return mount
+    return None
+
+
 def resolve_db_path() -> Path:
     """Pick a writable SQLite path. /var/data needs a Render disk mount."""
     global _resolved_db_path
     if _resolved_db_path is not None:
         return _resolved_db_path
 
-    candidates = [
-        Path(get_settings().guide_db_path or "data/guide.db"),
-        Path("data/guide.db"),
-        Path("/tmp/guide.db"),
-    ]
+    project = Path(__file__).resolve().parents[1]
+    configured = Path(get_settings().guide_db_path or "data/guide.db")
+    mount = _mount_dir()
+    chosen = choose_db_path(configured, project=project, mount=mount)
+    if mount is not None and chosen.parent == mount and not chosen.exists():
+        legacy = project / "data" / "guide.db"
+        if legacy.is_file() and legacy.stat().st_size > 0:
+            try:
+                chosen.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(legacy, chosen)
+            except OSError:
+                pass
+    candidates = [chosen, configured, Path("data/guide.db"), Path("/tmp/guide.db")]
     # de-dupe while preserving order
     seen: set[str] = set()
     ordered: list[Path] = []

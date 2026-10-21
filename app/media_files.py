@@ -8,7 +8,14 @@ from pathlib import Path
 from app.config import get_settings
 
 def media_dirs() -> list[Path]:
-    dirs = [Path("data/media")]
+    dirs: list[Path] = []
+    try:
+        from app import db
+
+        dirs.append(db.resolve_db_path().parent / "media")
+    except Exception:
+        pass
+    dirs.append(Path("data/media"))
     try:
         extra = Path(get_settings().guide_db_path).parent / "media"
     except Exception:

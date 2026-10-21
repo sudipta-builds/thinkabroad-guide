@@ -45,6 +45,7 @@ _PLANNER = (
     "Do not invent prices, times, or airlines.\n"
     "emoji is one of 👍 🤔 ✈️.\n"
     "Memory is what you already know. Never ask again for anything in Memory, and never say a saved trip or an in-progress search does not exist.\n"
+    "Also saved trips stay saved when the traveller adds another route. Search the active trip. Ask for a date only when that active trip has none.\n"
     "depart_until means a week window. Search that whole window. Do not ask them to pick one day inside it.\n"
     "If origin, destination, and depart are already filled, action is browse unless they only asked what you already found.\n"
     "same ones, yes, cheapest, or a site name means browse the saved trip.\n"
@@ -212,6 +213,18 @@ def _trip_line(state: dict[str, Any]) -> str:
     return f"{state['origin']} to {state['destination']} on {state['depart']}"
 
 
+def _window_phrase(state: dict[str, Any]) -> str:
+    origin = state.get("origin") or "?"
+    destination = state.get("destination") or "?"
+    depart = str(state.get("depart") or "")
+    until = str(state.get("depart_until") or "")
+    if depart and until and until != depart:
+        return f"{origin} to {destination}, {depart} through {until}"
+    if depart:
+        return f"{origin} to {destination} on {depart}"
+    return f"{origin} to {destination}, date not set"
+
+
 def _grounded(state: dict[str, Any], *, browsing: bool, busy: bool) -> str:
     """Used only when the model contradicts memory. Words come from saved facts."""
     trip = _trip_line(state)
@@ -259,7 +272,99 @@ def _force_browse(state: dict[str, Any], text: str) -> bool:
 def absorb_trip(state: dict[str, Any], text: str) -> dict[str, Any]:
     from app import agent, intent
 
-    return agent._merge(dict(state), intent.parse_updates(text))
+    updates = intent.parse_updates(text)
+    data = agent._merge(dict(state), updates)
+    _remember_routes(state, data, text, updates)
+    return data
+
+
+def _route_key(item: dict[str, Any]) -> tuple[str, str]:
+    return (str(item.get("origin") or "").casefold(), str(item.get("destination") or "").casefold())
+
+
+def _route_snapshot(state: dict[str, Any]) -> dict[str, str] | None:
+    if not (state.get("origin") and state.get("destination")):
+        return None
+    return {
+        "origin": str(state.get("origin") or ""),
+        "destination": str(state.get("destination") or ""),
+        "depart": str(state.get("depart") or ""),
+        "depart_until": str(state.get("depart_until") or ""),
+        "preference": str(state.get("preference") or ""),
+    }
+
+
+def _upsert_trip(trips: list[dict[str, Any]], snap: dict[str, str]) -> list[dict[str, Any]]:
+    key = _route_key(snap)
+    out: list[dict[str, Any]] = []
+    replaced = False
+    for item in trips:
+        if _route_key(item) != key:
+            out.append(item)
+            continue
+        merged = dict(item)
+        merged["origin"] = snap["origin"]
+        merged["destination"] = snap["destination"]
+        for field in ("depart", "depart_until", "preference"):
+            if snap.get(field):
+                merged[field] = snap[field]
+        out.append(merged)
+        replaced = True
+    if not replaced:
+        out.append(dict(snap))
+    return out[-8:]
+
+
+def _switch_saved(text: str, trips: list[dict[str, Any]]) -> dict[str, str] | None:
+    from app.search import mentioned_places
+
+    names = mentioned_places(text or "")
+    if len(names) != 1 or not trips:
+        return None
+    city = names[0].casefold()
+    hits = [
+        trip
+        for trip in trips
+        if city in {str(trip.get("origin") or "").casefold(), str(trip.get("destination") or "").casefold()}
+    ]
+    if len(hits) != 1:
+        return None
+    return {key: str(hits[0].get(key) or "") for key in ("origin", "destination", "depart", "depart_until", "preference")}
+
+
+def _remember_routes(before: dict[str, Any], after: dict[str, Any], text: str, updates: dict[str, Any]) -> None:
+    """Keep every route. A second trip becomes active and does not delete the first."""
+    trips = [dict(item) for item in (before.get("trips") or []) if isinstance(item, dict)]
+    prev = _route_snapshot(before)
+    if prev:
+        trips = _upsert_trip(trips, prev)
+    named = bool(updates.get("origin") and updates.get("destination"))
+    changed = bool(prev) and named and _route_key(prev) != (
+        str(updates.get("origin") or "").casefold(),
+        str(updates.get("destination") or "").casefold(),
+    )
+    if not named:
+        switched = _switch_saved(text, trips)
+        if switched and _route_key(switched) != _route_key(before):
+            after.update(switched)
+            if not switched.get("depart_until"):
+                after.pop("depart_until", None)
+    elif changed and "depart" not in updates:
+        match = next((item for item in trips if _route_key(item) == _route_key(after)), None)
+        if match and match.get("depart"):
+            after["depart"] = match["depart"]
+            if match.get("depart_until"):
+                after["depart_until"] = match["depart_until"]
+            else:
+                after.pop("depart_until", None)
+        else:
+            after.pop("depart", None)
+            after.pop("depart_until", None)
+    current = _route_snapshot(after)
+    if current:
+        trips = _upsert_trip(trips, current)
+    if trips:
+        after["trips"] = trips
 
 
 def absorb_details(state: dict[str, Any], text: str) -> dict[str, Any]:
@@ -563,10 +668,11 @@ def _recommendation(saw_price: bool, messages: list[dict[str, Any]], fallback: s
 def _memory_lines(state: dict[str, Any]) -> list[str]:
     lines: list[str] = []
     if state.get("origin") or state.get("destination") or state.get("depart"):
-        window = state.get("depart") or "date not set"
-        if state.get("depart_until") and state.get("depart_until") != state.get("depart"):
-            window = f"{state.get('depart')} through {state.get('depart_until')}"
-        lines.append(f"Trip: {state.get('origin') or '?'} to {state.get('destination') or '?'} on {window}.")
+        lines.append(f"Active trip: {_trip_line(state) or _window_phrase(state)}.")
+        for saved in state.get("trips") or []:
+            if not isinstance(saved, dict) or _route_key(saved) == _route_key(state):
+                continue
+            lines.append(f"Also saved: {_window_phrase(saved)}.")
     if state.get("preference"):
         lines.append(f"Cares about: {state['preference']}.")
     if state.get("trip_type"):

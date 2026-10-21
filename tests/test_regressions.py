@@ -12,6 +12,7 @@ from app.config import get_settings
 from app.intent import explicit_date
 from app.travel_agent import (
     _force_browse,
+    _human_reply,
     _memory_lines,
     _reasks,
     _recommendation,
@@ -66,6 +67,13 @@ class IntentGuards(unittest.TestCase):
     def test_reask_wording_is_caught(self) -> None:
         self.assertTrue(_reasks("What route and date should I search, and do you care most about cheapest?"))
         self.assertFalse(_reasks("Checking live sites for Jorhat to Bengaluru on 2026-11-23."))
+
+    def test_known_trip_is_not_asked_back(self) -> None:
+        trip = {"origin": "Jorhat", "destination": "Bengaluru", "depart": "2026-11-23", "preference": "cheapest"}
+        spoken = _human_reply(trip, "What route and date should I search?", browsing=True, busy=False)
+        self.assertNotIn("What route", spoken)
+        self.assertIn("Jorhat", spoken)
+        self.assertIn("2026-11-23", spoken)
 
 
 class LivePageGuards(unittest.TestCase):

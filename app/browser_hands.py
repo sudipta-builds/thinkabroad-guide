@@ -139,8 +139,11 @@ def page_blocked(text: str) -> bool:
 
 
 def should_capture(text: str) -> bool:
-    """Keep a screenshot only when the page shows fares or a block, not a blank load."""
-    return bool(prices_in(text) or page_blocked(text))
+    """Keep a screenshot when the page has fares, a block, or real text. Skip a blank load."""
+    if prices_in(text) or page_blocked(text):
+        return True
+    body = re.sub(r"\s+", " ", text or "").strip()
+    return len(body) > 180
 
 
 def looks_like_card(value: str) -> bool:
@@ -462,7 +465,8 @@ class BrowserSession:
                 "\nNO FARES RENDERED. Open a different seller in this same run. "
                 "Do not ask the traveller for the route, date, or preference."
             )
-            shoot = False
+            if not should_capture(self.last_text):
+                shoot = False
         shot_note = ""
         if shoot:
             path = self._screenshot()

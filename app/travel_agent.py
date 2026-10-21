@@ -66,8 +66,8 @@ _BROWSER = (
     "If a site asks for login and a vault login exists, fill_saved_login. If it does not exist, ask, then save_login.\n"
     "Fill the booking. Never click Pay or anything that charges. Stop on that screen and quote the total you saw.\n"
     "Never type a card, CVV, or OTP.\n"
-    "Call tell_user only when you have real prices, a login wall that needs their email or password, or a form that needs a missing detail. "
-    "Do not send a blank page. "
+    "Call tell_user as soon as a page has loaded, and include what you saw. "
+    "A screenshot should go with that message. If that site has no fares, say so and open the next one. "
     "End with a normal message and no tool call when you have the recommendation or the filled form. Do not repeat yourself.\n"
     "Call watch_fare with a price you actually saw, so a later change can be sent without them asking.\n"
     "Start user-facing text with one emoji. Sound like a person, not a menu. Nothing is paid."
@@ -110,12 +110,7 @@ def handle_turn(phone: str, text: str, state: dict[str, Any], prior: list[dict[s
         reply = reply or "Still on a live page. I'll message you when it loads."
     elif _force_browse(state, text):
         action = "browse"
-        if not reply or _reasks(reply):
-            pref = state.get("preference") or "best fare"
-            reply = (
-                f"Checking live sites for {state.get('origin')} to {state.get('destination')} "
-                f"on {state.get('depart')}, {pref}. Nothing is booked."
-            )
+    reply = _human_reply(state, reply, browsing=action == "browse", busy=busy)
     if action == "browse":
         if re.search(r"₹|Rs\.?\s*\d", reply):
             reply = "Opening live pages for that trip. I'll send what actually loads. Nothing is booked."
@@ -165,6 +160,28 @@ _REASK = re.compile(
 
 def _reasks(reply: str) -> bool:
     return bool(_REASK.search(reply or ""))
+
+
+def _trip_line(state: dict[str, Any]) -> str:
+    if not (state.get("origin") and state.get("destination") and state.get("depart")):
+        return ""
+    return f"{state['origin']} to {state['destination']} on {state['depart']}"
+
+
+def _human_reply(state: dict[str, Any], reply: str, *, browsing: bool, busy: bool) -> str:
+    """One human line. Never ask again for a trip that is already known."""
+    spoken = (reply or "").strip()
+    trip = _trip_line(state)
+    if busy and trip:
+        return f"Still on {trip}. I'll send the screenshot when the page loads."
+    if trip and (not spoken or _reasks(spoken)):
+        if browsing:
+            pref = state.get("preference") or "the best option I can see"
+            return f"Got it, {trip}, {pref}. I'll send a screenshot of what loads. Nothing is booked."
+        if not state.get("preference"):
+            return f"Got it, {trip}. Cheapest, a better time, or fewer stops?"
+        return f"Still {trip}. I can check it whenever you want."
+    return spoken or "Where are you flying, and when?"
 
 
 def _force_browse(state: dict[str, Any], text: str) -> bool:
@@ -289,7 +306,9 @@ def _run_browse(phone: str, text: str, started_at: float | None = None) -> None:
             return
         try:
             with BrowserSession(phone) as session:
-                _loop(phone, text, session, secrets)
+                sent = _loop(phone, text, session, secrets)
+                if not sent:
+                    _deliver(phone, "I opened the page but didn't get a clean read. Nothing is booked.", session, secrets)
         finally:
             _LOCK.release()
     except Exception:
@@ -300,13 +319,14 @@ def _run_browse(phone: str, text: str, started_at: float | None = None) -> None:
             _clear_busy(phone, started_at)
 
 
-def _loop(phone: str, text: str, session: BrowserSession, secrets: list[str]) -> None:
+def _loop(phone: str, text: str, session: BrowserSession, secrets: list[str]) -> bool:
     state = _load(phone)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": _BROWSER},
         {"role": "user", "content": _task_payload(phone, text, state)},
     ]
     last_sent = ""
+    sent = False
     hosts: set[str] = set()
     saw_price = False
     for step in range(12):
@@ -328,9 +348,13 @@ def _loop(phone: str, text: str, session: BrowserSession, secrets: list[str]) ->
             final = _clean(_recommendation(saw_price, messages, str(msg.get("content") or "")), secrets).strip()
             if final and final != last_sent:
                 _deliver(phone, final, session, secrets)
+                sent = True
             elif not last_sent:
                 _deliver(phone, "I opened live pages and no fares rendered. Nothing was booked.", session, secrets)
-            return
+                sent = True
+            elif last_sent:
+                sent = True
+            return sent
         messages.append(_assistant_message(msg))
         for call in calls:
             result = _dispatch(phone, session, call, secrets)
@@ -349,6 +373,7 @@ def _loop(phone: str, text: str, session: BrowserSession, secrets: list[str]) ->
                     _add_note(phone, f"{host} prices {seen.group(1) if seen else 'seen'}.")
             if call.get("name") == "tell_user":
                 last_sent = _clean(str((call.get("arguments") or {}).get("text") or ""), secrets).strip()
+                sent = True
             messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": result[:4000]})
     messages.append(
         {
@@ -360,6 +385,8 @@ def _loop(phone: str, text: str, session: BrowserSession, secrets: list[str]) ->
     final = _clean(_recommendation(saw_price, messages, str(closer.get("content") or "")), secrets).strip()
     if final and final != last_sent:
         _deliver(phone, final, session, secrets)
+        sent = True
+    return sent or bool(last_sent)
 
 
 def _dispatch(phone: str, session: BrowserSession, call: dict[str, Any], secrets: list[str]) -> str:

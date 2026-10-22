@@ -157,6 +157,73 @@ class MetaWebhookVerify(unittest.TestCase):
             get_settings.cache_clear()
 
 
+class MetaReactionOutbound(unittest.TestCase):
+    def test_strip_leading_emoji_keeps_plain_text(self) -> None:
+        from app.reply import for_send, strip_leading_emoji
+        from app.reply import Reply
+
+        self.assertEqual(strip_leading_emoji("Where are you flying?"), "Where are you flying?")
+        self.assertEqual(strip_leading_emoji("✈️ Opening live pages."), "Opening live pages.")
+        self.assertEqual(strip_leading_emoji("👍 Got it."), "Got it.")
+
+        reacted = for_send(Reply.of("✈️ Opening live pages.", emoji="✈️"), reacted=True)
+        self.assertEqual(reacted.text, "Opening live pages.")
+        self.assertEqual(reacted.emoji, "✈️")
+
+        fallback = for_send(Reply.of("Opening live pages.", emoji="✈️"), reacted=False)
+        self.assertTrue(fallback.text.startswith("✈️"))
+        self.assertIn("Opening live pages.", fallback.text)
+
+    def test_meta_reaction_posts_cloud_api_payload(self) -> None:
+        from unittest.mock import patch
+
+        from app import meta_wa
+        from app.config import get_settings
+        from app.reply import Reply
+
+        get_settings.cache_clear()
+        os.environ["WHATSAPP_TOKEN"] = "test-token"
+        os.environ["WHATSAPP_PHONE_NUMBER_ID"] = "1419600664569017"
+        get_settings.cache_clear()
+        posted: list[dict] = []
+
+        class FakeResp:
+            status_code = 200
+            text = "{}"
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def post(self, url, headers=None, json=None):
+                posted.append({"url": url, "json": json, "headers": headers})
+                return FakeResp()
+
+        try:
+            with patch("app.meta_wa.httpx.Client", FakeClient):
+                ok = meta_wa.send_reaction("33759341005", "wamid.TEST123", "👍")
+                send_ok = meta_wa.send_whatsapp("33759341005", Reply.of("Opening live pages.", emoji="👍"))
+        finally:
+            os.environ.pop("WHATSAPP_TOKEN", None)
+            os.environ.pop("WHATSAPP_PHONE_NUMBER_ID", None)
+            get_settings.cache_clear()
+
+        self.assertTrue(ok)
+        self.assertTrue(send_ok)
+        reaction = next(p for p in posted if (p["json"] or {}).get("type") == "reaction")
+        self.assertEqual(reaction["json"]["reaction"]["emoji"], "👍")
+        self.assertEqual(reaction["json"]["reaction"]["message_id"], "wamid.TEST123")
+        text_msg = next(p for p in posted if (p["json"] or {}).get("type") == "text")
+        self.assertEqual(text_msg["json"]["text"]["body"], "Opening live pages.")
+        self.assertNotIn("👍", text_msg["json"]["text"]["body"])
+
+
 class TypingAndSpeed(unittest.TestCase):
     def test_typing_form_is_the_whatsapp_indicator(self) -> None:
         url, payload = typing_form("SMabc123")

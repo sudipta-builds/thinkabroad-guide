@@ -10,7 +10,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 from app import agent
 from app.config import get_settings
 from app import meta_wa
-from app.reply import Reply
+from app.reply import Reply, for_send
 from app.twilio_wa import digits_only, remember_inbound, send_whatsapp
 
 logger = logging.getLogger(__name__)
@@ -70,10 +70,14 @@ async def meta_whatsapp_inbound(request: Request, background_tasks: BackgroundTa
     def _handle_one(phone: str, body: str, message_id: str) -> None:
         logger.info("Inbound Meta WA from %s id=%s len=%s", phone, message_id, len(body))
         reply = _build_reply(phone, body, message_id)
+        reacted = False
+        if reply.emoji and message_id:
+            from app.twilio_wa import send_reaction
+
+            reacted = send_reaction(phone, message_id, reply.emoji)
+        reply = for_send(reply, reacted=reacted)
         if not (reply.text or "").strip() and not reply.media_urls:
             return
-        if reply.emoji and reply.text and not reply.text.startswith(reply.emoji):
-            reply.text = f"{reply.emoji} {reply.text}".strip()
         if settings.meta_wa_ready:
             send_whatsapp(phone, reply)
         else:
@@ -102,14 +106,17 @@ async def twilio_whatsapp_inbound(request: Request):
 
     reply = _build_reply(phone, body, message_sid)
 
+    settings = get_settings()
+    reacted = False
+    if reply.emoji and message_sid:
+        from app.twilio_wa import send_reaction
+
+        reacted = send_reaction(phone, message_sid, reply.emoji)
+    reply = for_send(reply, reacted=reacted)
+
     if not (reply.text or "").strip() and not reply.media_urls:
         return Response(content=str(MessagingResponse()), media_type="application/xml")
 
-    # Twilio cannot tap-back WhatsApp messages. Keep the emoji on the reply text.
-    if reply.emoji and not (reply.text or "").startswith(reply.emoji):
-        reply.text = f"{reply.emoji} {reply.text}".strip()
-
-    settings = get_settings()
     if reply.media_urls and (settings.meta_wa_ready or settings.twilio_ready):
         send_whatsapp(phone, reply)
         return Response(content=str(MessagingResponse()), media_type="application/xml")

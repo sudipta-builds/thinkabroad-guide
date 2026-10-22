@@ -75,7 +75,7 @@ _BROWSER = (
     "Call tell_user only for the recommendation or the form total. If a site has no fares, open the next one. "
     "End with a normal message and no tool call when you have the recommendation or the filled form. Do not repeat yourself.\n"
     "Call watch_fare with a price you actually saw, so a later change can be sent without them asking.\n"
-    "Start user-facing text with one emoji. Sound like a person, not a menu. Nothing is paid."
+    "Do not put emoji in message text — reactions are sent separately. Sound like a person, not a menu. Nothing is paid."
 )
 
 _TOOLS: list[dict[str, Any]] = [
@@ -546,7 +546,7 @@ def _publish_fares(
                     "content": (
                         "Write 3 or 4 short WhatsApp lines. Use only fares and times in the page text. "
                         "If prices are in dollars, say so and do not convert them. Recommend one option. "
-                        "Say nothing is booked. Start with one emoji.\n\n"
+                        "Say nothing is booked. Do not put emoji in the text.\n\n"
                         f"Trip: {_window_phrase(state)}\nPage:\n{snippet}"
                     ),
                 }
@@ -876,9 +876,10 @@ def _assistant_message(msg: dict[str, Any]) -> dict[str, Any]:
 
 
 def _deliver(phone: str, text: str, session: BrowserSession | None, secrets: list[str]) -> None:
-    from app.twilio_wa import send_whatsapp
+    from app.reply import for_send, strip_leading_emoji
+    from app.twilio_wa import inbound_sid, send_reaction, send_whatsapp
 
-    spoken = _with_emoji(_clean(text, secrets))
+    spoken = strip_leading_emoji(_clean(text, secrets))
     urls: list[str] = []
     had_shot = False
     if session is not None and session.unsent:
@@ -891,17 +892,12 @@ def _deliver(phone: str, text: str, session: BrowserSession | None, secrets: lis
     if had_shot and not urls:
         spoken += "\nI have the live screenshot, but this server has no public URL set, so WhatsApp cannot show the image."
         logger.warning("Screenshot saved but GUIDE_PUBLIC_URL is empty")
-    send_whatsapp(phone, Reply(text=spoken[:4000], media_urls=urls[:3]))
-    db.add_message(phone, "assistant", spoken[:2000])
-
-
-def _with_emoji(text: str) -> str:
-    spoken = (text or "").strip()
-    if not spoken:
-        return spoken
-    if spoken[0].isalnum():
-        return f"✈️ {spoken}"
-    return spoken
+    emoji = "✈️"
+    sid = inbound_sid(phone)
+    reacted = bool(sid) and send_reaction(phone, sid, emoji)
+    outbound = for_send(Reply.of(spoken[:4000], *urls[:3], emoji=emoji), reacted=reacted)
+    send_whatsapp(phone, outbound)
+    db.add_message(phone, "assistant", outbound.text[:2000])
 
 
 def _clean(text: str, secrets: list[str]) -> str:

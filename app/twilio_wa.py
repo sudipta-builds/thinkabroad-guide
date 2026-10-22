@@ -98,7 +98,13 @@ def send_reaction(to_phone: str, message_sid: str, emoji: str) -> bool:
     settings = get_settings()
     emoji = (emoji or "").strip()
     message_sid = (message_sid or "").strip()
-    if not settings.twilio_ready or not emoji or not message_sid:
+    if not emoji or not message_sid:
+        return False
+    if settings.meta_wa_ready:
+        from app.meta_wa import send_reaction as meta_reaction
+
+        return meta_reaction(to_phone, message_sid, emoji)
+    if not settings.twilio_ready:
         return False
     from_num = settings.twilio_whatsapp_from
     if not from_num.startswith("whatsapp:"):

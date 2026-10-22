@@ -100,6 +100,33 @@ def send_typing(message_id: str) -> bool:
         return False
 
 
+def send_reaction(to_phone: str, message_id: str, emoji: str) -> bool:
+    """Tap-back emoji on the user's inbound message (Cloud API reaction)."""
+    settings = get_settings()
+    emoji = (emoji or "").strip()
+    mid = (message_id or "").strip()
+    phone = digits_only(to_phone)
+    if not settings.meta_wa_ready or not emoji or not mid or len(phone) < 8:
+        return False
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": phone,
+        "type": "reaction",
+        "reaction": {"message_id": mid, "emoji": emoji},
+    }
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.post(_messages_url(), headers=_headers(), json=payload)
+        if resp.status_code >= 300:
+            logger.info("Meta reaction not accepted %s %s", resp.status_code, resp.text[:200])
+            return False
+        return True
+    except Exception as exc:
+        logger.info("Meta reaction failed: %s", type(exc).__name__)
+        return False
+
+
 def send_whatsapp(to_phone: str, reply: Reply) -> bool:
     settings = get_settings()
     if not settings.meta_wa_ready:
@@ -108,9 +135,8 @@ def send_whatsapp(to_phone: str, reply: Reply) -> bool:
     if len(phone) < 8:
         return False
 
+    # Emoji tap-backs are sent via send_reaction; keep reply text clean.
     text = (reply.text or "").strip()
-    if reply.emoji and text and not text.startswith(reply.emoji):
-        text = f"{reply.emoji} {text}".strip()
 
     ok_any = False
     # Cap like Twilio path — chunk long text

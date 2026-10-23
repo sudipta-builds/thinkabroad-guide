@@ -38,6 +38,17 @@ REFUSE_PAY = "Refused. That button would take payment. Leave it unclicked and te
 REFUSE_CARD = "Refused. Card numbers, CVV, and OTP are not typed or saved."
 
 
+def _launch_browser(playwright: object, *, headed: bool) -> object:
+    """Visible Chrome can finish a Cleartrip itinerary. Headless Chromium is the fallback."""
+    chrome_args = ["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage"]
+    if headed:
+        try:
+            return playwright.chromium.launch(channel="chrome", headless=False, args=chrome_args, timeout=20000)
+        except Exception:
+            logger.warning("Headed Chrome did not start; using headless Chromium")
+    return playwright.chromium.launch(headless=True, args=_LAUNCH_ARGS, timeout=20000)
+
+
 def chromium_ready() -> bool:
     """True when a Chromium binary is already on disk. A miss is not cached."""
     if getattr(chromium_ready, "_ok", False):
@@ -146,6 +157,22 @@ def page_blocked(text: str) -> bool:
     return bool(_BLOCK.search(text or ""))
 
 
+def _booking_hint(text: str) -> str:
+    body = text or ""
+    if re.search(r"\botp\b|one[- ]time password|verification code", body, re.I):
+        return "OTP field is on this page. Ask the traveller for the code. Do not invent one. Do not store it."
+    if re.search(r"password|sign in|log in", body, re.I):
+        return "Login is required. Use a saved login, or tell the traveller you need the email and password for this site."
+    if re.search(r"\bupi\b|card number|payment|pay now", body, re.I):
+        return (
+            "Payment step. Send this page URL and ask whether they will pay on the link "
+            "or want the saved UPI or card filled. Click Pay only when pay is authorized."
+        )
+    if re.search(r"passenger|traveller|email|mobile", body, re.I):
+        return "Passenger form. Fill the saved profile. If phone, email, or name is missing, ask for that field."
+    return "Booking page. Continue to the next step. Tell the traveller if the page needs something you do not have."
+
+
 def should_capture(text: str) -> bool:
     """Keep a screenshot of a real page. Skip a blank or still-loading document."""
     if prices_in(text) or page_blocked(text):
@@ -216,13 +243,18 @@ def _shot_path() -> Path:
 
 
 class BrowserSession:
-    def __init__(self, phone: str = "", fresh: bool = False):
+    def __init__(self, phone: str = "", fresh: bool = False, headed: bool = False, use_proxy: bool = False):
         self.phone = phone
         self.unsent: list[Path] = []
         self.last_text = ""
         self.allow_local = False
         self.progress = 0
         self.fresh = fresh
+        self.headed = headed
+        self.use_proxy = use_proxy
+        self.mode = "search"
+        self.allow_pay = False
+        self.private: dict[str, str] = {}
         self._pw: object | None = None
         self._browser: object | None = None
         self._context: object | None = None
@@ -235,22 +267,41 @@ class BrowserSession:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
+    def _proxy(self) -> dict[str, str] | None:
+        if not self.use_proxy:
+            return None
+        from app.config import get_settings
+
+        return get_settings().playwright_proxy()
+
     def start(self) -> None:
         _prefer_render_browsers()
         from playwright.sync_api import sync_playwright
 
         self._pw = sync_playwright().start()
         playwright = self._pw
+        proxy = self._proxy()
         kwargs = {
             "headless": True,
             "args": _LAUNCH_ARGS,
-            "viewport": {"width": 1200, "height": 1400},
+            "viewport": {"width": 1280, "height": 1400},
             "user_agent": _UA,
             "timeout": 20000,
         }
+        if proxy:
+            kwargs["proxy"] = proxy
+            logger.info("Chromium using residential proxy host=%s", proxy.get("server"))
         if self.fresh:
-            self._browser = playwright.chromium.launch(headless=True, args=_LAUNCH_ARGS, timeout=20000)
-            self._context = self._browser.new_context(viewport=kwargs["viewport"], user_agent=_UA)
+            # Headed Chrome on a local machine can finish a checkout. On Render, book via proxy + headless.
+            headed = self.headed and not proxy
+            self._browser = _launch_browser(playwright, headed=headed)
+            context_args: dict[str, object] = {"viewport": kwargs["viewport"]}
+            if not headed:
+                context_args["user_agent"] = _UA
+            if proxy:
+                context_args["proxy"] = proxy
+            self._context = self._browser.new_context(**context_args)
+            self._context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             self.page = self._context.new_page()
             self.page.set_default_timeout(15000)
             self._context.route("**/*", self._gate)
@@ -261,7 +312,10 @@ class BrowserSession:
         except Exception:
             logger.warning("Persistent browser profile failed; opening a fresh window")
             self._browser = playwright.chromium.launch(headless=True, args=_LAUNCH_ARGS, timeout=25000)
-            self._context = self._browser.new_context(viewport=kwargs["viewport"], user_agent=_UA)
+            context_args = {"viewport": kwargs["viewport"], "user_agent": _UA}
+            if proxy:
+                context_args["proxy"] = proxy
+            self._context = self._browser.new_context(**context_args)
             self.page = self._context.new_page()
         self.page.set_default_timeout(20000)
         self._context.route("**/*", self._gate)
@@ -294,10 +348,78 @@ class BrowserSession:
         assert self.page is not None
         self.page.goto(allowed, wait_until="domcontentloaded", timeout=goto_timeout)
         self._dismiss()
+        flight_host = any(
+            host in allowed
+            for host in ("cleartrip.com/flights", "easemytrip.com", "ixigo.com", "makemytrip.com/flight")
+        )
+        if flight_host:
+            try:
+                self.page.wait_for_selector(
+                    "text=/SpiceJet|IndiGo|Air India|Akasa Air|No flights|couldn.?t find|sold out/i",
+                    timeout=20000,
+                )
+            except Exception:
+                self.page.wait_for_timeout(1500)
+        else:
+            try:
+                self.page.wait_for_selector("text=/₹|Rs\\.?\\s*\\d|INR\\s*\\d|\\$\\s*\\d/", timeout=price_wait)
+            except Exception:
+                self.page.wait_for_timeout(1200)
+        return self._observe(shoot=True)
+
+    def click_book(self, hint: str) -> str:
+        """Open the fare sheet for a departure time. Cleartrip's Book control is a real button."""
+        assert self.page is not None
+        self._lift_overlay()
+        found = self.page.evaluate(
+            """(hint) => {
+                const buttons = [...document.querySelectorAll('button')].filter(b => (b.innerText || '').trim() === 'Book');
+                const btn = buttons.find(b => {
+                    let node = b;
+                    let blob = '';
+                    for (let i = 0; i < 8 && node; i += 1) {
+                        blob += '\\n' + (node.innerText || '');
+                        node = node.parentElement;
+                    }
+                    return !hint || blob.includes(hint);
+                });
+                if (!btn) return '';
+                btn.click();
+                return 'ok';
+            }""",
+            hint or "",
+        )
+        if not found:
+            return f"Could not find a Book button for {hint or 'the first fare'}."
         try:
-            self.page.wait_for_selector("text=/₹|Rs\\.?\\s*\\d|INR\\s*\\d|\\$\\s*\\d/", timeout=price_wait)
+            self.page.wait_for_selector("text=Select your fare", timeout=10000)
         except Exception:
-            self.page.wait_for_timeout(1200)
+            self.page.wait_for_timeout(1500)
+        return self._observe(shoot=True)
+
+    def click_continue(self) -> str:
+        """The fare sheet and the review page both use a Continue button at the bottom."""
+        assert self.page is not None
+        buttons = self.page.get_by_role("button", name=re.compile(r"^Continue$", re.I))
+        if buttons.count() == 0:
+            return "No Continue button on this page."
+        target = buttons.nth(buttons.count() - 1)
+        try:
+            target.scroll_into_view_if_needed(timeout=4000)
+            target.click(timeout=8000)
+        except Exception:
+            self.page.evaluate(
+                """() => {
+                    const buttons = [...document.querySelectorAll('button')].filter(b => (b.innerText || '').trim() === 'Continue');
+                    const btn = buttons.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top)[0];
+                    if (btn) btn.click();
+                }"""
+            )
+        self.page.wait_for_timeout(4000)
+        active = self.page
+        if self._context is not None and self._context.pages:
+            active = self._context.pages[-1]
+            self.page = active
         return self._observe(shoot=True)
 
     def read_page(self) -> str:
@@ -307,8 +429,8 @@ class BrowserSession:
         label = (text or "").strip()
         if not label:
             return "Need the visible text of the button or link."
-        if payment_control(label):
-            return REFUSE_PAY
+        if payment_control(label) and not self.allow_pay:
+            return REFUSE_PAY + " Send the traveller this page link, or ask them to pay with saved UPI or card."
         locator = self._find_clickable(label)
         if locator is None:
             return f"Could not find a button or link named {label}."
@@ -316,8 +438,8 @@ class BrowserSession:
             visible = locator.inner_text(timeout=2000)
         except Exception:
             visible = label
-        if payment_control(visible):
-            return REFUSE_PAY
+        if payment_control(visible) and not self.allow_pay:
+            return REFUSE_PAY + " Send the traveller this page link, or ask them to pay with saved UPI or card."
         locator.click(timeout=8000)
         self.page.wait_for_timeout(1200)
         return self._observe(shoot=True)
@@ -411,6 +533,46 @@ class BrowserSession:
                 notes.append(f"Could not select {gender}.")
         return " ".join(notes) or "No saved passenger details to type."
 
+    def fill_payment(
+        self,
+        *,
+        upi: str = "",
+        card: str = "",
+        expiry: str = "",
+        holder: str = "",
+        cvv: str = "",
+        otp: str = "",
+    ) -> str:
+        """Type payment fields. The result never repeats the secret."""
+        notes: list[str] = []
+        if upi and not self._fill_first(["UPI ID", "UPI", "VPA"], upi):
+            notes.append("No UPI field visible.")
+        elif upi:
+            notes.append("Filled UPI.")
+        if card and not self._fill_first(
+            ["Card number", "Debit card", "Credit card", "Card"],
+            card,
+            css="input[autocomplete='cc-number'], input[name*='card' i]",
+        ):
+            notes.append("No card field visible.")
+        elif card:
+            notes.append("Filled card.")
+        if expiry:
+            self._fill_first(["Expiry", "Valid thru", "MM/YY"], expiry, css="input[autocomplete='cc-exp']")
+        if holder:
+            self._fill_first(["Name on card", "Cardholder"], holder, css="input[autocomplete='cc-name']")
+        if cvv and not self._fill_first(["CVV", "CVC"], cvv, css="input[autocomplete='cc-csc']"):
+            notes.append("No CVV field visible.")
+        elif cvv:
+            notes.append("Filled CVV.")
+        if otp and not self._fill_first(["OTP", "One time password", "Verification code"], otp):
+            notes.append("No OTP field visible. Ask the traveller for the OTP shown on their phone.")
+        elif otp:
+            notes.append("Filled OTP.")
+        if not notes:
+            return "No payment fields were filled."
+        return " ".join(notes) + " Secrets are not repeated."
+
     def _fill_first(self, labels: list[str], value: str, css: str = "") -> bool:
         assert self.page is not None
         for label in labels:
@@ -453,6 +615,13 @@ class BrowserSession:
         except Exception:
             return False
 
+    def _lift_overlay(self) -> None:
+        assert self.page is not None
+        try:
+            self.page.evaluate("document.querySelectorAll('.modal').forEach(el => { if (!(el.innerText || '').trim()) el.remove(); })")
+        except Exception:
+            return
+
     def _dismiss(self) -> None:
         assert self.page is not None
         for label in ("Accept", "I agree", "Got it", "OK", "Close"):
@@ -482,6 +651,8 @@ class BrowserSession:
                 "\nThis page looks like a bot check or an access block. "
                 "Open a different seller now. Do not ask the traveller to repeat the trip."
             )
+        elif self.mode == "book":
+            flag = "\n" + _booking_hint(self.last_text)
         elif not prices:
             flag = (
                 "\nNO FARES RENDERED. Open a different seller in this same run. "

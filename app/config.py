@@ -45,9 +45,36 @@ class Settings(BaseSettings):
     vault_secret_key: str = ""
     log_level: str = "INFO"
 
+    # Indian residential proxy (DataImpulse). Used for booking Chromium on Render.
+    proxy_host: str = Field(default="", validation_alias=AliasChoices("PROXY_HOST"))
+    proxy_port: str = Field(default="", validation_alias=AliasChoices("PROXY_PORT"))
+    proxy_username: str = Field(default="", validation_alias=AliasChoices("PROXY_USERNAME"))
+    proxy_password: str = Field(default="", validation_alias=AliasChoices("PROXY_PASSWORD"))
+    proxy_search: bool = Field(default=False, validation_alias=AliasChoices("PROXY_SEARCH"))
+
     @property
     def twilio_ready(self) -> bool:
         return bool(self.twilio_account_sid and self.twilio_auth_token and self.twilio_whatsapp_from)
+
+    @property
+    def proxy_ready(self) -> bool:
+        return bool(self.proxy_host and self.proxy_port and self.proxy_username and self.proxy_password)
+
+    def playwright_proxy(self) -> dict[str, str] | None:
+        """Playwright proxy dict, or None when unset."""
+        if not self.proxy_ready:
+            return None
+        host = self.proxy_host.strip()
+        port = self.proxy_port.strip()
+        if host.startswith(("http://", "https://", "socks5://")):
+            server = host if host.rsplit(":", 1)[-1].isdigit() else f"{host}:{port}"
+        else:
+            server = f"http://{host}:{port}"
+        return {
+            "server": server,
+            "username": self.proxy_username.strip(),
+            "password": self.proxy_password.strip(),
+        }
 
     @property
     def meta_wa_ready(self) -> bool:

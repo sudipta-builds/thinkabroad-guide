@@ -32,7 +32,7 @@ def on_startup() -> None:
         threading.Thread(target=ensure_chromium, name="chromium-install", daemon=True).start()
     start_price_watch()
     logger.info(
-        "Guide travel agent ready v%s db=%s meta_wa=%s twilio=%s deepseek=%s gemini=%s vault=%s public=%s chromium=%s",
+        "Guide travel agent ready v%s db=%s meta_wa=%s twilio=%s deepseek=%s gemini=%s vault=%s public=%s chromium=%s proxy=%s",
         __version__,
         db_path,
         settings.meta_wa_ready,
@@ -42,6 +42,7 @@ def on_startup() -> None:
         settings.vault_ready,
         bool(settings.guide_public_url),
         browser_ok,
+        settings.proxy_ready,
     )
 
 
@@ -65,6 +66,7 @@ def health() -> JSONResponse:
             "gemini": settings.search_ready,
             "vault": settings.vault_ready,
             "chromium": chromium_ready(),
+            "proxy": settings.proxy_ready,
             "memory": "persistent" if str(db_path).startswith("/var/data") else "ephemeral",
             "db": str(db_path),
         }

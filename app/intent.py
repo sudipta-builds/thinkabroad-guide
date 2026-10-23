@@ -182,7 +182,7 @@ def _book_index(raw: str) -> int | None:
     match = _BOOK_NUM.search(raw)
     if not match:
         return None
-    # "book jorhat ..." is a route, handled earlier. A digit/ordinal is required here.
+    # "book delhi ..." is a route, handled earlier. A digit/ordinal is required here.
     number = match.group(1) or match.group(3)
     ordinal = match.group(2)
     if number:
@@ -198,7 +198,8 @@ _DATE_BITS = re.compile(
     r"|\b[a-z]{3,9}\s+\d{1,2}(?:st|nd|rd|th)?(?:\s+20\d{2})?\b"
     r"|\b\d{1,2}[/-]\d{1,2}(?:[/-]20\d{2})?\b"
     r"|\b20\d{2}-\d{2}-\d{2}\b"
-    r"|\b(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    r"|\b(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b"
+    r"|\b(?:first|1st|second|2nd|third|3rd|fourth|4th|last)\s+week(?:\s+of)?(?:\s+[a-z]+)?\b",
     re.I,
 )
 

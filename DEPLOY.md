@@ -31,6 +31,10 @@ Branch `main` is pushed.
 | `PYTHON_VERSION` | `3.12.8` (optional but recommended) |
 | `GUIDE_PUBLIC_URL` | `https://YOUR-GUIDE-SERVICE.onrender.com` (required so WhatsApp can fetch screenshots) |
 | `PLAYWRIGHT_BROWSERS_PATH` | `/opt/render/project/src/.playwright` |
+| `PROXY_HOST` | `gw.dataimpulse.com` (DataImpulse residential) |
+| `PROXY_PORT` | Sticky port from DataImpulse (10000–20000) |
+| `PROXY_USERNAME` | Login with India sticky, e.g. `LOGIN__cr.in;sessttl.30` |
+| `PROXY_PASSWORD` | DataImpulse password (Render only — never commit) |
 
 **Disk:** Render → Guide service → **Disks** → add disk, mount path `/var/data`. If you skip the disk, remove `GUIDE_DB_PATH=/var/data/...` or set it to `data/guide.db`.
 
@@ -64,10 +68,11 @@ If Meta is configured, outbound replies use Meta even when inbound still arrives
 
 ## 4. Smoke test
 
-1. Text a Jorhat to Bengaluru date on WhatsApp.
+1. Text Guwahati to Delhi for the first week of December on WhatsApp.
 2. Guide should reply immediately, then send a live screenshot and a recommendation.
-3. `SAVE PROFILE Full Name | you@email.com | +phone` or just type those details when asked.
-4. Health at `/health` shows `"version": "0.3.0"` and `"chromium": true`.
+3. Reply "book the 12:30 flight" (any wording). It should open that fare on the chosen seller, not the same search again. If login, Indian mobile, email, DOB, gender, or OTP is missing, it asks. On payment it stops for approval (UPI you finish; card from vault if you say pay).
+4. `SAVE PROFILE Full Name | you@email.com | +phone` or just type those details when asked.
+5. Health at `/health` shows `"version": "0.5.0"`, `"chromium": true`, and `"proxy": true` when DataImpulse env vars are set.
 
 ## Build note
 

@@ -82,7 +82,7 @@ def reason(prompt: str, *, timeout: float = 40.0) -> str:
                 "You are judging a live flight search for a WhatsApp traveller. "
                 "Use only prices, times, and stops that appear in the evidence. "
                 "Say which site failed if the evidence says so. Recommend one option and why. "
-                "Say nothing has been paid. Do not put emoji in the text. Keep it under 8 short lines."
+                "Do not add a line that nothing is booked. Do not put emoji in the text. Keep it under 8 short lines."
             ),
         },
         {"role": "user", "content": prompt[:12000]},

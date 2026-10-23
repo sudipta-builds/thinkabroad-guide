@@ -24,9 +24,9 @@ _VOICE = (
     "🤔 when you still need something, 👌 when you drop it, ✅ only if allowed_to_agree.\n"
     "Voice to copy:\n"
     "- Which date, and one-way or return?\n"
-    "- Got it, 2 Dec one way. Jorhat to Bengaluru, right? Just confirm and I search.\n"
-    "- Searching Jorhat to Bengaluru for 2 Dec now. I'll bring back options before booking anything.\n"
-    "- Jorhat to Bengaluru for 2 Dec — live options below. I have not bought a ticket.\n"
+    "- Got it, 1 Dec. Guwahati to Delhi, right? Just confirm and I search.\n"
+    "- Searching Guwahati to Delhi for the first week of December. I'll bring back options before booking anything.\n"
+    "- Guwahati to Delhi, 1–7 Dec — live options below. I have not paid yet.\n"
     "- Want me to book the first one? I won't confirm the ticket until you say so.\n"
     "- Yes. Opening that page. I stop before payment."
 )
@@ -73,9 +73,12 @@ def handle_message(phone: str, body: str, message_sid: str = "") -> Reply:
 
     user = db.upsert_user(phone)
     state = _load(user)
-    db.add_message(phone, "user", text)
+    from app.travel_agent import redact_for_history
+
+    stored = redact_for_history(text)
+    db.add_message(phone, "user", stored)
     history = db.recent_messages(phone, 8)
-    prior = history[:-1] if history and history[-1].get("body") == text else history
+    prior = history[:-1] if history and history[-1].get("body") == stored else history
 
     profile_m = re.match(r"^SAVE\s+PROFILE\s+(.+)$", text, flags=re.I | re.S)
     if profile_m:

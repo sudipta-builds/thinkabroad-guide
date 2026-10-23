@@ -8,17 +8,6 @@ from urllib.parse import urlencode
 
 # name or IATA -> (IATA, label, domestic India)
 _PLACES: dict[str, tuple[str, str, bool]] = {
-    "jorhat": ("JRH", "Jorhat", True),
-    "jrh": ("JRH", "Jorhat", True),
-    "rowriah": ("JRH", "Jorhat", True),
-    "bengaluru": ("BLR", "Bengaluru", True),
-    "bangalore": ("BLR", "Bengaluru", True),
-    "begaluru": ("BLR", "Bengaluru", True),
-    "bangaluru": ("BLR", "Bengaluru", True),
-    "banglore": ("BLR", "Bengaluru", True),
-    "bangalor": ("BLR", "Bengaluru", True),
-    "bengaluru airport": ("BLR", "Bengaluru", True),
-    "blr": ("BLR", "Bengaluru", True),
     "delhi": ("DEL", "Delhi", True),
     "new delhi": ("DEL", "Delhi", True),
     "del": ("DEL", "Delhi", True),
@@ -282,6 +271,99 @@ def cleartrip_results_url(origin: str, destination: str, depart: str) -> str:
             "intl": domestic,
         }
     )
+
+
+def easemytrip_results_url(origin: str, destination: str, depart: str) -> str:
+    origin_hit = resolve_place(origin)
+    dest_hit = resolve_place(destination)
+    if not origin_hit or not dest_hit:
+        return flight_results_url(origin, destination, depart)
+    when = date.fromisoformat(str(depart)[:10])
+    day = when.strftime("%d%b%Y")  # 01Dec2026
+    return "https://flight.easemytrip.com/FlightList/Index?" + urlencode(
+        {
+            "srch": f"{origin_hit[0]}-{dest_hit[0]}-{day}--0-0-0-E-O-1-0",
+            "IsN": "N" if origin_hit[2] and dest_hit[2] else "Y",
+        }
+    )
+
+
+def ixigo_results_url(origin: str, destination: str, depart: str) -> str:
+    origin_hit = resolve_place(origin)
+    dest_hit = resolve_place(destination)
+    if not origin_hit or not dest_hit:
+        return flight_results_url(origin, destination, depart)
+    when = date.fromisoformat(str(depart)[:10])
+    return "https://www.ixigo.com/search/result/flight?" + urlencode(
+        {
+            "from": origin_hit[0],
+            "to": dest_hit[0],
+            "date": when.strftime("%d%m%Y"),
+            "adults": "1",
+            "children": "0",
+            "infants": "0",
+            "class": "e",
+            "source": "Search Form",
+        }
+    )
+
+
+def makemytrip_results_url(origin: str, destination: str, depart: str) -> str:
+    origin_hit = resolve_place(origin)
+    dest_hit = resolve_place(destination)
+    if not origin_hit or not dest_hit:
+        return flight_results_url(origin, destination, depart)
+    when = date.fromisoformat(str(depart)[:10])
+    domestic = bool(origin_hit[2] and dest_hit[2])
+    return _mmt_url(origin_hit[0], dest_hit[0], when, False, domestic)
+
+
+# Sellers the agent can open. Order is the default try order (feasible first).
+SELLERS: list[dict[str, str]] = [
+    {"id": "cleartrip", "label": "Cleartrip", "host": "cleartrip.com"},
+    {"id": "easemytrip", "label": "EaseMyTrip", "host": "easemytrip.com"},
+    {"id": "ixigo", "label": "Ixigo", "host": "ixigo.com"},
+    {"id": "makemytrip", "label": "MakeMyTrip", "host": "makemytrip.com"},
+]
+
+
+def seller_results_url(seller_id: str, origin: str, destination: str, depart: str) -> str:
+    builders = {
+        "cleartrip": cleartrip_results_url,
+        "easemytrip": easemytrip_results_url,
+        "ixigo": ixigo_results_url,
+        "makemytrip": makemytrip_results_url,
+    }
+    build = builders.get((seller_id or "").lower())
+    if not build:
+        return cleartrip_results_url(origin, destination, depart)
+    return build(origin, destination, depart)
+
+
+def named_seller(text: str) -> str:
+    """Seller id if the traveller named one, else empty."""
+    raw = (text or "").lower()
+    if re.search(r"\b(cleartrip|ct)\b", raw):
+        return "cleartrip"
+    if re.search(r"\b(easemytrip|emt)\b", raw):
+        return "easemytrip"
+    if re.search(r"\bixigo\b", raw):
+        return "ixigo"
+    if re.search(r"\b(makemytrip|mmt|goibibo)\b", raw):
+        return "makemytrip"
+    return ""
+
+
+def seller_order(preferred: str = "") -> list[dict[str, str]]:
+    """Preferred seller first, then the rest. MakeMyTrip stays last (often blocked)."""
+    preferred = (preferred or "").lower()
+    primary = [item for item in SELLERS if item["id"] == preferred]
+    rest = [item for item in SELLERS if item["id"] != preferred]
+    if preferred and preferred != "makemytrip":
+        rest = [item for item in rest if item["id"] != "makemytrip"] + [
+            item for item in rest if item["id"] == "makemytrip"
+        ]
+    return primary + rest
 
 
 def _google_url(

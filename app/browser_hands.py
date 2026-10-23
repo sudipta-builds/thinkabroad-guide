@@ -6,9 +6,11 @@ import ipaddress
 import logging
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
@@ -59,7 +61,7 @@ def _launch_browser(playwright: object, *, headed: bool, proxy: dict[str, str] |
             return playwright.chromium.launch(channel="chrome", headless=False, args=chrome_args, timeout=20000)
         except Exception:
             logger.warning("Headed Chrome did not start; using headless Chromium")
-    kwargs: dict[str, object] = {"headless": True, "args": _LAUNCH_ARGS, "timeout": 30000}
+    kwargs: dict[str, object] = {"headless": True, "args": _LAUNCH_ARGS, "timeout": 15000}
     if proxy:
         kwargs["proxy"] = proxy
     return playwright.chromium.launch(**kwargs)
@@ -206,6 +208,39 @@ def looks_like_card(value: str) -> bool:
     return 13 <= len(digits) <= 19 and len(digits) >= len(re.sub(r"\s", "", value or "")) - 2
 
 
+_FLIGHT_HOSTS = (
+    "cleartrip.com",
+    "easemytrip.com",
+    "ixigo.com",
+    "makemytrip.com",
+    "goibibo.com",
+    "google.com",
+    "kayak.com",
+    "kayak.co.in",
+)
+
+
+def known_flight_host(host: str) -> bool:
+    """Seller and search hosts. These skip a local DNS lookup so booking cannot sit on the resolver."""
+    name = (host or "").lower()
+    if name.startswith("www."):
+        name = name[4:]
+    return any(name == item or name.endswith("." + item) for item in _FLIGHT_HOSTS)
+
+
+def kill_browser(pid: int | None) -> None:
+    """Stop a Chromium that ignored its own timeout. A stuck proxy tunnel otherwise holds the reply."""
+    if not pid:
+        return
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], timeout=5, check=False, capture_output=True)
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        return
+
+
 def url_allowed(url: str, *, allow_local: bool = False) -> str | None:
     """Public http(s) only. Blocks local and private hosts."""
     parsed = urlparse((url or "").strip())
@@ -218,6 +253,8 @@ def url_allowed(url: str, *, allow_local: bool = False) -> str | None:
         return url
     if host in {"localhost", "metadata.google.internal"} or host.endswith(".local"):
         return None
+    if known_flight_host(host):
+        return url
     try:
         addresses = [ipaddress.ip_address(host)]
     except ValueError:
@@ -275,6 +312,7 @@ class BrowserSession:
         self._browser: object | None = None
         self._context: object | None = None
         self.page: object | None = None
+        self.browser_pid: int | None = None
 
     def __enter__(self) -> "BrowserSession":
         self.start()
@@ -317,8 +355,14 @@ class BrowserSession:
             self._context = self._browser.new_context(**context_args)
             self._context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             self.page = self._context.new_page()
-            self.page.set_default_timeout(12000)
-            self._context.route("**/*", self._gate)
+            self.page.set_default_timeout(8000)
+            process = getattr(self._browser, "process", None)
+            if callable(process):
+                process = process()
+            self.browser_pid = getattr(process, "pid", None) if process is not None else None
+            # A route on a proxied browser deadlocks the first navigation. Chromium applies the proxy itself.
+            if not proxy:
+                self._context.route("**/*", self._gate)
             return
         try:
             self._context = playwright.chromium.launch_persistent_context(str(_profile_dir(self.phone)), **kwargs)
@@ -335,18 +379,24 @@ class BrowserSession:
         self._context.route("**/*", self._gate)
 
     def close(self) -> None:
-        for obj in (self._context, self._browser):
+        context, browser, pw = self._context, self._browser, self._pw
+        self._context = self._browser = self._pw = None
+        self.page = None
+
+        def _shutdown() -> None:
+            for obj in (context, browser):
+                try:
+                    if obj is not None:
+                        obj.close()
+                except Exception:
+                    pass
             try:
-                if obj is not None:
-                    obj.close()
+                if pw is not None:
+                    pw.stop()
             except Exception:
                 pass
-        try:
-            if self._pw is not None:
-                self._pw.stop()
-        except Exception:
-            pass
-        self.page = None
+
+        threading.Thread(target=_shutdown, name="guide-browser-close", daemon=True).start()
 
     def _gate(self, route: object) -> None:
         url = route.request.url
@@ -372,22 +422,11 @@ class BrowserSession:
         try:
             self.page.goto(allowed, wait_until="domcontentloaded", timeout=goto_timeout)
         except Exception as exc:
-            proxy_down = self.use_proxy and re.search(r"PROXY|TUNNEL|CONNECTION_RESET|CONNECTION_CLOSED", str(exc), re.I)
             timed_out = "Timeout" in type(exc).__name__
-            if proxy_down:
-                logger.warning("Proxied open failed once; retrying %s", allowed[:80])
-                try:
-                    self.page.goto(allowed, wait_until="domcontentloaded", timeout=12000)
-                except Exception as again:
-                    if "Timeout" not in type(again).__name__ and not re.search(
-                        r"PROXY|TUNNEL|CONNECTION_RESET|CONNECTION_CLOSED", str(again), re.I
-                    ):
-                        raise
-                    logger.warning("Proxied open still failed (%s); reading what loaded", type(again).__name__)
-            elif timed_out:
-                logger.warning("Page open timed out; reading what loaded")
-            else:
+            proxy_down = self.use_proxy and re.search(r"PROXY|TUNNEL|CONNECTION_RESET|CONNECTION_CLOSED", str(exc), re.I)
+            if not timed_out and not proxy_down:
                 raise
+            logger.warning("Open failed (%s); reading what loaded", type(exc).__name__)
         self._dismiss()
         flight_host = any(
             host in allowed
@@ -722,13 +761,18 @@ class BrowserSession:
 
     def _dismiss(self) -> None:
         assert self.page is not None
-        for label in ("Accept", "I agree", "Got it", "OK", "Close"):
-            try:
-                button = self.page.get_by_role("button", name=re.compile(rf"^{label}$", re.I))
-                if button.count() and button.first.is_visible():
-                    button.first.click(timeout=800)
-            except Exception:
-                continue
+        try:
+            self.page.evaluate(
+                """() => {
+                    const labels = new Set(['accept', 'i agree', 'got it', 'ok', 'close']);
+                    for (const button of document.querySelectorAll('button')) {
+                        const text = (button.innerText || '').trim().toLowerCase();
+                        if (labels.has(text)) button.click();
+                    }
+                }"""
+            )
+        except Exception:
+            return
 
     def _observe(self, *, shoot: bool) -> str:
         assert self.page is not None
@@ -772,7 +816,7 @@ class BrowserSession:
         assert self.page is not None
         path = _shot_path()
         try:
-            self.page.screenshot(path=str(path), type="jpeg", quality=55, full_page=False)
+            self.page.screenshot(path=str(path), type="jpeg", quality=55, full_page=False, timeout=4000)
         except Exception as exc:
             logger.warning("Screenshot failed: %s", type(exc).__name__)
             return None

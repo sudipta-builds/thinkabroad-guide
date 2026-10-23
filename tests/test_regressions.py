@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.browser_hands import _alt_clock, looks_like_card, payment_control, should_capture
+from app.browser_hands import _alt_clock, known_flight_host, looks_like_card, payment_control, should_capture, url_allowed
 from app.search import (
     cleartrip_results_url,
     easemytrip_results_url,
@@ -476,6 +476,10 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(_alt_clock("13:15"), "1:15")
         self.assertEqual(_bookable_live_url("https://www.google.com/travel/flights?q=ghy"), "")
         self.assertTrue(_bookable_live_url("https://www.cleartrip.com/flights/results?from=GAU").startswith("https://www.cleartrip.com"))
+        self.assertTrue(known_flight_host("www.cleartrip.com"))
+        self.assertFalse(known_flight_host("localhost"))
+        self.assertTrue(str(url_allowed("https://www.cleartrip.com/flights/results?from=GAU&to=DEL")).startswith("https://www.cleartrip.com"))
+        self.assertIsNone(url_allowed("http://127.0.0.1/admin"))
 
     def test_a_running_search_is_not_restarted(self) -> None:
         trip = {"origin": "Guwahati", "destination": "Delhi", "depart": "2026-12-04", "options": [{"depart": "12:30", "price": "9,472", "airline": "SpiceJet"}]}

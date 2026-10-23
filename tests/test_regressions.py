@@ -27,6 +27,7 @@ from app.travel_agent import (
     _booking_page_reply,
     _cached_fares_reply,
     _browse_is_search,
+    _coerce_kind,
     _direct_results,
     _bookable_live_url,
     _wants_other_seller,
@@ -472,6 +473,13 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(infer_intent(trip, "try another service"), "book")
         self.assertFalse(_browse_is_search("book", trip, "try another service"))
         self.assertTrue(_browse_is_search("search", trip, "4th dec"))
+        self.assertTrue(_browse_is_search("search", {}, "4th Dec"))
+        self.assertEqual(_coerce_kind("4th Dec", "book"), "search")
+        self.assertEqual(_coerce_kind("Ixigo", "book"), "search")
+        self.assertEqual(_coerce_kind("1:15", "select"), "select")
+        stuck = dict(trip)
+        stuck["preferred_seller"] = "cleartrip"
+        self.assertIn("Google Flights", _search_ack(stuck, "4th Dec"))
         self.assertEqual(_alt_clock("1:15"), "13:15")
         self.assertEqual(_alt_clock("13:15"), "1:15")
         self.assertEqual(_bookable_live_url("https://www.google.com/travel/flights?q=ghy"), "")

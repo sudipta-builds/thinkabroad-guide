@@ -131,7 +131,7 @@ def handle_turn(
     state = _recover_trip(state, prior, text)
     previous_stage = str(state.get("stage") or "")
     saved_secret = _capture_private(phone, text, state)
-    kind = resolve_intent(text, state, prior)
+    kind = _coerce_kind(text, resolve_intent(text, state, prior))
     if _wants_other_seller(text) and state.get("origin") and state.get("destination") and state.get("depart"):
         from app.search import next_bookable_seller
 
@@ -200,9 +200,13 @@ def handle_turn(
             name="guide-browse",
             daemon=True,
         ).start()
-        reply = _search_ack(state)
+        reply = _search_ack(state, text)
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="✈️")
+    if kind == "search":
+        reply = "Where are you flying from and to?"
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply, emoji="🤔")
     with composing(phone):
         decision = llm.converse(_PLANNER, _planner_payload(phone, text, state, prior, busy=busy), timeout=7)
     action = str(decision.get("action") or "reply").lower()
@@ -217,7 +221,7 @@ def handle_turn(
         reply = _grounded(state, browsing=False, busy=busy)
     if action == "browse":
         if re.search(r"₹|Rs\.?\s*\d", reply):
-            reply = _search_ack(state)
+            reply = _search_ack(state, text)
         if not chromium_ready():
             reply = "Chromium isn't installed on the server yet, so I can't open a booking page."
             emoji = "⚠️"
@@ -230,7 +234,7 @@ def handle_turn(
                 name="guide-browse",
                 daemon=True,
             ).start()
-            reply = reply or _search_ack(state)
+            reply = reply or _search_ack(state, text)
             emoji = emoji or "✈️"
     if not reply:
         reply = "Where are you flying, and when?"
@@ -491,8 +495,21 @@ def _bookable_live_url(url: str) -> str:
     return ""
 
 
+def _coerce_kind(text: str, kind: str) -> str:
+    """A date or a seller name looks up fares. A flight time is what starts booking."""
+    from app.intent import explicit_date
+
+    if _flight_hint(text) or kind in {"pay", "login", "details", "pay_self", "cancel"}:
+        return kind
+    if explicit_date(text) or (named_seller_from(text) and kind in {"book", "select", "chat"}):
+        return "search"
+    return kind
+
+
 def _browse_is_search(kind: str, state: dict[str, Any], text: str) -> bool:
-    """The intent already chosen for this turn. Do not turn a booking into another Google search."""
+    """A search stays a search. A missing city must not fall through into a booking."""
+    if kind == "search":
+        return True
     if kind in _BOOKING:
         return False
     return _direct_results(state, text)
@@ -504,11 +521,11 @@ def named_seller_from(text: str) -> str:
     return named_seller(text)
 
 
-def _search_ack(state: dict[str, Any]) -> str:
+def _search_ack(state: dict[str, Any], text: str = "") -> str:
     trip = _trip_line(state) or "that trip"
     from app.search import NOT_BOOKABLE
 
-    seller = str(state.get("preferred_seller") or "")
+    seller = named_seller_from(text)
     if seller and seller not in NOT_BOOKABLE:
         return f"Opening {_seller_label(seller)} for {trip}. Screenshot as soon as the fares load."
     return f"Checking Google Flights for {trip}. One page, then the fares and a screenshot."
@@ -1074,8 +1091,11 @@ def _publish_fares(
     origin = str(state.get("origin") or "")
     destination = str(state.get("destination") or "")
     depart = str(state.get("depart") or "")
-    preferred = named_seller(text) or str(state.get("preferred_seller") or "")
+    preferred = named_seller(text)
     seller = search_seller(preferred)
+    if not (origin and destination and depart):
+        _deliver(phone, "Where are you flying from and to?", None, secrets)
+        return
     if _stale(phone, started_at):
         return
     session = BrowserSession(phone, fresh=True, headed=False, use_proxy=False)
@@ -1201,6 +1221,15 @@ def _book_on_seller(
         return ""
     result = session.open_url(seller_results_url(seller_id, origin, destination, depart), goto_timeout=18000, airline_wait=8000)
     if _stale(phone, started_at):
+        return ""
+    page_url = str(session.page.url or "") if session.page is not None else ""
+    if seller["host"] not in page_url:
+        _deliver(
+            phone,
+            f"{seller['label']} didn't open. Nothing paid.",
+            session,
+            secrets,
+        )
         return ""
     if page_blocked(result) or not (fare_options(result) or any(n >= 3000 for n in prices_in(result))):
         _add_note(phone, f"{seller['label']} not usable for booking.")

@@ -1366,67 +1366,6 @@ def _open_booking(phone: str, text: str, session: BrowserSession, secrets: list[
     return _book_on_seller(phone, text, session, secrets, started_at)
 
 
-_BOOKING_CAP_S = 40
-
-
-def _booking_seller_id(phone: str) -> str:
-    seller_id = str(_load(phone).get("seller") or _load(phone).get("preferred_seller") or "cleartrip")
-    if seller_id in {"google", "kayak", ""}:
-        return "cleartrip"
-    return seller_id
-
-
-def _book_with_cap(
-    phone: str,
-    text: str,
-    secrets: list[str],
-    started_at: float | None,
-    loaded: dict[str, Any],
-    *,
-    use_proxy: bool,
-    headed: bool,
-) -> None:
-    """One booking browser. If it is still silent after the cap, kill it and reply."""
-    from app.browser_hands import kill_browser
-
-    box: dict[str, Any] = {}
-
-    def attempt() -> None:
-        try:
-            with BrowserSession(phone, fresh=True, headed=headed, use_proxy=use_proxy) as session:
-                box["pid"] = session.browser_pid
-                _open_booking(phone, text, session, secrets, started_at, loaded)
-        except Exception:
-            logger.exception("Live booking failed")
-            if _stale(phone, started_at):
-                return
-            _deliver(
-                phone,
-                f"{_seller_label(_booking_seller_id(phone))} didn't open the booking page. Nothing paid. "
-                "Say another site and I'll try that one.",
-                None,
-                secrets,
-            )
-        finally:
-            box["done"] = True
-
-    worker = threading.Thread(target=attempt, name="guide-book", daemon=True)
-    worker.start()
-    worker.join(_BOOKING_CAP_S)
-    if box.get("done"):
-        return
-    logger.warning("Booking still running after %ss", _BOOKING_CAP_S)
-    _clear_busy(phone, started_at)
-    kill_browser(box.get("pid"))
-    _deliver(
-        phone,
-        f"{_seller_label(_booking_seller_id(phone))} didn't finish opening. Nothing paid. "
-        "Send that flight time once more.",
-        None,
-        secrets,
-    )
-
-
 def _run_browse(phone: str, text: str, started_at: float | None = None, kind: str = "") -> None:
     secrets: list[str] = []
     acquired = False
@@ -1449,15 +1388,8 @@ def _run_browse(phone: str, text: str, started_at: float | None = None, kind: st
             if direct:
                 _publish_fares(phone, text, secrets, started_at)
             else:
-                _book_with_cap(
-                    phone,
-                    text,
-                    secrets,
-                    started_at,
-                    loaded,
-                    use_proxy=use_proxy,
-                    headed=headed,
-                )
+                with BrowserSession(phone, fresh=True, headed=headed, use_proxy=use_proxy) as session:
+                    _open_booking(phone, text, session, secrets, started_at, loaded)
         finally:
             _LOCK.release()
     except Exception:

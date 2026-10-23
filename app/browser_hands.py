@@ -6,7 +6,6 @@ import ipaddress
 import logging
 import os
 import re
-import signal
 import socket
 import subprocess
 import sys
@@ -228,19 +227,6 @@ def known_flight_host(host: str) -> bool:
     return any(name == item or name.endswith("." + item) for item in _FLIGHT_HOSTS)
 
 
-def kill_browser(pid: int | None) -> None:
-    """Stop a Chromium that ignored its own timeout. A stuck proxy tunnel otherwise holds the reply."""
-    if not pid:
-        return
-    if os.name == "nt":
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], timeout=5, check=False, capture_output=True)
-        return
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except OSError:
-        return
-
-
 def url_allowed(url: str, *, allow_local: bool = False) -> str | None:
     """Public http(s) only. Blocks local and private hosts."""
     parsed = urlparse((url or "").strip())
@@ -312,7 +298,6 @@ class BrowserSession:
         self._browser: object | None = None
         self._context: object | None = None
         self.page: object | None = None
-        self.browser_pid: int | None = None
 
     def __enter__(self) -> "BrowserSession":
         self.start()
@@ -356,10 +341,6 @@ class BrowserSession:
             self._context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             self.page = self._context.new_page()
             self.page.set_default_timeout(8000)
-            process = getattr(self._browser, "process", None)
-            if callable(process):
-                process = process()
-            self.browser_pid = getattr(process, "pid", None) if process is not None else None
             # A route on a proxied browser deadlocks the first navigation. Chromium applies the proxy itself.
             if not proxy:
                 self._context.route("**/*", self._gate)

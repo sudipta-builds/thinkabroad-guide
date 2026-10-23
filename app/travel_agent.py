@@ -1183,6 +1183,9 @@ def _book_on_seller(
     if named and named not in {"google", "kayak"}:
         live_url = ""
 
+    goto_ms = 45000 if session.use_proxy else 18000
+    airline_ms = 15000 if session.use_proxy else 8000
+
     # Resume on the open checkout when the traveller just sent details or payment.
     if live_url and kind in {"details", "login", "pay", "book"} and state.get("stage") in {
         "booking",
@@ -1190,9 +1193,9 @@ def _book_on_seller(
         "passenger",
         "payment",
     }:
-        page = session.open_url(live_url, goto_timeout=18000, airline_wait=8000)
+        page = session.open_url(live_url, goto_timeout=goto_ms, airline_wait=airline_ms)
         if _stale(phone, started_at):
-            return
+            return ""
         _note_live(phone, page)
         filled = _fill_what_we_can(phone, session, secrets)
         if filled and not _stale(phone, started_at):
@@ -1201,6 +1204,8 @@ def _book_on_seller(
             if re.search(r"continue", page, re.I) and not re.search(r"\bupi\b|pay now|card number", page, re.I):
                 page = session.click_continue()
                 _note_live(phone, page)
+                _fill_what_we_can(phone, session, secrets)
+                page = session.read_page()
         if state.get("pay_authorized") and re.search(r"\bupi\b|card number|pay now", page, re.I):
             pay = _try_fill_payment(phone, session, secrets)
             page = pay or page
@@ -1219,19 +1224,18 @@ def _book_on_seller(
     _save(phone, picked)
     if _stale(phone, started_at):
         return ""
-    result = session.open_url(seller_results_url(seller_id, origin, destination, depart), goto_timeout=18000, airline_wait=8000)
+    result = session.open_url(
+        seller_results_url(seller_id, origin, destination, depart),
+        goto_timeout=goto_ms,
+        airline_wait=airline_ms,
+    )
     if _stale(phone, started_at):
         return ""
     page_url = str(session.page.url or "") if session.page is not None else ""
-    if seller["host"] not in page_url:
-        _deliver(
-            phone,
-            f"{seller['label']} didn't open. Nothing paid.",
-            session,
-            secrets,
-        )
-        return ""
-    if page_blocked(result) or not (fare_options(result) or any(n >= 3000 for n in prices_in(result))):
+    has_fares = bool(fare_options(result) or any(n >= 3000 for n in prices_in(result)))
+    if seller["host"] not in page_url or page_blocked(result) or not has_fares:
+        if session.use_proxy:
+            return "proxy-miss"
         _add_note(phone, f"{seller['label']} not usable for booking.")
         _deliver(
             phone,
@@ -1417,8 +1421,18 @@ def _run_browse(phone: str, text: str, started_at: float | None = None, kind: st
             if direct:
                 _publish_fares(phone, text, secrets, started_at)
             else:
-                with BrowserSession(phone, fresh=True, headed=headed, use_proxy=use_proxy) as session:
-                    _open_booking(phone, text, session, secrets, started_at, loaded)
+                try:
+                    with BrowserSession(phone, fresh=True, headed=headed, use_proxy=use_proxy) as session:
+                        missed = _open_booking(phone, text, session, secrets, started_at, loaded)
+                    if missed == "proxy-miss":
+                        raise RuntimeError("proxy page had no bookable fare")
+                except Exception:
+                    logger.exception("Proxy booking failed")
+                    if not use_proxy:
+                        raise
+                    logger.warning("Opening the seller directly after a proxy miss")
+                    with BrowserSession(phone, fresh=True, headed=False, use_proxy=False) as session:
+                        _open_booking(phone, text, session, secrets, started_at, loaded)
         finally:
             _LOCK.release()
     except Exception:
@@ -1868,8 +1882,10 @@ def _note_live(phone: str, result: str) -> None:
     }
     if re.search(r"\botp\b|card number|\bupi\b|pay now", result, re.I):
         state["stage"] = "payment"
-    elif re.search(r"password|sign in|log in", result, re.I) and state.get("stage") == "booking":
+    elif re.search(r"password|sign in|log in", result, re.I) and state.get("stage") in {"booking", "passenger", "login"}:
         state["stage"] = "login"
+    elif re.search(r"contact|add contact|traveller|passenger|mobile number|date of birth", result, re.I):
+        state["stage"] = "passenger"
     elif "Prices visible" in result and state.get("stage") in {"", "searching", "idle", None}:
         state["stage"] = "results"
     _save(phone, state)

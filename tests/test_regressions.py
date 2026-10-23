@@ -480,6 +480,8 @@ class SellerChoiceAndProxy(unittest.TestCase):
         stuck = dict(trip)
         stuck["preferred_seller"] = "cleartrip"
         self.assertIn("Google Flights", _search_ack(stuck, "4th Dec"))
+        checkout = "https://www.cleartrip.com/flights/itinerary?x=1"
+        self.assertEqual(_bookable_live_url(checkout), checkout)
         self.assertEqual(_alt_clock("1:15"), "13:15")
         self.assertEqual(_alt_clock("13:15"), "1:15")
         self.assertEqual(_bookable_live_url("https://www.google.com/travel/flights?q=ghy"), "")

@@ -72,7 +72,7 @@ If Meta is configured, outbound replies use Meta even when inbound still arrives
 2. Guide should reply immediately, then send a live screenshot and a recommendation.
 3. Reply "book the 12:30 flight" (any wording). It should open that fare on the chosen seller, not the same search again. If login, Indian mobile, email, DOB, gender, or OTP is missing, it asks. On payment it stops for approval (UPI you finish; card from vault if you say pay).
 4. `SAVE PROFILE Full Name | you@email.com | +phone` or just type those details when asked.
-5. Health at `/health` shows `"version": "0.5.5"`, `"chromium": true`, and `"proxy": true` when DataImpulse env vars are set.
+5. Health at `/health` shows `"version": "0.5.6"`, `"chromium": true`, and `"proxy": true` when DataImpulse env vars are set.
 
 ## Build note
 

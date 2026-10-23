@@ -9,6 +9,7 @@ import threading
 import time
 from datetime import date
 from typing import Any
+from urllib.parse import urlparse
 
 from app import db, llm, vault
 from app.browser_hands import (
@@ -477,6 +478,17 @@ _OTHER_SELLER = re.compile(
 
 def _wants_other_seller(text: str) -> bool:
     return bool(_OTHER_SELLER.search(text or ""))
+
+
+def _bookable_live_url(url: str) -> str:
+    """A checkout we can continue. A Google or Kayak results link is not one."""
+    host = (urlparse(url or "").hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    for name in ("cleartrip.com", "easemytrip.com", "ixigo.com", "makemytrip.com", "goibibo.com"):
+        if host == name or host.endswith("." + name):
+            return url
+    return ""
 
 
 def _browse_is_search(kind: str, state: dict[str, Any], text: str) -> bool:
@@ -1144,11 +1156,15 @@ def _book_on_seller(
         or "cleartrip"
     )
     live = state.get("live") if isinstance(state.get("live"), dict) else {}
-    live_url = str((live or {}).get("url") or "")
+    live_url = _bookable_live_url(str((live or {}).get("url") or ""))
     kind = infer_intent(state, text)
+    named = named_seller(text)
+    # A named site starts on that site's results, not whatever page was left open.
+    if named and named not in {"google", "kayak"}:
+        live_url = ""
 
     # Resume on the open checkout when the traveller just sent details or payment.
-    if live_url.startswith("http") and kind in {"details", "login", "pay", "book"} and state.get("stage") in {
+    if live_url and kind in {"details", "login", "pay", "book"} and state.get("stage") in {
         "booking",
         "login",
         "passenger",
@@ -1169,7 +1185,7 @@ def _book_on_seller(
             pay = _try_fill_payment(phone, session, secrets)
             page = pay or page
         _deliver(phone, _booking_page_reply(_load(phone), hint, page, session), session, secrets)
-        return
+        return ""
 
     from app.search import NOT_BOOKABLE
 
@@ -1177,12 +1193,18 @@ def _book_on_seller(
         preferred = "cleartrip"
     seller = seller_order(preferred)[0]
     seller_id = seller["id"]
+    picked = _load(phone)
+    picked["seller"] = seller_id
+    picked["preferred_seller"] = seller_id
+    _save(phone, picked)
     if _stale(phone, started_at):
-        return
+        return ""
     result = session.open_url(seller_results_url(seller_id, origin, destination, depart), goto_timeout=18000, airline_wait=8000)
     if _stale(phone, started_at):
-        return
-    if page_blocked(result) or not fare_options(result):
+        return ""
+    if page_blocked(result) or not (fare_options(result) or any(n >= 3000 for n in prices_in(result))):
+        if session.use_proxy:
+            return "proxy-miss"
         _add_note(phone, f"{seller['label']} not usable for booking.")
         _deliver(
             phone,
@@ -1191,14 +1213,14 @@ def _book_on_seller(
             session,
             secrets,
         )
-        return
+        return ""
     _note_live(phone, result)
     saved = _load(phone)
     saved["seller"] = seller_id
     _save(phone, saved)
     sheet = session.click_book(hint)
     if _stale(phone, started_at):
-        return
+        return ""
     if sheet.startswith("Could not"):
         _deliver(
             phone,
@@ -1207,14 +1229,14 @@ def _book_on_seller(
             session,
             secrets,
         )
-        return
+        return ""
     _note_live(phone, sheet)
     if "itinerary/failure" in sheet or "Server error" in sheet:
         _deliver(phone, _booking_page_reply(_load(phone), hint, sheet, session), session, secrets)
-        return
+        return ""
     moved = session.click_continue()
     if _stale(phone, started_at):
-        return
+        return ""
     _note_live(phone, moved)
     _fill_what_we_can(phone, session, secrets)
     if "Review your itinerary" in moved and not re.search(r"\bemail\b|mobile number|date of birth", moved, re.I):
@@ -1226,6 +1248,7 @@ def _book_on_seller(
     page = session.read_page()
     _note_live(phone, page)
     _deliver(phone, _booking_page_reply(_load(phone), hint, page, session), session, secrets)
+    return ""
 
 
 def _fill_what_we_can(phone: str, session: BrowserSession, secrets: list[str]) -> bool:
@@ -1338,9 +1361,19 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     return f"I moved {trip} forward on {seller}. Nothing paid. The screenshot is the page I'm on."
 
 
+def _open_booking(phone: str, text: str, session: BrowserSession, secrets: list[str], started_at: float | None, loaded: dict[str, Any]) -> str:
+    session.mode = "book"
+    session.allow_pay = bool(loaded.get("pay_authorized"))
+    session.private = _take_ephemeral(phone)
+    return _book_on_seller(phone, text, session, secrets, started_at)
+
+
 def _run_browse(phone: str, text: str, started_at: float | None = None, kind: str = "") -> None:
     secrets: list[str] = []
     acquired = False
+    direct = False
+    use_proxy = False
+    loaded: dict[str, Any] = {}
     try:
         acquired = _LOCK.acquire(timeout=40)
         if not acquired:
@@ -1357,19 +1390,28 @@ def _run_browse(phone: str, text: str, started_at: float | None = None, kind: st
             if direct:
                 _publish_fares(phone, text, secrets, started_at)
             else:
-                with BrowserSession(phone, fresh=True, headed=headed, use_proxy=use_proxy) as session:
-                    session.mode = "book"
-                    session.allow_pay = bool(loaded.get("pay_authorized"))
-                    session.private = _take_ephemeral(phone)
-                    _book_on_seller(phone, text, session, secrets, started_at)
+                try:
+                    with BrowserSession(phone, fresh=True, headed=headed, use_proxy=use_proxy) as session:
+                        missed = _open_booking(phone, text, session, secrets, started_at, loaded)
+                    if missed == "proxy-miss":
+                        raise RuntimeError("proxy page had no bookable fare")
+                except Exception:
+                    logger.exception("Proxy booking failed")
+                    if not use_proxy:
+                        raise
+                    logger.warning("Opening the seller directly")
+                    with BrowserSession(phone, fresh=True, headed=False, use_proxy=False) as session:
+                        _open_booking(phone, text, session, secrets, started_at, loaded)
         finally:
             _LOCK.release()
     except Exception:
         logger.exception("Live browse failed")
-        seller = _seller_label(str(_load(phone).get("preferred_seller") or _load(phone).get("seller") or "cleartrip"))
+        seller_id = str(_load(phone).get("seller") or _load(phone).get("preferred_seller") or "cleartrip")
+        if seller_id in {"google", "kayak", ""}:
+            seller_id = "cleartrip"
         _deliver(
             phone,
-            f"{seller} didn't open the booking page. Nothing paid. Say another site and I'll try that one.",
+            f"{_seller_label(seller_id)} didn't open the booking page. Nothing paid. Say another site and I'll try that one.",
             None,
             secrets,
         )

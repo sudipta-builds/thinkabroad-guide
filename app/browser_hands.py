@@ -350,15 +350,18 @@ class BrowserSession:
 
     def _gate(self, route: object) -> None:
         url = route.request.url
-        if url.startswith(("about:", "data:", "blob:")) or url_allowed(url, allow_local=self.allow_local):
+        if url.startswith(("about:", "data:", "blob:")):
             route.continue_()
             return
-        # The proxy resolves hosts this machine cannot. Aborting those kills the booking page.
-        if self.use_proxy:
-            host = (urlparse(url).hostname or "").lower()
-            if urlparse(url).scheme in {"http", "https"} and host not in {"localhost", "metadata.google.internal"} and not host.endswith(".local"):
-                route.continue_()
-                return
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        # Proxied traffic must not wait on this machine's DNS. A failed lookup aborts the booking page.
+        if self.use_proxy and parsed.scheme in {"http", "https"} and host not in {"localhost", "metadata.google.internal"} and not host.endswith(".local"):
+            route.continue_()
+            return
+        if url_allowed(url, allow_local=self.allow_local):
+            route.continue_()
+            return
         route.abort()
 
     def open_url(self, url: str, *, goto_timeout: int = 12000, price_wait: int = 4000, airline_wait: int = 10000) -> str:
@@ -370,10 +373,21 @@ class BrowserSession:
             self.page.goto(allowed, wait_until="domcontentloaded", timeout=goto_timeout)
         except Exception as exc:
             proxy_down = self.use_proxy and re.search(r"PROXY|TUNNEL|CONNECTION_RESET|CONNECTION_CLOSED", str(exc), re.I)
-            if not proxy_down:
+            timed_out = "Timeout" in type(exc).__name__
+            if proxy_down:
+                logger.warning("Proxied open failed once; retrying %s", allowed[:80])
+                try:
+                    self.page.goto(allowed, wait_until="domcontentloaded", timeout=12000)
+                except Exception as again:
+                    if "Timeout" not in type(again).__name__ and not re.search(
+                        r"PROXY|TUNNEL|CONNECTION_RESET|CONNECTION_CLOSED", str(again), re.I
+                    ):
+                        raise
+                    logger.warning("Proxied open still failed (%s); reading what loaded", type(again).__name__)
+            elif timed_out:
+                logger.warning("Page open timed out; reading what loaded")
+            else:
                 raise
-            logger.warning("Proxied open failed once; retrying %s", allowed[:80])
-            self.page.goto(allowed, wait_until="domcontentloaded", timeout=12000)
         self._dismiss()
         flight_host = any(
             host in allowed

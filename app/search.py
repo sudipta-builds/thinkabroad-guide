@@ -360,7 +360,7 @@ def named_seller(text: str) -> str:
         return "google"
     if re.search(r"\b(cleartrip|ct)\b", raw):
         return "cleartrip"
-    if re.search(r"\b(easemytrip|emt)\b", raw):
+    if re.search(r"\b(easemytrip|easymyt\w*|ease\s*my\s*trip|emt)\b", raw):
         return "easemytrip"
     if re.search(r"\bixigo\b", raw):
         return "ixigo"

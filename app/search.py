@@ -373,18 +373,16 @@ def named_seller(text: str) -> str:
 NOT_BOOKABLE = {"google", "kayak"}
 
 
-def race_sellers(preferred: str = "") -> list[dict[str, str]]:
-    """Sellers to open at once. A named site is the only one. Otherwise the two fastest bookable sites."""
+def search_seller(preferred: str = "") -> dict[str, str]:
+    """One page for fares. Google Flights unless the traveller named a bookable site."""
     preferred = (preferred or "").lower()
-    if preferred:
+    if preferred and preferred not in NOT_BOOKABLE:
         match = [item for item in SELLERS if item["id"] == preferred]
         if match:
-            return match
-        if preferred == "google":
-            return [{"id": "google", "label": "Google Flights", "host": "google.com"}]
-        if preferred == "kayak":
-            return [{"id": "kayak", "label": "Kayak", "host": "kayak.co.in"}]
-    return [item for item in SELLERS if item["id"] in {"cleartrip", "easemytrip"}]
+            return match[0]
+    if preferred == "kayak":
+        return {"id": "kayak", "label": "Kayak", "host": "kayak.co.in"}
+    return {"id": "google", "label": "Google Flights", "host": "google.com"}
 
 
 def seller_order(preferred: str = "") -> list[dict[str, str]]:

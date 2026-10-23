@@ -465,7 +465,12 @@ def named_seller_from(text: str) -> str:
 
 def _search_ack(state: dict[str, Any]) -> str:
     trip = _trip_line(state) or "that trip"
-    return f"Searching {trip}. About 15 seconds, then the first fares and a screenshot."
+    from app.search import NOT_BOOKABLE
+
+    seller = str(state.get("preferred_seller") or "")
+    if seller and seller not in NOT_BOOKABLE:
+        return f"Opening {_seller_label(seller)} for {trip}. Screenshot as soon as the fares load."
+    return f"Checking Google Flights for {trip}. One page, then the fares and a screenshot."
 
 
 def _hold_live(state: dict[str, Any], text: str, *, busy: bool, changed: bool) -> bool:
@@ -979,10 +984,15 @@ def _options_reply(state: dict[str, Any], options: list[dict[str, Any]], seller:
         bits.append(f"₹{option['price']}")
         lines.append(", ".join(part for part in bits if part) + ".")
     best = _pick_best(options, str(state.get("preference") or ""))
-    lines.append(
-        f"I'd take {best['airline']} at {best['depart']} on {label}. Say that time and I'll book it. "
-        "Another site is one message away."
-    )
+    from app.search import NOT_BOOKABLE
+
+    if (seller or "") in NOT_BOOKABLE or label == "Google Flights":
+        lines.append(
+            f"I'd take {best['airline']} at {best['depart']}. "
+            "Google Flights can't take the booking. Say that time and I'll book it on Cleartrip, or name another site."
+        )
+    else:
+        lines.append(f"I'd take {best['airline']} at {best['depart']} on {label}. Say that time and I'll book it.")
     return "\n".join(lines)
 
 
@@ -1009,84 +1019,35 @@ def _publish_fares(
     secrets: list[str],
     started_at: float | str | None,
 ) -> None:
-    """Open the fastest bookable sellers together and send whichever paints first."""
-    from app.search import NOT_BOOKABLE, named_seller, race_sellers, seller_results_url
+    """One page only. Google Flights unless the traveller named a site."""
+    from app.search import NOT_BOOKABLE, named_seller, search_seller, seller_results_url
 
     state = _load(phone)
     origin = str(state.get("origin") or "")
     destination = str(state.get("destination") or "")
     depart = str(state.get("depart") or "")
     preferred = named_seller(text) or str(state.get("preferred_seller") or "")
-    racers = race_sellers(preferred)
-    box: dict[str, Any] = {}
-    box_lock = threading.Lock()
-    settings = get_settings()
-    use_proxy = bool(settings.proxy_ready and settings.proxy_search)
-
-    def attempt(seller: dict[str, str]) -> None:
+    seller = search_seller(preferred)
+    if _stale(phone, started_at):
+        return
+    session = BrowserSession(phone, fresh=True, headed=False, use_proxy=False)
+    try:
+        session.start()
+        session.mode = "search"
+        result = session.open_url(
+            seller_results_url(seller["id"], origin, destination, depart),
+            goto_timeout=12000,
+            airline_wait=8000,
+        )
         if _stale(phone, started_at):
             return
-        session = BrowserSession(phone, fresh=True, headed=False, use_proxy=use_proxy)
-        keep = False
-        try:
-            session.start()
-            session.mode = "search"
-            result = session.open_url(
-                seller_results_url(seller["id"], origin, destination, depart),
-                goto_timeout=12000,
-                airline_wait=8000,
-            )
-            if _stale(phone, started_at):
-                return
-            options = fare_options(result)
-            prices = [n for n in prices_in(result) if n >= 3000]
-            if page_blocked(result) or not (options or prices):
-                return
-            with box_lock:
-                if box.get("winner"):
-                    return
-                box["winner"] = {"seller": seller, "result": result, "options": options, "session": session}
-                keep = True
-        except Exception:
-            logger.exception("Seller race failed for %s", seller.get("id"))
-        finally:
-            if not keep:
-                session.close()
-
-    threads = [threading.Thread(target=attempt, args=(seller,), name=f"fare-{seller['id']}", daemon=True) for seller in racers]
-    for thread in threads:
-        thread.start()
-    deadline = time.time() + 14
-    while time.time() < deadline:
-        if box.get("winner") or _stale(phone, started_at):
-            break
-        time.sleep(0.25)
-    for thread in threads:
-        thread.join(timeout=0.2)
-    if _stale(phone, started_at):
-        winner = box.get("winner") or {}
-        if winner.get("session") is not None:
-            winner["session"].close()
-        return
-    winner = box.get("winner")
-    if not winner:
-        trip = _trip_line(_load(phone)) or "that trip"
-        _deliver(
-            phone,
-            f"No fare painted for {trip} in 15 seconds. Say Cleartrip or EaseMyTrip and I'll open just that page.",
-            None,
-            secrets,
-        )
-        return
-    seller = winner["seller"]
-    session = winner["session"]
-    try:
-        result = str(winner["result"])
-        options = winner["options"]
+        options = fare_options(result)
+        prices = [n for n in prices_in(result) if n >= 3000]
         _note_live(phone, result)
         saved = _load(phone)
         saved["seller"] = seller["id"]
-        saved["preferred_seller"] = preferred or seller["id"]
+        if preferred and preferred not in NOT_BOOKABLE:
+            saved["preferred_seller"] = preferred
         if options:
             saved["options"] = [
                 {k: item[k] for k in ("airline", "flight", "depart", "arrive", "price") if k in item}
@@ -1094,10 +1055,23 @@ def _publish_fares(
             ]
         saved["stage"] = "results"
         _save(phone, saved)
+        if page_blocked(result) or not (options or prices):
+            trip = _trip_line(saved) or "that trip"
+            _deliver(
+                phone,
+                f"Google Flights didn't paint a fare for {trip}. The screenshot is the page. Say another day, or name Cleartrip.",
+                session,
+                secrets,
+            )
+            return
         spoken = _options_reply(saved, options, seller=seller["id"]) if options else _fare_line(result, saved, seller=seller["id"])
-        if seller["id"] in NOT_BOOKABLE:
-            spoken += " Booking isn't possible on this page. Say Cleartrip or EaseMyTrip and I'll book there."
+        if seller["id"] in NOT_BOOKABLE and "can't take the booking" not in spoken:
+            spoken += " Booking isn't possible on this page. Say a time and I'll book it on Cleartrip, or name another site."
         _deliver(phone, spoken, session, secrets)
+    except Exception:
+        logger.exception("Fare search failed")
+        if not _stale(phone, started_at):
+            _deliver(phone, "The fare page didn't open. Say the date again and I'll try once.", None, secrets)
     finally:
         session.close()
 
@@ -1158,14 +1132,7 @@ def _book_on_seller(
     from app.search import NOT_BOOKABLE
 
     if preferred in NOT_BOOKABLE:
-        label = "Google Flights" if preferred == "google" else "Kayak"
-        _deliver(
-            phone,
-            f"Booking isn't possible on {label}. Say Cleartrip or EaseMyTrip and I'll book there.",
-            session,
-            secrets,
-        )
-        return
+        preferred = "cleartrip"
     seller = seller_order(preferred)[0]
     seller_id = seller["id"]
     if _stale(phone, started_at):

@@ -52,6 +52,21 @@ def _alt_clock(hint: str) -> str:
     return ""
 
 
+def _clock_needles(hint: str) -> list[str]:
+    """Times a fare row might show: 1:15, 01:15, 13:15."""
+    match = re.match(r"(\d{1,2}):(\d{2})", hint or "")
+    if not match:
+        return [hint] if hint else []
+    hour, minute = int(match.group(1)), match.group(2)
+    needles = {f"{hour}:{minute}", f"{hour:02d}:{minute}"}
+    alt = _alt_clock(hint)
+    if alt:
+        needles.add(alt)
+        alt_hour = int(alt.split(":", 1)[0])
+        needles.add(f"{alt_hour:02d}:{minute}")
+    return [item for item in needles if item]
+
+
 def _launch_browser(playwright: object, *, headed: bool, proxy: dict[str, str] | None = None) -> object:
     """Headless Chromium. A proxy is set on launch so authenticated residential exits work."""
     chrome_args = ["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage"]
@@ -486,33 +501,49 @@ class BrowserSession:
             return
 
     def click_book(self, hint: str) -> str:
-        """Open the fare sheet for a departure time. Cleartrip's Book control is a real button."""
+        """Open the fare sheet for a departure time. Wait until Book controls actually paint."""
         assert self.page is not None
         self._lift_overlay()
-        found = self.page.evaluate(
-            """([hint, alt]) => {
-                const buttons = [...document.querySelectorAll('button')].filter(b => (b.innerText || '').trim() === 'Book');
-                const btn = buttons.find(b => {
-                    let node = b;
-                    let blob = '';
-                    for (let i = 0; i < 8 && node; i += 1) {
-                        blob += '\\n' + (node.innerText || '');
-                        node = node.parentElement;
-                    }
-                    return !hint || blob.includes(hint) || (alt && blob.includes(alt));
-                });
-                if (!btn) return '';
-                btn.click();
-                return 'ok';
-            }""",
-            [hint or "", _alt_clock(hint)],
-        )
+        needles = _clock_needles(hint)
+        deadline = 90 if self.use_proxy else 20
+        started = time.monotonic()
+        found = ""
+        while time.monotonic() - started < deadline:
+            found = self.page.evaluate(
+                """(needles) => {
+                    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                    const controls = [...document.querySelectorAll('button, a, [role="button"]')].filter(
+                        b => /^book$/i.test(norm(b.innerText || b.textContent || ''))
+                    );
+                    const blobOf = (el) => {
+                        let node = el;
+                        let blob = '';
+                        for (let i = 0; i < 10 && node; i += 1) {
+                            blob += '\\n' + (node.innerText || '');
+                            node = node.parentElement;
+                        }
+                        return blob;
+                    };
+                    const btn = controls.find(b => {
+                        if (!needles.length) return true;
+                        const blob = blobOf(b);
+                        return needles.some(n => n && blob.includes(n));
+                    });
+                    if (!btn) return '';
+                    btn.click();
+                    return 'ok';
+                }""",
+                needles,
+            )
+            if found:
+                break
+            self.page.wait_for_timeout(2000)
         if not found:
             return f"Could not find a Book button for {hint or 'the first fare'}."
         try:
-            self.page.wait_for_selector("text=Select your fare", timeout=6000)
+            self.page.wait_for_selector("text=/Select your fare|Continue|Review your itinerary/i", timeout=12000)
         except Exception:
-            self.page.wait_for_timeout(600)
+            self.page.wait_for_timeout(800)
         return self._observe(shoot=True)
 
     def click_continue(self) -> str:

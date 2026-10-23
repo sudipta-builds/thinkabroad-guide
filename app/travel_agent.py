@@ -1295,8 +1295,8 @@ def _book_on_seller(
     if sheet.startswith("Could not"):
         _deliver(
             phone,
-            f"The fares are on the screenshot, but I couldn't open a Book button for {hint or 'that time'}. "
-            "Say another site if you want me to try there.",
+            f"The results page didn't finish painting a Book button for {hint or 'that time'}. Nothing paid. "
+            "Say that time again, or name EaseMyTrip or Ixigo.",
             session,
             secrets,
         )

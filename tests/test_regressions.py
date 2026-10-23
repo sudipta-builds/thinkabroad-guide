@@ -641,23 +641,30 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIs(pw.stopped_on, threading.current_thread())
 
     def test_booking_proxy_username_keeps_india_sticky(self) -> None:
-        """Cleartrip checkout needs LOGIN__cr.in;sessttl.30 on a sticky port, not rotating 823."""
+        """Cleartrip checkout needs LOGIN__cr.in;sessid…;sessttl.30 on a sticky port, not rotating 823."""
         get_settings.cache_clear()
         os.environ["PROXY_HOST"] = "gw.dataimpulse.com"
         os.environ["PROXY_PORT"] = "10000"
-        os.environ["PROXY_USERNAME"] = "aebd377cf63720321420__cr.in;sessttl.30"
+        os.environ["PROXY_USERNAME"] = "aebd377cf63720321420__cr.in;sessid.guide1;sessttl.30"
         os.environ["PROXY_PASSWORD"] = "secret"
         get_settings.cache_clear()
         try:
             proxy = get_settings().playwright_proxy()
             assert proxy is not None
             self.assertEqual(proxy["server"], "http://gw.dataimpulse.com:10000")
-            self.assertTrue(proxy["username"].endswith("__cr.in;sessttl.30"))
+            self.assertIn("__cr.in;sessid.guide1;sessttl.30", proxy["username"])
             self.assertNotIn(":823", proxy["server"])
         finally:
             for key in ("PROXY_HOST", "PROXY_PORT", "PROXY_USERNAME", "PROXY_PASSWORD"):
                 os.environ.pop(key, None)
             get_settings.cache_clear()
+
+    def test_busy_window_covers_slow_cleartrip_checkout(self) -> None:
+        from app.travel_agent import _busy
+
+        now = __import__("time").time()
+        self.assertTrue(_busy({"busy_at": f"{now - 200:.3f}"}))
+        self.assertFalse(_busy({"busy_at": f"{now - 400:.3f}"}))
 
 
 if __name__ == "__main__":

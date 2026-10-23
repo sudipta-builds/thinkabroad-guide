@@ -9,6 +9,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
@@ -545,17 +546,53 @@ class BrowserSession:
                     if (btn) btn.click();
                 }"""
             )
-        # Residential Cleartrip needs longer for itinerary/create before contact/pay.
-        settle_ms = 4500 if self.use_proxy else 1200
-        self.page.wait_for_timeout(settle_ms)
+        # Short pause, then settle_checkout polls — Instinct-class Cleartrip often needs minutes.
+        self.page.wait_for_timeout(2000 if self.use_proxy else 800)
         try:
-            self.page.wait_for_load_state("domcontentloaded", timeout=20000 if self.use_proxy else 6000)
+            self.page.wait_for_load_state("domcontentloaded", timeout=15000 if self.use_proxy else 5000)
         except Exception:
             pass
-        active = self.page
-        if self._context is not None and self._context.pages:
-            active = self._context.pages[-1]
-            self.page = active
+        return self.settle_checkout()
+
+    def settle_checkout(self, *, deadline_ms: int | None = None) -> str:
+        """After Continue, wait for contact/pay. Cleartrip can take ~4 minutes on residential."""
+        assert self.page is not None
+        if deadline_ms is None:
+            deadline_ms = 240_000 if self.use_proxy else 20_000
+        ready = re.compile(
+            r"pay to complete|pay now|\bupi\b|card number|mobile number|date of birth|"
+            r"add contact|traveller|passenger|review your itinerary|net banking",
+            re.I,
+        )
+        lost = re.compile(r"connection lost|been disconnected|itinerary/failure|server error", re.I)
+        retried = False
+        started = time.monotonic()
+        while (time.monotonic() - started) * 1000 < deadline_ms:
+            if self._context is not None and self._context.pages:
+                self.page = self._context.pages[-1]
+            blob = self._observe(shoot=False)
+            if ready.search(blob) and not lost.search(blob):
+                return self._observe(shoot=True)
+            if lost.search(blob) and not retried:
+                retried = True
+                logger.info("Cleartrip connection lost; clicking Try again once")
+                try:
+                    self.page.get_by_role("button", name=re.compile(r"try again", re.I)).first.click(timeout=4000)
+                except Exception:
+                    try:
+                        self.page.evaluate(
+                            """() => {
+                                const btn = [...document.querySelectorAll('button,a')].find(
+                                    el => /try again/i.test((el.innerText || el.textContent || ''))
+                                );
+                                if (btn) btn.click();
+                            }"""
+                        )
+                    except Exception:
+                        pass
+                self.page.wait_for_timeout(5000)
+                continue
+            self.page.wait_for_timeout(3000)
         return self._observe(shoot=True)
 
     def read_page(self) -> str:

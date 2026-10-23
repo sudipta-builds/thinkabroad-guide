@@ -475,6 +475,7 @@ def _booking_ack(state: dict[str, Any], kind: str, text: str = "") -> str:
     if kind == "select" and hint:
         return (
             f"Got the {hint} on {trip}. I'll open that fare on {seller} and go through sign-in and the passenger form. "
+            "Cleartrip can take a few minutes after Continue — I'll wait. "
             "If the site needs your email, phone, or an OTP, I'll ask. I won't pay unless you tell me to."
         )
     if kind == "pay":
@@ -1301,28 +1302,18 @@ def _book_on_seller(
         )
         return ""
     _note_live(phone, sheet)
-    if "itinerary/failure" in sheet or "Server error" in sheet:
-        _deliver(phone, _booking_page_reply(_load(phone), hint, sheet, session), session, secrets)
-        return ""
+    # Don't abort on a flash Connection lost here — click_continue → settle_checkout waits / retries.
     moved = session.click_continue()
     if _stale(phone, started_at):
         return ""
     _note_live(phone, moved)
-    page_url = str(session.page.url or "") if session.page is not None else ""
-    if "itinerary/failure" in page_url or "itinerary/failure" in moved or "Server error" in moved:
-        _deliver(phone, _booking_page_reply(_load(phone), hint, moved, session), session, secrets)
-        return ""
     _fill_what_we_can(phone, session, secrets)
-    if "Review your itinerary" in moved and not re.search(r"\bemail\b|mobile number|date of birth", moved, re.I):
+    if "Review your itinerary" in moved and not re.search(r"\bemail\b|mobile number|date of birth|pay now|\bupi\b", moved, re.I):
         further = session.click_continue()
         if not _stale(phone, started_at):
             moved = further
             _note_live(phone, moved)
             _fill_what_we_can(phone, session, secrets)
-            page_url = str(session.page.url or "") if session.page is not None else ""
-            if "itinerary/failure" in page_url or "itinerary/failure" in moved or "Server error" in moved:
-                _deliver(phone, _booking_page_reply(_load(phone), hint, moved, session), session, secrets)
-                return ""
     page = session.read_page()
     _note_live(phone, page)
     _deliver(phone, _booking_page_reply(_load(phone), hint, page, session), session, secrets)
@@ -1374,10 +1365,11 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     url = ""
     if session.page is not None:
         url = str(session.page.url or "")
-    if "itinerary/failure" in url or "Server error" in page:
+    if "itinerary/failure" in url or re.search(r"connection lost|been disconnected|server error", page, re.I):
         return (
-            f"{seller} opened the {hint or 'selected'} fare for {trip}, then the itinerary page failed. "
-            "Nothing paid. The screenshot is that error. Say EaseMyTrip or Ixigo if you want another site."
+            f"{seller} opened the {hint or 'selected'} fare for {trip}, then the itinerary page failed "
+            "(Connection lost after waiting). Nothing paid. The screenshot is that error. "
+            "Say EaseMyTrip or Ixigo if you want another site."
         )
     needs_login = bool(re.search(r"\bpassword\b", page, re.I) and re.search(r"log ?in|sign in|sign up", page, re.I))
     contact = bool(re.search(r"contact|add contact|traveller|passenger|mobile", page, re.I))
@@ -1971,7 +1963,8 @@ def _busy(state: dict[str, Any]) -> bool:
         started = float(state.get("busy_at") or 0)
     except (TypeError, ValueError):
         return False
-    return bool(started) and (time.time() - started) < 180
+    # Residential Cleartrip checkout can take ~4 minutes (Instinct-class).
+    return bool(started) and (time.time() - started) < 360
 
 
 def _clear_busy(phone: str, started_at: float | None = None) -> None:

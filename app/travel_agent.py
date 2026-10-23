@@ -155,6 +155,19 @@ def handle_turn(
         remember_inbound(phone, message_sid)
     busy = _busy(state)
     changed = _trip_changed(before, state)
+    if changed:
+        state.pop("options", None)
+        if not named_seller_from(text):
+            state.pop("seller", None)
+        _save(phone, state)
+    if _hold_live(state, text, busy=busy, changed=changed):
+        reply = _live_hold_reply(state, text)
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply, emoji="👀")
+    cached = _cached_fares_reply(state, text, kind)
+    if cached:
+        db.add_message(phone, "assistant", cached)
+        return Reply.of(cached, emoji="✈️")
     if kind in _BOOKING and _should_browse(state, text, busy=busy, changed=changed):
         if not chromium_ready():
             reply = "Chromium isn't installed on the server yet, so I can't open the booking page."
@@ -180,7 +193,9 @@ def handle_turn(
             name="guide-browse",
             daemon=True,
         ).start()
-        return Reply.of("")
+        reply = _search_ack(state)
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply, emoji="✈️")
     with composing(phone):
         decision = llm.converse(_PLANNER, _planner_payload(phone, text, state, prior, busy=busy), timeout=7)
     action = str(decision.get("action") or "reply").lower()
@@ -195,7 +210,7 @@ def handle_turn(
         reply = _grounded(state, browsing=False, busy=busy)
     if action == "browse":
         if re.search(r"₹|Rs\.?\s*\d", reply):
-            reply = "Checking live sellers for that trip. I'll send what actually loads."
+            reply = _search_ack(state)
         if not chromium_ready():
             reply = "Chromium isn't installed on the server yet, so I can't open a booking page."
             emoji = "⚠️"
@@ -208,7 +223,7 @@ def handle_turn(
                 name="guide-browse",
                 daemon=True,
             ).start()
-            reply = reply or "Checking live sellers for that trip."
+            reply = reply or _search_ack(state)
             emoji = emoji or "✈️"
     if not reply:
         reply = "Where are you flying, and when?"
@@ -278,6 +293,8 @@ def infer_intent(state: dict[str, Any], text: str) -> str:
     updates = intent.parse_updates(raw)
     if updates.get("origin") and updates.get("destination"):
         return "search"
+    if state.get("options") and re.search(r"\b(go ahead|book it|take it|do it)\b", raw, re.I):
+        return "book"
     if re.search(r"\b(book|buy|reserve)\b", raw, re.I):
         return "book"
     if _TIME.search(raw) or re.search(r"\b(that one|this one|spicejet|indigo|done|take it)\b", raw, re.I):
@@ -438,6 +455,67 @@ def _booking_ack(state: dict[str, Any], kind: str) -> str:
 
 def _take_ephemeral(phone: str) -> dict[str, str]:
     return _EPHEMERAL.pop(phone, {})
+
+
+def named_seller_from(text: str) -> str:
+    from app.search import named_seller
+
+    return named_seller(text)
+
+
+def _search_ack(state: dict[str, Any]) -> str:
+    trip = _trip_line(state) or "that trip"
+    return f"Searching {trip}. About 15 seconds, then the first fares and a screenshot."
+
+
+def _hold_live(state: dict[str, Any], text: str, *, busy: bool, changed: bool) -> bool:
+    """A running search stays up. A new route or date is the only reason to replace it."""
+    if not busy or changed:
+        return False
+    return True
+
+
+def _live_hold_reply(state: dict[str, Any], text: str) -> str:
+    trip = _trip_line(state) or "that trip"
+    hint = str(state.get("selected_hint") or "")
+    noted = f" I noted {hint}." if hint and infer_intent(state, text) in {"select", "book"} else ""
+    return f"Still checking {trip}. First fares and a screenshot in a few seconds. I won't start over.{noted}"
+
+
+def _cached_fares_reply(state: dict[str, Any], text: str, kind: str) -> str:
+    """Repeat fares already on screen. A different named seller starts a new search."""
+    options = _stored_options(state)
+    if not options or kind in _BOOKING | {"pay_self", "cancel", "login", "details", "pay"}:
+        return ""
+    raw = (text or "").strip()
+    if kind == "chat" and raw not in {"?", "??"} and len(raw) > 24:
+        return ""
+    asked = named_seller_from(text)
+    current = str(state.get("seller") or "")
+    if asked and asked != current:
+        return ""
+    return _options_reply(state, options, seller=current)
+
+
+def _stored_options(state: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in state.get("options") or []:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        if "price_n" not in row:
+            digits = re.sub(r"[^\d]", "", str(row.get("price") or ""))
+            row["price_n"] = int(digits or "0")
+        row.setdefault("minutes", 9999)
+        row.setdefault("airline", "")
+        row.setdefault("depart", "")
+        row.setdefault("arrive", "")
+        row.setdefault("flight", "")
+        row.setdefault("duration", "")
+        row.setdefault("stops", "")
+        row.setdefault("price", "")
+        rows.append(row)
+    return rows
 
 
 def _direct_results(state: dict[str, Any], text: str) -> bool:
@@ -901,7 +979,10 @@ def _options_reply(state: dict[str, Any], options: list[dict[str, Any]], seller:
         bits.append(f"₹{option['price']}")
         lines.append(", ".join(part for part in bits if part) + ".")
     best = _pick_best(options, str(state.get("preference") or ""))
-    lines.append(f"I'd take {best['airline']} at {best['depart']} on {label}. Say that time and I'll open it.")
+    lines.append(
+        f"I'd take {best['airline']} at {best['depart']} on {label}. Say that time and I'll book it. "
+        "Another site is one message away."
+    )
     return "\n".join(lines)
 
 
@@ -925,62 +1006,100 @@ def _fare_line(result: str, state: dict[str, Any], seller: str = "") -> str:
 def _publish_fares(
     phone: str,
     text: str,
-    session: BrowserSession,
     secrets: list[str],
     started_at: float | str | None,
 ) -> None:
-    """Try sellers until one paints real fares. Prefer the one the traveller named."""
-    from app.search import named_seller, seller_order, seller_results_url
+    """Open the fastest bookable sellers together and send whichever paints first."""
+    from app.search import NOT_BOOKABLE, named_seller, race_sellers, seller_results_url
 
     state = _load(phone)
     origin = str(state.get("origin") or "")
     destination = str(state.get("destination") or "")
     depart = str(state.get("depart") or "")
-    preferred = named_seller(text) or str(state.get("preferred_seller") or state.get("seller") or "")
-    tried: list[str] = []
-    last_result = ""
-    last_seller = ""
-    for seller in seller_order(preferred)[:3]:
-        seller_id = seller["id"]
+    preferred = named_seller(text) or str(state.get("preferred_seller") or "")
+    racers = race_sellers(preferred)
+    box: dict[str, Any] = {}
+    box_lock = threading.Lock()
+    settings = get_settings()
+    use_proxy = bool(settings.proxy_ready and settings.proxy_search)
+
+    def attempt(seller: dict[str, str]) -> None:
         if _stale(phone, started_at):
             return
-        url = seller_results_url(seller_id, origin, destination, depart)
-        result = session.open_url(url, goto_timeout=45000)
-        last_result, last_seller = result, seller_id
-        if _stale(phone, started_at):
-            return
-        if not result.startswith("URL:"):
-            tried.append(seller["label"])
-            continue
+        session = BrowserSession(phone, fresh=True, headed=False, use_proxy=use_proxy)
+        keep = False
+        try:
+            session.start()
+            session.mode = "search"
+            result = session.open_url(
+                seller_results_url(seller["id"], origin, destination, depart),
+                goto_timeout=12000,
+                airline_wait=8000,
+            )
+            if _stale(phone, started_at):
+                return
+            options = fare_options(result)
+            prices = [n for n in prices_in(result) if n >= 3000]
+            if page_blocked(result) or not (options or prices):
+                return
+            with box_lock:
+                if box.get("winner"):
+                    return
+                box["winner"] = {"seller": seller, "result": result, "options": options, "session": session}
+                keep = True
+        except Exception:
+            logger.exception("Seller race failed for %s", seller.get("id"))
+        finally:
+            if not keep:
+                session.close()
+
+    threads = [threading.Thread(target=attempt, args=(seller,), name=f"fare-{seller['id']}", daemon=True) for seller in racers]
+    for thread in threads:
+        thread.start()
+    deadline = time.time() + 14
+    while time.time() < deadline:
+        if box.get("winner") or _stale(phone, started_at):
+            break
+        time.sleep(0.25)
+    for thread in threads:
+        thread.join(timeout=0.2)
+    if _stale(phone, started_at):
+        winner = box.get("winner") or {}
+        if winner.get("session") is not None:
+            winner["session"].close()
+        return
+    winner = box.get("winner")
+    if not winner:
+        trip = _trip_line(_load(phone)) or "that trip"
+        _deliver(
+            phone,
+            f"No fare painted for {trip} in 15 seconds. Say Cleartrip or EaseMyTrip and I'll open just that page.",
+            None,
+            secrets,
+        )
+        return
+    seller = winner["seller"]
+    session = winner["session"]
+    try:
+        result = str(winner["result"])
+        options = winner["options"]
         _note_live(phone, result)
-        if page_blocked(result):
-            tried.append(seller["label"])
-            _add_note(phone, f"{seller['label']} blocked the browser.")
-            continue
-        options = fare_options(result)
-        if not options:
-            tried.append(seller["label"])
-            continue
         saved = _load(phone)
-        saved["seller"] = seller_id
-        saved["preferred_seller"] = preferred or seller_id
-        saved["options"] = [
-            {k: item[k] for k in ("airline", "flight", "depart", "arrive", "price") if k in item}
-            for item in options
-        ]
+        saved["seller"] = seller["id"]
+        saved["preferred_seller"] = preferred or seller["id"]
+        if options:
+            saved["options"] = [
+                {k: item[k] for k in ("airline", "flight", "depart", "arrive", "price") if k in item}
+                for item in options
+            ]
         saved["stage"] = "results"
         _save(phone, saved)
-        _deliver(phone, _options_reply(saved, options, seller=seller_id), session, secrets)
-        return
-    if last_result.startswith("URL:"):
-        saved = _load(phone)
-        saved["seller"] = last_seller
-        _save(phone, saved)
-        _deliver(phone, _fare_line(last_result, saved, seller=last_seller), session, secrets)
-        return
-    trip = _trip_line(_load(phone)) or "that trip"
-    names = ", ".join(tried) if tried else "the live sellers"
-    _deliver(phone, f"I couldn't get fares for {trip} from {names}. Say a day and I'll try again.", session, secrets)
+        spoken = _options_reply(saved, options, seller=seller["id"]) if options else _fare_line(result, saved, seller=seller["id"])
+        if seller["id"] in NOT_BOOKABLE:
+            spoken += " Booking isn't possible on this page. Say Cleartrip or EaseMyTrip and I'll book there."
+        _deliver(phone, spoken, session, secrets)
+    finally:
+        session.close()
 
 
 def _book_on_seller(
@@ -1036,76 +1155,67 @@ def _book_on_seller(
         _deliver(phone, _booking_page_reply(_load(phone), hint, page, session), session, secrets)
         return
 
-    sellers = seller_order(preferred)[:2]
-    last_page = ""
-    for index, seller in enumerate(sellers):
-        seller_id = seller["id"]
-        if _stale(phone, started_at):
-            return
-        result = session.open_url(seller_results_url(seller_id, origin, destination, depart), goto_timeout=45000)
-        if _stale(phone, started_at):
-            return
-        if page_blocked(result) or not fare_options(result):
-            _add_note(phone, f"{seller['label']} not usable for booking.")
-            continue
-        _note_live(phone, result)
-        saved = _load(phone)
-        saved["seller"] = seller_id
-        _save(phone, saved)
-        sheet = session.click_book(hint)
-        if _stale(phone, started_at):
-            return
-        if sheet.startswith("Could not"):
-            if index + 1 < len(sellers):
-                continue
-            _deliver(
-                phone,
-                f"The fares are on the screenshot, but I couldn't open a Book button for {hint or 'that time'}.",
-                session,
-                secrets,
-            )
-            return
-        _note_live(phone, sheet)
-        if "itinerary/failure" in sheet or "Server error" in sheet:
-            if index + 1 < len(sellers):
-                _add_note(phone, f"{seller['label']} itinerary failed; trying next seller.")
-                continue
-            _deliver(phone, _booking_page_reply(_load(phone), hint, sheet, session), session, secrets)
-            return
-        moved = session.click_continue()
-        if _stale(phone, started_at):
-            return
-        _note_live(phone, moved)
-        if "itinerary/failure" in (session.page.url if session.page else "") or "Server error" in moved:
-            if index + 1 < len(sellers):
-                continue
-            _deliver(phone, _booking_page_reply(_load(phone), hint, moved, session), session, secrets)
-            return
-        if "Review your itinerary" in moved and not re.search(r"\bemail\b|mobile number|date of birth", moved, re.I):
-            further = session.click_continue()
-            if not _stale(phone, started_at):
-                moved = further
-                _note_live(phone, moved)
-        _fill_what_we_can(phone, session, secrets)
-        page = session.read_page()
-        _note_live(phone, page)
-        last_page = page
-        if "itinerary/failure" in (session.page.url if session.page else ""):
-            if index + 1 < len(sellers):
-                continue
-        _deliver(phone, _booking_page_reply(_load(phone), hint, page, session), session, secrets)
+    from app.search import NOT_BOOKABLE
+
+    if preferred in NOT_BOOKABLE:
+        label = "Google Flights" if preferred == "google" else "Kayak"
+        _deliver(
+            phone,
+            f"Booking isn't possible on {label}. Say Cleartrip or EaseMyTrip and I'll book there.",
+            session,
+            secrets,
+        )
         return
-    if last_page:
-        _deliver(phone, _booking_page_reply(_load(phone), hint, last_page, session), session, secrets)
+    seller = seller_order(preferred)[0]
+    seller_id = seller["id"]
+    if _stale(phone, started_at):
         return
-    trip = _trip_line(_load(phone)) or "that trip"
-    _deliver(
-        phone,
-        f"I couldn't open a booking page for {trip}. The sellers blocked the checkout or had no fares. "
-        "Say a different time and I'll try once more.",
-        session,
-        secrets,
-    )
+    result = session.open_url(seller_results_url(seller_id, origin, destination, depart), goto_timeout=15000, airline_wait=8000)
+    if _stale(phone, started_at):
+        return
+    if page_blocked(result) or not fare_options(result):
+        _add_note(phone, f"{seller['label']} not usable for booking.")
+        _deliver(
+            phone,
+            f"{seller['label']} didn't open a bookable fare for {_trip_line(state) or 'that trip'}. Nothing paid. "
+            "Say EaseMyTrip, Ixigo, or Cleartrip if you want a different site.",
+            session,
+            secrets,
+        )
+        return
+    _note_live(phone, result)
+    saved = _load(phone)
+    saved["seller"] = seller_id
+    _save(phone, saved)
+    sheet = session.click_book(hint)
+    if _stale(phone, started_at):
+        return
+    if sheet.startswith("Could not"):
+        _deliver(
+            phone,
+            f"The fares are on the screenshot, but I couldn't open a Book button for {hint or 'that time'}. "
+            "Say another site if you want me to try there.",
+            session,
+            secrets,
+        )
+        return
+    _note_live(phone, sheet)
+    if "itinerary/failure" in sheet or "Server error" in sheet:
+        _deliver(phone, _booking_page_reply(_load(phone), hint, sheet, session), session, secrets)
+        return
+    moved = session.click_continue()
+    if _stale(phone, started_at):
+        return
+    _note_live(phone, moved)
+    if "Review your itinerary" in moved and not re.search(r"\bemail\b|mobile number|date of birth", moved, re.I):
+        further = session.click_continue()
+        if not _stale(phone, started_at):
+            moved = further
+            _note_live(phone, moved)
+    _fill_what_we_can(phone, session, secrets)
+    page = session.read_page()
+    _note_live(phone, page)
+    _deliver(phone, _booking_page_reply(_load(phone), hint, page, session), session, secrets)
 
 
 def _fill_what_we_can(phone: str, session: BrowserSession, secrets: list[str]) -> bool:
@@ -1156,7 +1266,7 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     if "itinerary/failure" in url or "Server error" in page:
         return (
             f"{seller} opened the {hint or 'selected'} fare for {trip}, then the itinerary page failed. "
-            "Nothing paid. The screenshot is that error. Say the time again and I'll try another seller once."
+            "Nothing paid. The screenshot is that error. Say EaseMyTrip or Ixigo if you want another site."
         )
     needs_login = bool(re.search(r"\bpassword\b", page, re.I) and re.search(r"log ?in|sign in|sign up", page, re.I))
     contact = bool(re.search(r"contact|add contact|traveller|passenger|mobile", page, re.I))
@@ -1234,13 +1344,13 @@ def _run_browse(phone: str, text: str, started_at: float | None = None) -> None:
             # Booking uses the residential proxy in production. Search stays direct unless PROXY_SEARCH=1.
             use_proxy = bool(settings.proxy_ready and (not direct or settings.proxy_search))
             headed = not direct and not use_proxy
-            with BrowserSession(phone, fresh=True, headed=headed, use_proxy=use_proxy) as session:
-                session.mode = "search" if direct else "book"
-                session.allow_pay = bool(loaded.get("pay_authorized"))
-                session.private = _take_ephemeral(phone)
-                if direct:
-                    _publish_fares(phone, text, session, secrets, started_at)
-                else:
+            if direct:
+                _publish_fares(phone, text, secrets, started_at)
+            else:
+                with BrowserSession(phone, fresh=True, headed=headed, use_proxy=use_proxy) as session:
+                    session.mode = "book"
+                    session.allow_pay = bool(loaded.get("pay_authorized"))
+                    session.private = _take_ephemeral(phone)
                     _book_on_seller(phone, text, session, secrets, started_at)
         finally:
             _LOCK.release()

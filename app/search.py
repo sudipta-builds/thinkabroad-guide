@@ -308,6 +308,15 @@ def ixigo_results_url(origin: str, destination: str, depart: str) -> str:
     )
 
 
+def kayak_results_url(origin: str, destination: str, depart: str) -> str:
+    origin_hit = resolve_place(origin)
+    dest_hit = resolve_place(destination)
+    if not origin_hit or not dest_hit:
+        return flight_results_url(origin, destination, depart)
+    when = date.fromisoformat(str(depart)[:10])
+    return _kayak_url(origin_hit[0], dest_hit[0], when, False)
+
+
 def makemytrip_results_url(origin: str, destination: str, depart: str) -> str:
     origin_hit = resolve_place(origin)
     dest_hit = resolve_place(destination)
@@ -333,6 +342,8 @@ def seller_results_url(seller_id: str, origin: str, destination: str, depart: st
         "easemytrip": easemytrip_results_url,
         "ixigo": ixigo_results_url,
         "makemytrip": makemytrip_results_url,
+        "google": flight_results_url,
+        "kayak": kayak_results_url,
     }
     build = builders.get((seller_id or "").lower())
     if not build:
@@ -343,6 +354,8 @@ def seller_results_url(seller_id: str, origin: str, destination: str, depart: st
 def named_seller(text: str) -> str:
     """Seller id if the traveller named one, else empty."""
     raw = (text or "").lower()
+    if re.search(r"\b(google flights|google)\b", raw):
+        return "google"
     if re.search(r"\b(cleartrip|ct)\b", raw):
         return "cleartrip"
     if re.search(r"\b(easemytrip|emt)\b", raw):
@@ -351,7 +364,27 @@ def named_seller(text: str) -> str:
         return "ixigo"
     if re.search(r"\b(makemytrip|mmt|goibibo)\b", raw):
         return "makemytrip"
+    if re.search(r"\bkayak\b", raw):
+        return "kayak"
     return ""
+
+
+# Pages we can search but cannot ticket.
+NOT_BOOKABLE = {"google", "kayak"}
+
+
+def race_sellers(preferred: str = "") -> list[dict[str, str]]:
+    """Sellers to open at once. A named site is the only one. Otherwise the two fastest bookable sites."""
+    preferred = (preferred or "").lower()
+    if preferred:
+        match = [item for item in SELLERS if item["id"] == preferred]
+        if match:
+            return match
+        if preferred == "google":
+            return [{"id": "google", "label": "Google Flights", "host": "google.com"}]
+        if preferred == "kayak":
+            return [{"id": "kayak", "label": "Kayak", "host": "kayak.co.in"}]
+    return [item for item in SELLERS if item["id"] in {"cleartrip", "easemytrip"}]
 
 
 def seller_order(preferred: str = "") -> list[dict[str, str]]:

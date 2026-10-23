@@ -341,7 +341,7 @@ class BrowserSession:
             return
         route.abort()
 
-    def open_url(self, url: str, *, goto_timeout: int = 18000, price_wait: int = 4000) -> str:
+    def open_url(self, url: str, *, goto_timeout: int = 12000, price_wait: int = 4000, airline_wait: int = 10000) -> str:
         allowed = url_allowed(url, allow_local=self.allow_local)
         if not allowed:
             return "That address is not a public web page, so it was not opened."
@@ -350,16 +350,22 @@ class BrowserSession:
         self._dismiss()
         flight_host = any(
             host in allowed
-            for host in ("cleartrip.com/flights", "easemytrip.com", "ixigo.com", "makemytrip.com/flight")
+            for host in (
+                "cleartrip.com/flights",
+                "easemytrip.com",
+                "ixigo.com",
+                "makemytrip.com/flight",
+                "google.com/travel/flights",
+            )
         )
         if flight_host:
             try:
                 self.page.wait_for_selector(
                     "text=/SpiceJet|IndiGo|Air India|Akasa Air|No flights|couldn.?t find|sold out/i",
-                    timeout=20000,
+                    timeout=airline_wait,
                 )
             except Exception:
-                self.page.wait_for_timeout(1500)
+                self.page.wait_for_timeout(800)
         else:
             try:
                 self.page.wait_for_selector("text=/₹|Rs\\.?\\s*\\d|INR\\s*\\d|\\$\\s*\\d/", timeout=price_wait)

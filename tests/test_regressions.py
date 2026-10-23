@@ -14,6 +14,7 @@ from app.search import (
     flight_results_url,
     ixigo_results_url,
     named_seller,
+    race_sellers,
     seller_order,
     seller_results_url,
 )
@@ -23,7 +24,10 @@ from app.db import choose_db_path
 from app.intent import explicit_date, week_window
 from app.travel_agent import (
     _booking_page_reply,
+    _cached_fares_reply,
     _direct_results,
+    _hold_live,
+    _search_ack,
     _force_browse,
     _human_reply,
     _indian_mobile,
@@ -438,10 +442,28 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(named_seller("try easemytrip"), "easemytrip")
         self.assertEqual(named_seller("open cleartrip"), "cleartrip")
         self.assertEqual(named_seller("mmt please"), "makemytrip")
+        self.assertEqual(named_seller("check google flights"), "google")
         order = seller_order("easemytrip")
         self.assertEqual(order[0]["id"], "easemytrip")
         self.assertIn("cleartrip", [item["id"] for item in order])
         self.assertEqual(order[-1]["id"], "makemytrip")
+        race = [item["id"] for item in race_sellers("")]
+        self.assertEqual(race, ["cleartrip", "easemytrip"])
+        self.assertEqual(race_sellers("ixigo")[0]["id"], "ixigo")
+        self.assertEqual(race_sellers("google")[0]["id"], "google")
+
+    def test_a_running_search_is_not_restarted(self) -> None:
+        trip = {"origin": "Guwahati", "destination": "Delhi", "depart": "2026-12-04", "options": [{"depart": "12:30", "price": "9,472", "airline": "SpiceJet"}]}
+        self.assertTrue(_hold_live(trip, "?", busy=True, changed=False))
+        self.assertFalse(_hold_live(trip, "?", busy=False, changed=False))
+        self.assertFalse(_hold_live(trip, "5 december", busy=True, changed=True))
+        ack = _search_ack(trip)
+        self.assertIn("15 seconds", ack)
+        self.assertIn("screenshot", ack)
+        self.assertEqual(infer_intent(trip, "go ahead with 4th december"), "book")
+        replay = _cached_fares_reply(trip, "?", "chat")
+        self.assertIn("SpiceJet", replay)
+        self.assertIn("Another site", replay)
 
     def test_seller_urls_for_ghy_delhi(self) -> None:
         clear = seller_results_url("cleartrip", "Guwahati", "Delhi", "2026-12-01")

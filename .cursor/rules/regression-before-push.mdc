@@ -1,0 +1,14 @@
+---
+description: Run and update regression checks before every git push
+alwaysApply: true
+---
+
+# Regression checks before every push
+
+Before `git push`, always:
+
+1. Update `tests/test_regressions.py` when behavior changed, so the new cases are locked in.
+2. Run `python -m unittest tests.test_regressions` and wait until it passes.
+3. Push only after that run is green. If it fails, fix the code or the tests first. Do not push a red suite.
+
+This applies to every push in this project, including small fixes.

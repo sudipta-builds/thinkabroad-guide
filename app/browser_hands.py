@@ -373,6 +373,57 @@ class BrowserSession:
                 self.page.wait_for_timeout(1200)
         return self._observe(shoot=True)
 
+    def fill_google_route(self, origin: str, destination: str, depart: str) -> str:
+        """Type the route when Google left the search form empty."""
+        assert self.page is not None
+        if not re.search(r"Where from\?", self.last_text or "", re.I):
+            return self.last_text
+        self._type_combo("Where from", origin)
+        self._type_combo("Where to", destination)
+        when = str(depart or "")[:10]
+        if len(when) == 10:
+            from datetime import date as date_cls
+
+            try:
+                spoken = date_cls.fromisoformat(when).strftime("%d %B %Y")
+            except ValueError:
+                spoken = when
+            self._type_combo("Departure", spoken)
+        for name in ("Search", "Done"):
+            button = self.page.get_by_role("button", name=re.compile(rf"^{name}$", re.I))
+            try:
+                if button.count() and button.first.is_visible():
+                    button.first.click(timeout=2000)
+                    break
+            except Exception:
+                continue
+        try:
+            self.page.wait_for_selector(
+                "text=/SpiceJet|IndiGo|Air India|Akasa Air|₹|Rs\\.?\\s*\\d/",
+                timeout=8000,
+            )
+        except Exception:
+            self.page.wait_for_timeout(800)
+        return self._observe(shoot=True)
+
+    def _type_combo(self, label: str, value: str) -> None:
+        assert self.page is not None
+        if not value:
+            return
+        pattern = re.compile(label, re.I)
+        locator = self.page.get_by_role("combobox", name=pattern)
+        if locator.count() == 0:
+            locator = self.page.get_by_label(pattern)
+        if locator.count() == 0:
+            return
+        try:
+            locator.first.click(timeout=2500)
+            locator.first.fill(value, timeout=2500)
+            self.page.keyboard.press("Enter")
+            self.page.wait_for_timeout(400)
+        except Exception:
+            return
+
     def click_book(self, hint: str) -> str:
         """Open the fare sheet for a departure time. Cleartrip's Book control is a real button."""
         assert self.page is not None

@@ -571,18 +571,25 @@ def _trip_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
     return any(norm(before, key) != norm(after, key) for key in ("origin", "destination", "depart", "depart_until"))
 
 
+def _place(name: object) -> str:
+    from app.search import place_label
+
+    return place_label(str(name or "")) or str(name or "")
+
+
 def _trip_line(state: dict[str, Any]) -> str:
     if not (state.get("origin") and state.get("destination") and state.get("depart")):
         return ""
+    origin, destination = _place(state.get("origin")), _place(state.get("destination"))
     until = str(state.get("depart_until") or "")
     if until and until != state.get("depart"):
-        return f"{state['origin']} to {state['destination']}, {state['depart']} through {until}"
-    return f"{state['origin']} to {state['destination']} on {state['depart']}"
+        return f"{origin} to {destination}, {state['depart']} through {until}"
+    return f"{origin} to {destination} on {state['depart']}"
 
 
 def _window_phrase(state: dict[str, Any]) -> str:
-    origin = state.get("origin") or "?"
-    destination = state.get("destination") or "?"
+    origin = _place(state.get("origin")) or "?"
+    destination = _place(state.get("destination")) or "?"
     depart = str(state.get("depart") or "")
     until = str(state.get("depart_until") or "")
     if depart and until and until != depart:
@@ -1041,6 +1048,12 @@ def _publish_fares(
         )
         if _stale(phone, started_at):
             return
+        if seller["id"] == "google" and re.search(r"Where from\?", result or "", re.I):
+            from app.search import place_label
+
+            result = session.fill_google_route(place_label(origin) or origin, place_label(destination) or destination, depart)
+            if _stale(phone, started_at):
+                return
         options = fare_options(result)
         prices = [n for n in prices_in(result) if n >= 3000]
         _note_live(phone, result)

@@ -236,20 +236,22 @@ def _when_blurb(when: date, round_trip: bool) -> str:
     return f"{start} → {back} · 1 adult · round trip"
 
 
+def place_label(name: str) -> str:
+    hit = resolve_place(name)
+    return hit[1] if hit else (name or "")
+
+
 def flight_results_url(origin: str, destination: str, depart: str, depart_until: str = "") -> str:
-    """A Google Flights results page for a known trip. No model call required."""
+    """Google Flights search that already contains the cities and the date."""
     when = date.fromisoformat(str(depart)[:10])
-    origin_hit = resolve_place(origin)
-    dest_hit = resolve_place(destination)
-    origin_label = origin_hit[1] if origin_hit else origin
-    dest_label = dest_hit[1] if dest_hit else destination
-    origin_code = origin_hit[0] if origin_hit else ""
-    dest_code = dest_hit[0] if dest_hit else ""
+    origin_label = place_label(origin) or origin
+    dest_label = place_label(destination) or destination
     until = str(depart_until or "")[:10]
     if until and until != str(depart)[:10]:
         query = f"Flights from {origin_label} to {dest_label} from {str(depart)[:10]} to {until}"
-        return "https://www.google.com/travel/flights?" + urlencode({"hl": "en", "curr": "INR", "q": query})
-    return _google_url(origin_label, origin_code, dest_label, dest_code, when, False)
+    else:
+        query = f"One way flights from {origin_label} to {dest_label} on {when.strftime('%d %B %Y')}"
+    return "https://www.google.com/travel/flights?" + urlencode({"hl": "en", "curr": "INR", "q": query})
 
 
 def cleartrip_results_url(origin: str, destination: str, depart: str) -> str:

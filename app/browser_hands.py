@@ -532,7 +532,13 @@ class BrowserSession:
                     if (btn) btn.click();
                 }"""
             )
-        self.page.wait_for_timeout(1200)
+        # Residential Cleartrip needs longer for itinerary/create before contact/pay.
+        settle_ms = 4500 if self.use_proxy else 1200
+        self.page.wait_for_timeout(settle_ms)
+        try:
+            self.page.wait_for_load_state("domcontentloaded", timeout=20000 if self.use_proxy else 6000)
+        except Exception:
+            pass
         active = self.page
         if self._context is not None and self._context.pages:
             active = self._context.pages[-1]

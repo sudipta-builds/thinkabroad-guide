@@ -36,6 +36,8 @@ Branch `main` is pushed.
 | `PROXY_USERNAME` | Login with India sticky, e.g. `LOGIN__cr.in;sessttl.30` |
 | `PROXY_PASSWORD` | DataImpulse password (Render only — never commit) |
 
+Booking/checkout uses this proxy only (one residential retry if fares miss). It does **not** fall back to Render’s datacenter IP for Cleartrip itinerary/pay — that path caused `itinerary/failure`.
+
 **Disk:** Render → Guide service → **Disks** → add disk, mount path `/var/data`. If you skip the disk, remove `GUIDE_DB_PATH=/var/data/...` or set it to `data/guide.db`.
 
 ## 3. Meta WhatsApp Cloud API (preferred)
@@ -72,7 +74,7 @@ If Meta is configured, outbound replies use Meta even when inbound still arrives
 2. Guide should reply immediately, then send a live screenshot and a recommendation.
 3. Reply "book the 12:30 flight" (any wording). It should open that fare on the chosen seller, not the same search again. If login, Indian mobile, email, DOB, gender, or OTP is missing, it asks. On payment it stops for approval (UPI you finish; card from vault if you say pay).
 4. `SAVE PROFILE Full Name | you@email.com | +phone` or just type those details when asked.
-5. Health at `/health` shows `"version": "0.6.1"`, `"chromium": true`, and `"proxy": true` when DataImpulse env vars are set.
+5. Health at `/health` shows `"version": "0.6.2"`, `"chromium": true`, and `"proxy": true` when DataImpulse env vars are set.
 
 ## Build note
 

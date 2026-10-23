@@ -131,13 +131,20 @@ def handle_turn(
     state = _recover_trip(state, prior, text)
     previous_stage = str(state.get("stage") or "")
     saved_secret = _capture_private(phone, text, state)
-    kind = _coerce_kind(text, resolve_intent(text, state, prior))
+    kind = _coerce_kind(text, resolve_intent(text, state, prior), state)
     if _wants_other_seller(text) and state.get("origin") and state.get("destination") and state.get("depart"):
         from app.search import next_bookable_seller
 
         state["preferred_seller"] = next_bookable_seller(str(state.get("seller") or state.get("preferred_seller") or ""))
         state["seller"] = state["preferred_seller"]
         kind = "book"
+    else:
+        from app.search import NOT_BOOKABLE
+
+        named = named_seller_from(text)
+        if kind == "book" and named and named not in NOT_BOOKABLE:
+            state["preferred_seller"] = named
+            state["seller"] = named
     _apply_stage(state, text, kind)
     _save(phone, state)
     if not get_settings().llm_ready:
@@ -495,13 +502,29 @@ def _bookable_live_url(url: str) -> str:
     return ""
 
 
-def _coerce_kind(text: str, kind: str) -> str:
-    """A date or a seller name looks up fares. A flight time is what starts booking."""
+def _coerce_kind(text: str, kind: str, state: dict[str, Any] | None = None) -> str:
+    """A date looks up fares. A named seller with fares already on screen books that site."""
     from app.intent import explicit_date
+    from app.search import NOT_BOOKABLE
 
     if _flight_hint(text) or kind in {"pay", "login", "details", "pay_self", "cancel"}:
         return kind
-    if explicit_date(text) or (named_seller_from(text) and kind in {"book", "select", "chat"}):
+    named = named_seller_from(text)
+    if (
+        named
+        and named not in NOT_BOOKABLE
+        and state
+        and state.get("origin")
+        and state.get("destination")
+        and state.get("depart")
+        and (
+            state.get("selected_hint")
+            or state.get("options")
+            or str(state.get("stage") or "") in {"results", "booking", "login", "passenger", "payment"}
+        )
+    ):
+        return "book"
+    if explicit_date(text) or (named and kind in {"book", "select", "chat"}):
         return "search"
     return kind
 
@@ -1131,9 +1154,11 @@ def _publish_fares(
         _save(phone, saved)
         if page_blocked(result) or not (options or prices):
             trip = _trip_line(saved) or "that trip"
+            label = seller.get("label") or _seller_label(seller["id"])
+            next_hint = "Say another day, or name Cleartrip." if seller["id"] in NOT_BOOKABLE else "Say another day, or name a different site."
             _deliver(
                 phone,
-                f"Google Flights didn't paint a fare for {trip}. The screenshot is the page. Say another day, or name Cleartrip.",
+                f"{label} didn't paint a fare for {trip}. The screenshot is the page. {next_hint}",
                 session,
                 secrets,
             )
@@ -1269,6 +1294,10 @@ def _book_on_seller(
     if _stale(phone, started_at):
         return ""
     _note_live(phone, moved)
+    page_url = str(session.page.url or "") if session.page is not None else ""
+    if "itinerary/failure" in page_url or "itinerary/failure" in moved or "Server error" in moved:
+        _deliver(phone, _booking_page_reply(_load(phone), hint, moved, session), session, secrets)
+        return ""
     _fill_what_we_can(phone, session, secrets)
     if "Review your itinerary" in moved and not re.search(r"\bemail\b|mobile number|date of birth", moved, re.I):
         further = session.click_continue()
@@ -1276,6 +1305,10 @@ def _book_on_seller(
             moved = further
             _note_live(phone, moved)
             _fill_what_we_can(phone, session, secrets)
+            page_url = str(session.page.url or "") if session.page is not None else ""
+            if "itinerary/failure" in page_url or "itinerary/failure" in moved or "Server error" in moved:
+                _deliver(phone, _booking_page_reply(_load(phone), hint, moved, session), session, secrets)
+                return ""
     page = session.read_page()
     _note_live(phone, page)
     _deliver(phone, _booking_page_reply(_load(phone), hint, page, session), session, secrets)
@@ -1421,21 +1454,34 @@ def _run_browse(phone: str, text: str, started_at: float | None = None, kind: st
             if direct:
                 _publish_fares(phone, text, secrets, started_at)
             else:
+                # Checkout stays on the residential proxy only. A datacenter fallback can show
+                # fares then die on Cleartrip itinerary/create — that is not Instinct-like.
                 missed = ""
-                try:
-                    with BrowserSession(phone, fresh=True, headed=headed, use_proxy=use_proxy) as session:
-                        missed = _open_booking(phone, text, session, secrets, started_at, loaded) or ""
-                except Exception:
-                    logger.exception("Proxy booking failed")
-                    if not use_proxy:
-                        raise
-                    missed = "proxy-miss"
-                # Session must be fully closed above before starting another — Playwright
-                # Sync cannot start twice on one thread while the first driver is still open.
-                if missed == "proxy-miss" and use_proxy:
-                    logger.warning("Opening the seller directly after a proxy miss")
-                    with BrowserSession(phone, fresh=True, headed=False, use_proxy=False) as session:
-                        _open_booking(phone, text, session, secrets, started_at, loaded)
+                attempts = 2 if use_proxy else 1
+                for attempt in range(attempts):
+                    try:
+                        with BrowserSession(phone, fresh=True, headed=headed, use_proxy=use_proxy) as session:
+                            missed = _open_booking(phone, text, session, secrets, started_at, loaded) or ""
+                    except Exception:
+                        logger.exception("Booking browse failed (attempt %s)", attempt + 1)
+                        if not use_proxy:
+                            raise
+                        missed = "proxy-miss"
+                    if missed != "proxy-miss":
+                        break
+                    if attempt + 1 < attempts:
+                        logger.warning("Residential page had no bookable fare; retrying once on the same proxy")
+                if missed == "proxy-miss":
+                    seller_id = str(_load(phone).get("seller") or _load(phone).get("preferred_seller") or "cleartrip")
+                    if seller_id in {"google", "kayak", ""}:
+                        seller_id = "cleartrip"
+                    _deliver(
+                        phone,
+                        f"{_seller_label(seller_id)} didn't open a bookable fare on the India proxy. Nothing paid. "
+                        "Say that time again, or name EaseMyTrip or Ixigo.",
+                        None,
+                        secrets,
+                    )
         finally:
             _LOCK.release()
     except Exception:

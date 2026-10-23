@@ -485,9 +485,16 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(_coerce_kind("4th Dec", "book"), "search")
         self.assertEqual(_coerce_kind("Ixigo", "book"), "search")
         self.assertEqual(_coerce_kind("1:15", "select"), "select")
+        with_fares = dict(trip)
+        with_fares["options"] = [{"depart": "1:15", "price": "9,365"}]
+        with_fares["selected_hint"] = "1:15"
+        with_fares["stage"] = "results"
+        self.assertEqual(_coerce_kind("EaseMyTrip", "chat", with_fares), "book")
+        self.assertEqual(_coerce_kind("Ixigo", "book", with_fares), "book")
         stuck = dict(trip)
         stuck["preferred_seller"] = "cleartrip"
         self.assertIn("Google Flights", _search_ack(stuck, "4th Dec"))
+        self.assertIn("EaseMyTrip", _search_ack(stuck, "EaseMyTrip"))
         checkout = "https://www.cleartrip.com/flights/itinerary?x=1"
         self.assertEqual(_bookable_live_url(checkout), checkout)
         self.assertEqual(_alt_clock("1:15"), "13:15")
@@ -602,7 +609,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
             get_settings.cache_clear()
 
     def test_browser_close_stops_playwright_on_same_thread(self) -> None:
-        """Background close left the sync driver loop alive and blocked the direct fallback."""
+        """Close must finish on this thread so the next residential booking can start."""
         import threading
 
         class _Pw:
@@ -626,6 +633,25 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIsNone(session._pw)
         self.assertIsNone(session.page)
         self.assertIs(pw.stopped_on, threading.current_thread())
+
+    def test_booking_proxy_username_keeps_india_sticky(self) -> None:
+        """Cleartrip checkout needs LOGIN__cr.in;sessttl.30 on a sticky port, not rotating 823."""
+        get_settings.cache_clear()
+        os.environ["PROXY_HOST"] = "gw.dataimpulse.com"
+        os.environ["PROXY_PORT"] = "10000"
+        os.environ["PROXY_USERNAME"] = "aebd377cf63720321420__cr.in;sessttl.30"
+        os.environ["PROXY_PASSWORD"] = "secret"
+        get_settings.cache_clear()
+        try:
+            proxy = get_settings().playwright_proxy()
+            assert proxy is not None
+            self.assertEqual(proxy["server"], "http://gw.dataimpulse.com:10000")
+            self.assertTrue(proxy["username"].endswith("__cr.in;sessttl.30"))
+            self.assertNotIn(":823", proxy["server"])
+        finally:
+            for key in ("PROXY_HOST", "PROXY_PORT", "PROXY_USERNAME", "PROXY_PASSWORD"):
+                os.environ.pop(key, None)
+            get_settings.cache_clear()
 
 
 if __name__ == "__main__":

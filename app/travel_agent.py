@@ -1421,15 +1421,18 @@ def _run_browse(phone: str, text: str, started_at: float | None = None, kind: st
             if direct:
                 _publish_fares(phone, text, secrets, started_at)
             else:
+                missed = ""
                 try:
                     with BrowserSession(phone, fresh=True, headed=headed, use_proxy=use_proxy) as session:
-                        missed = _open_booking(phone, text, session, secrets, started_at, loaded)
-                    if missed == "proxy-miss":
-                        raise RuntimeError("proxy page had no bookable fare")
+                        missed = _open_booking(phone, text, session, secrets, started_at, loaded) or ""
                 except Exception:
                     logger.exception("Proxy booking failed")
                     if not use_proxy:
                         raise
+                    missed = "proxy-miss"
+                # Session must be fully closed above before starting another — Playwright
+                # Sync cannot start twice on one thread while the first driver is still open.
+                if missed == "proxy-miss" and use_proxy:
                     logger.warning("Opening the seller directly after a proxy miss")
                     with BrowserSession(phone, fresh=True, headed=False, use_proxy=False) as session:
                         _open_booking(phone, text, session, secrets, started_at, loaded)

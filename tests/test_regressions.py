@@ -7,7 +7,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.browser_hands import _alt_clock, known_flight_host, looks_like_card, payment_control, should_capture, url_allowed
+from app.browser_hands import (
+    BrowserSession,
+    _alt_clock,
+    known_flight_host,
+    looks_like_card,
+    payment_control,
+    should_capture,
+    url_allowed,
+)
 from app.search import (
     cleartrip_results_url,
     easemytrip_results_url,
@@ -592,6 +600,32 @@ class SellerChoiceAndProxy(unittest.TestCase):
             for key in ("PROXY_HOST", "PROXY_PORT", "PROXY_USERNAME", "PROXY_PASSWORD"):
                 os.environ.pop(key, None)
             get_settings.cache_clear()
+
+    def test_browser_close_stops_playwright_on_same_thread(self) -> None:
+        """Background close left the sync driver loop alive and blocked the direct fallback."""
+        import threading
+
+        class _Pw:
+            def __init__(self) -> None:
+                self.stopped_on: threading.Thread | None = None
+
+            def stop(self) -> None:
+                self.stopped_on = threading.current_thread()
+
+        class _Handle:
+            def close(self) -> None:
+                return None
+
+        session = BrowserSession("close-test")
+        pw = _Pw()
+        session._pw = pw
+        session._browser = _Handle()
+        session._context = _Handle()
+        session.page = object()
+        session.close()
+        self.assertIsNone(session._pw)
+        self.assertIsNone(session.page)
+        self.assertIs(pw.stopped_on, threading.current_thread())
 
 
 if __name__ == "__main__":

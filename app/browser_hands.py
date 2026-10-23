@@ -9,7 +9,6 @@ import re
 import socket
 import subprocess
 import sys
-import threading
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
@@ -360,24 +359,24 @@ class BrowserSession:
         self._context.route("**/*", self._gate)
 
     def close(self) -> None:
+        # Must stop Playwright on this same thread. A background close leaves its
+        # asyncio loop "running" here, so the next sync_playwright().start() dies with
+        # "Sync API inside the asyncio loop" — which is why the direct Cleartrip
+        # fallback after a proxy miss never opened.
         context, browser, pw = self._context, self._browser, self._pw
         self._context = self._browser = self._pw = None
         self.page = None
-
-        def _shutdown() -> None:
-            for obj in (context, browser):
-                try:
-                    if obj is not None:
-                        obj.close()
-                except Exception:
-                    pass
+        for obj in (context, browser):
             try:
-                if pw is not None:
-                    pw.stop()
+                if obj is not None:
+                    obj.close()
             except Exception:
                 pass
-
-        threading.Thread(target=_shutdown, name="guide-browser-close", daemon=True).start()
+        try:
+            if pw is not None:
+                pw.stop()
+        except Exception:
+            pass
 
     def _gate(self, route: object) -> None:
         url = route.request.url

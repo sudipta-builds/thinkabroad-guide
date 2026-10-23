@@ -187,6 +187,9 @@ def handle_turn(
             reply = "Chromium isn't installed on the server yet, so I can't open the booking page."
             db.add_message(phone, "assistant", reply)
             return Reply.of(reply, emoji="⚠️")
+        book_seller = _booking_seller_id(state, text)
+        state["seller"] = book_seller
+        state["preferred_seller"] = book_seller
         state["busy_at"] = f"{time.time():.3f}"
         _save(phone, state)
         threading.Thread(
@@ -195,7 +198,7 @@ def handle_turn(
             name="guide-browse",
             daemon=True,
         ).start()
-        reply = _booking_ack(state, kind)
+        reply = _booking_ack(state, kind, text)
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="✈️")
     if _should_browse(state, text, busy=busy, changed=changed) and _direct_results(state, text) and chromium_ready():
@@ -449,12 +452,25 @@ def _pay_link_reply(state: dict[str, Any]) -> str:
     return f"I haven't reached payment for {trip} yet. Say book and I'll take it there, then send the link."
 
 
-def _booking_ack(state: dict[str, Any], kind: str) -> str:
+def _booking_seller_id(state: dict[str, Any], text: str = "") -> str:
+    """Google fare times book on Cleartrip. A named site in this message wins; don't keep a failed Ixigo preference."""
+    from app.search import NOT_BOOKABLE
+
+    named = named_seller_from(text)
+    if named and named not in NOT_BOOKABLE:
+        return named
+    if _flight_hint(text):
+        return "cleartrip"
+    preferred = str(state.get("preferred_seller") or state.get("seller") or "cleartrip")
+    if preferred in NOT_BOOKABLE or preferred == "":
+        return "cleartrip"
+    return preferred
+
+
+def _booking_ack(state: dict[str, Any], kind: str, text: str = "") -> str:
     trip = _trip_line(state) or "Guwahati to Delhi"
-    hint = str(state.get("selected_hint") or "")
-    seller_id = str(state.get("preferred_seller") or state.get("seller") or "cleartrip")
-    if seller_id in {"google", "kayak", ""}:
-        seller_id = "cleartrip"
+    hint = str(state.get("selected_hint") or _flight_hint(text) or "")
+    seller_id = _booking_seller_id(state, text)
     seller = _seller_label(seller_id)
     if kind == "select" and hint:
         return (
@@ -1145,6 +1161,9 @@ def _publish_fares(
         saved["seller"] = seller["id"]
         if preferred and preferred not in NOT_BOOKABLE:
             saved["preferred_seller"] = preferred
+        elif seller["id"] in NOT_BOOKABLE:
+            # Google/Kayak fares book on Cleartrip next — don't keep a leftover Ixigo preference.
+            saved["preferred_seller"] = "cleartrip"
         if options:
             saved["options"] = [
                 {k: item[k] for k in ("airline", "flight", "depart", "arrive", "price") if k in item}
@@ -1194,12 +1213,7 @@ def _book_on_seller(
     origin = str(state.get("origin") or "Guwahati")
     destination = str(state.get("destination") or "Delhi")
     depart = str(state.get("depart") or "")
-    preferred = (
-        named_seller(text)
-        or str(state.get("seller") or "")
-        or str(state.get("preferred_seller") or "")
-        or "cleartrip"
-    )
+    preferred = _booking_seller_id(state, text)
     live = state.get("live") if isinstance(state.get("live"), dict) else {}
     live_url = _bookable_live_url(str((live or {}).get("url") or ""))
     kind = infer_intent(state, text)

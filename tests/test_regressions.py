@@ -33,6 +33,7 @@ from app.db import choose_db_path
 from app.intent import explicit_date, week_window
 from app.travel_agent import (
     _booking_page_reply,
+    _booking_seller_id,
     _cached_fares_reply,
     _browse_is_search,
     _coerce_kind,
@@ -491,6 +492,11 @@ class SellerChoiceAndProxy(unittest.TestCase):
         with_fares["stage"] = "results"
         self.assertEqual(_coerce_kind("EaseMyTrip", "chat", with_fares), "book")
         self.assertEqual(_coerce_kind("Ixigo", "book", with_fares), "book")
+        # A leftover Ixigo preference must not steal a bare "1:15" after Google fares.
+        with_fares["preferred_seller"] = "ixigo"
+        with_fares["seller"] = "ixigo"
+        self.assertEqual(_booking_seller_id(with_fares, "1:15"), "cleartrip")
+        self.assertEqual(_booking_seller_id(with_fares, "Ixigo"), "ixigo")
         stuck = dict(trip)
         stuck["preferred_seller"] = "cleartrip"
         self.assertIn("Google Flights", _search_ack(stuck, "4th Dec"))

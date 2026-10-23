@@ -517,6 +517,19 @@ class BrowserSession:
     def click_continue(self) -> str:
         """The fare sheet and the review page both use a Continue button at the bottom."""
         assert self.page is not None
+        # Cleartrip "Select your fare" needs a fare family chosen before Continue → itinerary.
+        try:
+            self.page.evaluate(
+                """() => {
+                    const radios = [...document.querySelectorAll('input[type="radio"]')];
+                    const unchecked = radios.find(r => !r.checked && r.offsetParent !== null);
+                    if (unchecked) { unchecked.click(); return; }
+                    if (radios.length && !radios.some(r => r.checked)) radios[0].click();
+                }"""
+            )
+            self.page.wait_for_timeout(400)
+        except Exception:
+            pass
         buttons = self.page.get_by_role("button", name=re.compile(r"^Continue$", re.I))
         if buttons.count() == 0:
             return "No Continue button on this page."

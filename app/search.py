@@ -375,6 +375,18 @@ def named_seller(text: str) -> str:
 NOT_BOOKABLE = {"google", "kayak"}
 
 
+_BOOKABLE_CYCLE = ("cleartrip", "easemytrip", "ixigo")
+
+
+def next_bookable_seller(current: str) -> str:
+    """The next site that can take a booking. Google and a failed Cleartrip move to EaseMyTrip."""
+    current = (current or "").lower()
+    if current not in _BOOKABLE_CYCLE:
+        return "easemytrip"
+    index = _BOOKABLE_CYCLE.index(current)
+    return _BOOKABLE_CYCLE[(index + 1) % len(_BOOKABLE_CYCLE)]
+
+
 def search_seller(preferred: str = "") -> dict[str, str]:
     """One page for fares. Google Flights unless the traveller named a bookable site."""
     preferred = (preferred or "").lower()

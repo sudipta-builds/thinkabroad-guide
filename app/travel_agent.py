@@ -131,6 +131,12 @@ def handle_turn(
     previous_stage = str(state.get("stage") or "")
     saved_secret = _capture_private(phone, text, state)
     kind = resolve_intent(text, state, prior)
+    if _wants_other_seller(text) and state.get("origin") and state.get("destination") and state.get("depart"):
+        from app.search import next_bookable_seller
+
+        state["preferred_seller"] = next_bookable_seller(str(state.get("seller") or state.get("preferred_seller") or ""))
+        state["seller"] = state["preferred_seller"]
+        kind = "book"
     _apply_stage(state, text, kind)
     _save(phone, state)
     if not get_settings().llm_ready:
@@ -177,7 +183,7 @@ def handle_turn(
         _save(phone, state)
         threading.Thread(
             target=_run_browse,
-            args=(phone, text, state.get("busy_at")),
+            args=(phone, text, state.get("busy_at"), kind),
             name="guide-browse",
             daemon=True,
         ).start()
@@ -189,7 +195,7 @@ def handle_turn(
         _save(phone, state)
         threading.Thread(
             target=_run_browse,
-            args=(phone, text, state.get("busy_at")),
+            args=(phone, text, state.get("busy_at"), "search"),
             name="guide-browse",
             daemon=True,
         ).start()
@@ -219,7 +225,7 @@ def handle_turn(
             _save(phone, state)
             threading.Thread(
                 target=_run_browse,
-                args=(phone, text, state.get("busy_at")),
+                args=(phone, text, state.get("busy_at"), "search"),
                 name="guide-browse",
                 daemon=True,
             ).start()
@@ -293,6 +299,8 @@ def infer_intent(state: dict[str, Any], text: str) -> str:
     updates = intent.parse_updates(raw)
     if updates.get("origin") and updates.get("destination"):
         return "search"
+    if _wants_other_seller(raw) and state.get("origin") and state.get("depart"):
+        return "book"
     if state.get("options") and re.search(r"\b(go ahead|book it|take it|do it)\b", raw, re.I):
         return "book"
     if re.search(r"\b(book|buy|reserve)\b", raw, re.I):
@@ -432,9 +440,13 @@ def _pay_link_reply(state: dict[str, Any]) -> str:
 def _booking_ack(state: dict[str, Any], kind: str) -> str:
     trip = _trip_line(state) or "Guwahati to Delhi"
     hint = str(state.get("selected_hint") or "")
+    seller_id = str(state.get("preferred_seller") or state.get("seller") or "cleartrip")
+    if seller_id in {"google", "kayak", ""}:
+        seller_id = "cleartrip"
+    seller = _seller_label(seller_id)
     if kind == "select" and hint:
         return (
-            f"Got the {hint} on {trip}. I'll open that fare and go through sign-in and the passenger form. "
+            f"Got the {hint} on {trip}. I'll open that fare on {seller} and go through sign-in and the passenger form. "
             "If the site needs your email, phone, or an OTP, I'll ask. I won't pay unless you tell me to."
         )
     if kind == "pay":
@@ -448,13 +460,30 @@ def _booking_ack(state: dict[str, Any], kind: str) -> str:
     if kind == "details":
         return f"Saved. I'll put that on the {trip} form and tell you if the page still needs something."
     return (
-        f"Booking {trip}. I'll go through login and the passenger form, ask if a phone, email, or OTP is missing, "
+        f"Booking {trip} on {seller}. I'll go through login and the passenger form, ask if a phone, email, or OTP is missing, "
         "and stop on payment with a link unless you want me to pay."
     )
 
 
 def _take_ephemeral(phone: str) -> dict[str, str]:
     return _EPHEMERAL.pop(phone, {})
+
+
+_OTHER_SELLER = re.compile(
+    r"\b(another|different|other|next)\s+(service|site|seller|provider)\b|\btry another\b",
+    re.I,
+)
+
+
+def _wants_other_seller(text: str) -> bool:
+    return bool(_OTHER_SELLER.search(text or ""))
+
+
+def _browse_is_search(kind: str, state: dict[str, Any], text: str) -> bool:
+    """The intent already chosen for this turn. Do not turn a booking into another Google search."""
+    if kind in _BOOKING:
+        return False
+    return _direct_results(state, text)
 
 
 def named_seller_from(text: str) -> str:
@@ -1150,7 +1179,7 @@ def _book_on_seller(
     seller_id = seller["id"]
     if _stale(phone, started_at):
         return
-    result = session.open_url(seller_results_url(seller_id, origin, destination, depart), goto_timeout=15000, airline_wait=8000)
+    result = session.open_url(seller_results_url(seller_id, origin, destination, depart), goto_timeout=45000, airline_wait=15000)
     if _stale(phone, started_at):
         return
     if page_blocked(result) or not fare_options(result):
@@ -1308,7 +1337,7 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     return f"I moved {trip} forward on {seller}. Nothing paid. The screenshot is the page I'm on."
 
 
-def _run_browse(phone: str, text: str, started_at: float | None = None) -> None:
+def _run_browse(phone: str, text: str, started_at: float | None = None, kind: str = "") -> None:
     secrets: list[str] = []
     acquired = False
     try:
@@ -1319,7 +1348,7 @@ def _run_browse(phone: str, text: str, started_at: float | None = None) -> None:
             return
         try:
             loaded = _load(phone)
-            direct = _direct_results(loaded, text)
+            direct = _browse_is_search(kind, loaded, text)
             settings = get_settings()
             # Booking uses the residential proxy in production. Search stays direct unless PROXY_SEARCH=1.
             use_proxy = bool(settings.proxy_ready and (not direct or settings.proxy_search))
@@ -1336,7 +1365,13 @@ def _run_browse(phone: str, text: str, started_at: float | None = None) -> None:
             _LOCK.release()
     except Exception:
         logger.exception("Live browse failed")
-        _deliver(phone, "The live browser hit an error before the booking page opened.", None, secrets)
+        seller = _seller_label(str(_load(phone).get("preferred_seller") or _load(phone).get("seller") or "cleartrip"))
+        _deliver(
+            phone,
+            f"{seller} didn't open the booking page. Nothing paid. Say another site and I'll try that one.",
+            None,
+            secrets,
+        )
     finally:
         if acquired:
             _clear_busy(phone, started_at)

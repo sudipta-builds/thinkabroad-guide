@@ -38,15 +38,18 @@ REFUSE_PAY = "Refused. That button would take payment. Leave it unclicked and te
 REFUSE_CARD = "Refused. Card numbers, CVV, and OTP are not typed or saved."
 
 
-def _launch_browser(playwright: object, *, headed: bool) -> object:
-    """Visible Chrome can finish a Cleartrip itinerary. Headless Chromium is the fallback."""
+def _launch_browser(playwright: object, *, headed: bool, proxy: dict[str, str] | None = None) -> object:
+    """Headless Chromium. A proxy is set on launch so authenticated residential exits work."""
     chrome_args = ["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage"]
-    if headed:
+    if headed and not proxy:
         try:
             return playwright.chromium.launch(channel="chrome", headless=False, args=chrome_args, timeout=20000)
         except Exception:
             logger.warning("Headed Chrome did not start; using headless Chromium")
-    return playwright.chromium.launch(headless=True, args=_LAUNCH_ARGS, timeout=20000)
+    kwargs: dict[str, object] = {"headless": True, "args": _LAUNCH_ARGS, "timeout": 30000}
+    if proxy:
+        kwargs["proxy"] = proxy
+    return playwright.chromium.launch(**kwargs)
 
 
 def chromium_ready() -> bool:
@@ -292,18 +295,16 @@ class BrowserSession:
             kwargs["proxy"] = proxy
             logger.info("Chromium using residential proxy host=%s", proxy.get("server"))
         if self.fresh:
-            # Headed Chrome on a local machine can finish a checkout. On Render, book via proxy + headless.
+            # Proxy is attached at launch. A second proxy on the context breaks the tunnel.
             headed = self.headed and not proxy
-            self._browser = _launch_browser(playwright, headed=headed)
-            context_args: dict[str, object] = {"viewport": kwargs["viewport"]}
+            self._browser = _launch_browser(playwright, headed=headed, proxy=proxy)
+            context_args: dict[str, object] = {"viewport": kwargs["viewport"], "ignore_https_errors": bool(proxy)}
             if not headed:
                 context_args["user_agent"] = _UA
-            if proxy:
-                context_args["proxy"] = proxy
             self._context = self._browser.new_context(**context_args)
             self._context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             self.page = self._context.new_page()
-            self.page.set_default_timeout(15000)
+            self.page.set_default_timeout(45000 if proxy else 15000)
             self._context.route("**/*", self._gate)
             return
         try:
@@ -339,6 +340,12 @@ class BrowserSession:
         if url.startswith(("about:", "data:", "blob:")) or url_allowed(url, allow_local=self.allow_local):
             route.continue_()
             return
+        # The proxy resolves hosts this machine cannot. Aborting those kills the booking page.
+        if self.use_proxy:
+            host = (urlparse(url).hostname or "").lower()
+            if urlparse(url).scheme in {"http", "https"} and host not in {"localhost", "metadata.google.internal"} and not host.endswith(".local"):
+                route.continue_()
+                return
         route.abort()
 
     def open_url(self, url: str, *, goto_timeout: int = 12000, price_wait: int = 4000, airline_wait: int = 10000) -> str:
@@ -346,7 +353,13 @@ class BrowserSession:
         if not allowed:
             return "That address is not a public web page, so it was not opened."
         assert self.page is not None
-        self.page.goto(allowed, wait_until="domcontentloaded", timeout=goto_timeout)
+        try:
+            self.page.goto(allowed, wait_until="domcontentloaded", timeout=goto_timeout)
+        except Exception:
+            if not self.use_proxy:
+                raise
+            logger.warning("Proxied open failed once; retrying %s", allowed[:80])
+            self.page.goto(allowed, wait_until="domcontentloaded", timeout=goto_timeout)
         self._dismiss()
         flight_host = any(
             host in allowed

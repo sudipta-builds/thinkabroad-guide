@@ -14,6 +14,7 @@ from app.search import (
     flight_results_url,
     ixigo_results_url,
     named_seller,
+    next_bookable_seller,
     search_seller,
     seller_order,
     seller_results_url,
@@ -25,7 +26,9 @@ from app.intent import explicit_date, week_window
 from app.travel_agent import (
     _booking_page_reply,
     _cached_fares_reply,
+    _browse_is_search,
     _direct_results,
+    _wants_other_seller,
     _hold_live,
     _search_ack,
     _force_browse,
@@ -456,6 +459,16 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(search_seller("")["id"], "google")
         self.assertEqual(search_seller("ixigo")["id"], "ixigo")
         self.assertEqual(search_seller("google")["id"], "google")
+        self.assertEqual(next_bookable_seller("google"), "easemytrip")
+        self.assertEqual(next_bookable_seller("cleartrip"), "easemytrip")
+        self.assertEqual(next_bookable_seller("easemytrip"), "ixigo")
+
+    def test_another_service_stays_a_booking(self) -> None:
+        trip = {"origin": "Guwahati", "destination": "Delhi", "depart": "2026-12-04", "seller": "google", "stage": "results"}
+        self.assertTrue(_wants_other_seller("try another service"))
+        self.assertEqual(infer_intent(trip, "try another service"), "book")
+        self.assertFalse(_browse_is_search("book", trip, "try another service"))
+        self.assertTrue(_browse_is_search("search", trip, "4th dec"))
 
     def test_a_running_search_is_not_restarted(self) -> None:
         trip = {"origin": "Guwahati", "destination": "Delhi", "depart": "2026-12-04", "options": [{"depart": "12:30", "price": "9,472", "airline": "SpiceJet"}]}

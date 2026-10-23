@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.browser_hands import looks_like_card, payment_control, should_capture
+from app.browser_hands import _alt_clock, looks_like_card, payment_control, should_capture
 from app.search import (
     cleartrip_results_url,
     easemytrip_results_url,
@@ -469,6 +469,8 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(infer_intent(trip, "try another service"), "book")
         self.assertFalse(_browse_is_search("book", trip, "try another service"))
         self.assertTrue(_browse_is_search("search", trip, "4th dec"))
+        self.assertEqual(_alt_clock("1:15"), "13:15")
+        self.assertEqual(_alt_clock("13:15"), "1:15")
 
     def test_a_running_search_is_not_restarted(self) -> None:
         trip = {"origin": "Guwahati", "destination": "Delhi", "depart": "2026-12-04", "options": [{"depart": "12:30", "price": "9,472", "airline": "SpiceJet"}]}

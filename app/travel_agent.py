@@ -1154,7 +1154,7 @@ def _book_on_seller(
         "passenger",
         "payment",
     }:
-        page = session.open_url(live_url, goto_timeout=45000)
+        page = session.open_url(live_url, goto_timeout=18000, airline_wait=8000)
         if _stale(phone, started_at):
             return
         _note_live(phone, page)
@@ -1179,7 +1179,7 @@ def _book_on_seller(
     seller_id = seller["id"]
     if _stale(phone, started_at):
         return
-    result = session.open_url(seller_results_url(seller_id, origin, destination, depart), goto_timeout=45000, airline_wait=15000)
+    result = session.open_url(seller_results_url(seller_id, origin, destination, depart), goto_timeout=18000, airline_wait=8000)
     if _stale(phone, started_at):
         return
     if page_blocked(result) or not fare_options(result):
@@ -1216,12 +1216,13 @@ def _book_on_seller(
     if _stale(phone, started_at):
         return
     _note_live(phone, moved)
+    _fill_what_we_can(phone, session, secrets)
     if "Review your itinerary" in moved and not re.search(r"\bemail\b|mobile number|date of birth", moved, re.I):
         further = session.click_continue()
         if not _stale(phone, started_at):
             moved = further
             _note_live(phone, moved)
-    _fill_what_we_can(phone, session, secrets)
+            _fill_what_we_can(phone, session, secrets)
     page = session.read_page()
     _note_live(phone, page)
     _deliver(phone, _booking_page_reply(_load(phone), hint, page, session), session, secrets)

@@ -1438,6 +1438,58 @@ def _open_booking(phone: str, text: str, session: BrowserSession, secrets: list[
     return _book_on_seller(phone, text, session, secrets, started_at)
 
 
+def _run_booking_on_worker(
+    phone: str,
+    text: str,
+    started_at: float | None,
+    loaded: dict[str, Any],
+    secrets: list[str],
+) -> None:
+    """Render asks Hetzner to open Chromium; screenshots come back as base64."""
+    from app.remote_booking import materialize_screenshots, run_remote_booking
+    from app.reply import for_send, strip_leading_emoji
+    from app.twilio_wa import inbound_sid, send_reaction, send_whatsapp
+    from app.media_files import public_url_for
+
+    private = _take_ephemeral(phone)
+    try:
+        result = run_remote_booking(phone=phone, text=text, state=loaded, private=private)
+    except Exception:
+        logger.exception("Hetzner booking worker failed")
+        seller_id = str(loaded.get("seller") or loaded.get("preferred_seller") or "cleartrip")
+        if seller_id in {"google", "kayak", ""}:
+            seller_id = "cleartrip"
+        _deliver(
+            phone,
+            f"{_seller_label(seller_id)} booking worker didn't respond. Nothing paid. Try that time again in a minute.",
+            None,
+            secrets,
+        )
+        return
+    if _stale(phone, started_at):
+        return
+    patched = result.get("state") if isinstance(result.get("state"), dict) else None
+    if patched:
+        _save(phone, patched)
+    for item in result.get("replies") or []:
+        if not isinstance(item, dict):
+            continue
+        spoken = strip_leading_emoji(_clean(str(item.get("text") or ""), secrets))
+        urls: list[str] = []
+        for path in materialize_screenshots(list(item.get("screenshots_b64") or [])):
+            public = public_url_for(path)
+            if public:
+                urls.append(public)
+        if not spoken and not urls:
+            continue
+        emoji = "✈️"
+        sid = inbound_sid(phone)
+        reacted = bool(sid) and send_reaction(phone, sid, emoji)
+        outbound = for_send(Reply.of((spoken or "Opened the booking page.")[:4000], *urls[:3], emoji=emoji), reacted=reacted)
+        send_whatsapp(phone, outbound)
+        db.add_message(phone, "assistant", outbound.text[:2000])
+
+
 def _run_browse(phone: str, text: str, started_at: float | None = None, kind: str = "") -> None:
     secrets: list[str] = []
     acquired = False
@@ -1459,6 +1511,8 @@ def _run_browse(phone: str, text: str, started_at: float | None = None, kind: st
             headed = not direct and not use_proxy
             if direct:
                 _publish_fares(phone, text, secrets, started_at)
+            elif settings.booking_worker_ready:
+                _run_booking_on_worker(phone, text, started_at, loaded, secrets)
             else:
                 # Checkout stays on the residential proxy only. A datacenter fallback can show
                 # fares then die on Cleartrip itinerary/create — that is not Instinct-like.

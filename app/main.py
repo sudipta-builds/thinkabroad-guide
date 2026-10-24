@@ -67,6 +67,7 @@ def health() -> JSONResponse:
             "vault": settings.vault_ready,
             "chromium": chromium_ready(),
             "proxy": settings.proxy_ready,
+            "booking_worker": settings.booking_worker_ready,
             "memory": "persistent" if str(db_path).startswith("/var/data") else "ephemeral",
             "db": str(db_path),
         }

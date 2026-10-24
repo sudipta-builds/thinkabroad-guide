@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     proxy_password: str = Field(default="", validation_alias=AliasChoices("PROXY_PASSWORD"))
     proxy_search: bool = Field(default=False, validation_alias=AliasChoices("PROXY_SEARCH"))
 
+    # Hetzner (or other VPS) Chromium worker. When set, booking runs there, not on Render.
+    booking_worker_url: str = Field(default="", validation_alias=AliasChoices("BOOKING_WORKER_URL"))
+    booking_worker_token: str = Field(default="", validation_alias=AliasChoices("BOOKING_WORKER_TOKEN"))
+
     @property
     def twilio_ready(self) -> bool:
         return bool(self.twilio_account_sid and self.twilio_auth_token and self.twilio_whatsapp_from)
@@ -95,6 +99,10 @@ class Settings(BaseSettings):
     @property
     def vault_ready(self) -> bool:
         return bool(self.vault_secret_key) and len(self.vault_secret_key) >= 16
+
+    @property
+    def booking_worker_ready(self) -> bool:
+        return bool(self.booking_worker_url.strip() and self.booking_worker_token.strip())
 
 
 @lru_cache

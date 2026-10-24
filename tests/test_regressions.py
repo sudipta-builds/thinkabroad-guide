@@ -669,6 +669,22 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertTrue(_busy({"busy_at": f"{now - 200:.3f}"}))
         self.assertFalse(_busy({"busy_at": f"{now - 400:.3f}"}))
 
+    def test_booking_worker_settings(self) -> None:
+        get_settings.cache_clear()
+        os.environ["BOOKING_WORKER_URL"] = "http://127.0.0.1:8000"
+        os.environ["BOOKING_WORKER_TOKEN"] = "secret-token"
+        get_settings.cache_clear()
+        try:
+            settings = get_settings()
+            self.assertTrue(settings.booking_worker_ready)
+            from app.remote_booking import worker_configured
+
+            self.assertTrue(worker_configured())
+        finally:
+            os.environ.pop("BOOKING_WORKER_URL", None)
+            os.environ.pop("BOOKING_WORKER_TOKEN", None)
+            get_settings.cache_clear()
+
 
 if __name__ == "__main__":
     unittest.main()

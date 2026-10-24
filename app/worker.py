@@ -66,6 +66,7 @@ def health() -> JSONResponse:
             "version": __version__,
             "chromium": chromium_ready(),
             "proxy": settings.proxy_ready,
+            "force_proxy": str(__import__("os").environ.get("BOOKING_FORCE_PROXY") or "").strip() in {"1", "true", "yes"},
         }
     )
 
@@ -74,21 +75,25 @@ def health() -> JSONResponse:
 def book(payload: BookRequest, authorization: str | None = Header(default=None)) -> JSONResponse:
     _check_token(authorization)
     settings = get_settings()
-    if not settings.proxy_ready:
-        raise HTTPException(status_code=503, detail="proxy not configured on worker")
     if not chromium_ready():
         raise HTTPException(status_code=503, detail="chromium not ready")
 
-    # Local imports keep worker from needing WhatsApp when only smoke-testing health.
+    # Hetzner Germany can load Cleartrip fares direct after ~45s. DataImpulse often returns an
+    # empty shell — so the worker prefers direct unless BOOKING_FORCE_PROXY=1.
+    force_proxy = (getattr(settings, "booking_force_proxy", False) is True) or (
+        str(__import__("os").environ.get("BOOKING_FORCE_PROXY") or "").strip() in {"1", "true", "yes"}
+    )
+    use_proxy = bool(settings.proxy_ready and force_proxy)
+    logger.info("Worker booking use_proxy=%s force_proxy=%s", use_proxy, force_proxy)
+
     from app import db
-    from app.travel_agent import _deliver, _load, _save
+    from app.travel_agent import _load, _save
 
     phone = (payload.phone or "worker").strip() or "worker"
     text = payload.text or ""
     state = dict(payload.state or {})
     secrets: list[str] = []
 
-    # Seed in-memory/sqlite state on this box for the booking helpers.
     db.init_db()
     _save(phone, state)
 
@@ -106,7 +111,6 @@ def book(payload: BookRequest, authorization: str | None = Header(default=None))
             session.unsent.clear()
         replies.append({"text": spoken, "screenshots_b64": shots})
 
-    # Temporarily route delivers into the response payload.
     import app.travel_agent as travel
 
     original = travel._deliver
@@ -116,16 +120,17 @@ def book(payload: BookRequest, authorization: str | None = Header(default=None))
             raise HTTPException(status_code=409, detail="worker busy")
         try:
             loaded = _load(phone)
-            with BrowserSession(phone, fresh=True, headed=False, use_proxy=True) as session:
+            with BrowserSession(phone, fresh=True, headed=False, use_proxy=use_proxy) as session:
                 session.private = dict(payload.private or {})
                 missed = _book_on_seller(phone, text, session, secrets, None) or ""
             if missed == "proxy-miss":
                 seller_id = str(_load(phone).get("seller") or _load(phone).get("preferred_seller") or "cleartrip")
                 if seller_id in {"google", "kayak", ""}:
                     seller_id = "cleartrip"
+                label = "India proxy" if use_proxy else "booking browser"
                 capture_deliver(
                     phone,
-                    f"{_seller_label(seller_id)} didn't open a bookable fare on the India proxy. Nothing paid. "
+                    f"{_seller_label(seller_id)} didn't open a bookable fare on the {label}. Nothing paid. "
                     "Say that time again, or name EaseMyTrip or Ixigo.",
                     None,
                     secrets,
@@ -150,6 +155,7 @@ def book(payload: BookRequest, authorization: str | None = Header(default=None))
         {
             "ok": True,
             "missed": missed,
+            "use_proxy": use_proxy,
             "state": _load(phone),
             "replies": replies,
         }

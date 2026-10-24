@@ -40,15 +40,18 @@ playwright install --with-deps chromium
 ## 4. Create `/opt/thinkabroad-guide/.env` on the VPS
 
 ```env
-PROXY_HOST=gw.dataimpulse.com
-PROXY_PORT=10000
-PROXY_USERNAME=aebd377cf63720321420__cr.in;sessid.guide1;sessttl.30
-PROXY_PASSWORD=YOUR_DATAIMPULSE_PASSWORD
 BOOKING_WORKER_TOKEN=pick-a-long-random-secret
 LOG_LEVEL=INFO
+# Leave proxy off for now — Hetzner loads Cleartrip fares direct after ~45s.
+# DataImpulse often returns an empty Cleartrip shell from this host.
+# BOOKING_FORCE_PROXY=1
+# PROXY_HOST=gw.dataimpulse.com
+# PROXY_PORT=10000
+# PROXY_USERNAME=LOGIN__cr.in;sessid.guide1;sessttl.30
+# PROXY_PASSWORD=
 ```
 
-Use the **same** DataImpulse password as Render. Pick any long random `BOOKING_WORKER_TOKEN` and save it — you will paste the same value into Render.
+Pick any long random `BOOKING_WORKER_TOKEN` and save it — you will paste the same value into Render.
 
 ## 5. Smoke-test Cleartrip on the VPS
 

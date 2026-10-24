@@ -437,11 +437,21 @@ class BrowserSession:
         if flight_host:
             try:
                 self.page.wait_for_selector(
-                    "text=/SpiceJet|IndiGo|Air India|Akasa Air|No flights|couldn.?t find|sold out/i",
+                    "text=/SpiceJet|IndiGo|Air India|Akasa Air|No flights|couldn.?t find|sold out|₹|Rs\\.?\\s*\\d/i",
                     timeout=airline_wait,
                 )
             except Exception:
-                self.page.wait_for_timeout(800)
+                self.page.wait_for_timeout(2000)
+            # Cleartrip paints chrome first; Book buttons often land ~30–45s later.
+            if "cleartrip.com" in allowed:
+                try:
+                    self.page.wait_for_function(
+                        """() => [...document.querySelectorAll('button,a,[role=button]')]
+                            .some(b => /^book$/i.test((b.innerText || '').trim()))""",
+                        timeout=max(airline_wait, 45000),
+                    )
+                except Exception:
+                    self.page.wait_for_timeout(2000)
         else:
             try:
                 self.page.wait_for_selector("text=/₹|Rs\\.?\\s*\\d|INR\\s*\\d|\\$\\s*\\d/", timeout=price_wait)

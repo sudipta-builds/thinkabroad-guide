@@ -23,7 +23,18 @@ def main() -> int:
     print("proxy server:", settings.playwright_proxy()["server"] if settings.playwright_proxy() else None)
     print("opening:", url)
     with BrowserSession("smoke", fresh=True, headed=False, use_proxy=True) as session:
-        page = session.open_url(url, goto_timeout=60000, airline_wait=25000)
+        # Cleartrip often paints the shell first; Book buttons land ~30–45s later.
+        page = session.open_url(url, goto_timeout=60000, airline_wait=45000)
+        if session.page is not None:
+            try:
+                session.page.wait_for_function(
+                    """() => [...document.querySelectorAll('button,a,[role=button]')]
+                        .some(b => /^book$/i.test((b.innerText || '').trim()))""",
+                    timeout=60000,
+                )
+            except Exception:
+                session.page.wait_for_timeout(5000)
+            page = session.read_page()
         live = str(session.page.url if session.page else "")
         print("final url:", live)
         print("page sample:", (page or "")[:500].replace("\n", " | "))

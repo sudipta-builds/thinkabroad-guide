@@ -1223,8 +1223,9 @@ def _book_on_seller(
     if named and named not in {"google", "kayak"}:
         live_url = ""
 
-    goto_ms = 45000 if session.use_proxy else 18000
-    airline_ms = 15000 if session.use_proxy else 8000
+    # Cleartrip paints Book buttons ~30–45s after the shell; proxy needs even longer.
+    goto_ms = 60000 if session.use_proxy else 45000
+    airline_ms = 45000 if session.use_proxy else 45000
 
     # Resume on the open checkout when the traveller just sent details or payment.
     if live_url and kind in {"details", "login", "pay", "book"} and state.get("stage") in {

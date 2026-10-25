@@ -11,6 +11,7 @@ from app.browser_hands import (
     BrowserSession,
     _alt_clock,
     _clock_needles,
+    time_in_card,
     known_flight_host,
     looks_like_card,
     payment_control,
@@ -508,6 +509,10 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(_alt_clock("13:15"), "1:15")
         self.assertIn("01:15", _clock_needles("1:15"))
         self.assertIn("13:15", _clock_needles("1:15"))
+        self.assertTrue(time_in_card("Air India Express 1:15 Book ₹9,365", "1:15"))
+        self.assertTrue(time_in_card("dep 13:15 Book", "1:15"))
+        self.assertFalse(time_in_card("SpiceJet 11:15 Book ₹8,190", "1:15"))
+        self.assertFalse(time_in_card("IndiGo 9:10 Book ₹8,063", "1:15"))
         self.assertEqual(_bookable_live_url("https://www.google.com/travel/flights?q=ghy"), "")
         self.assertTrue(_bookable_live_url("https://www.cleartrip.com/flights/results?from=GAU").startswith("https://www.cleartrip.com"))
         self.assertTrue(known_flight_host("www.cleartrip.com"))

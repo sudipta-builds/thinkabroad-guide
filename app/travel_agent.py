@@ -1302,6 +1302,16 @@ def _book_on_seller(
             secrets,
         )
         return ""
+    from app.browser_hands import time_in_card
+
+    if hint and not time_in_card(sheet, hint):
+        _deliver(
+            phone,
+            f"I did not click {hint}. The fare sheet on screen is a different flight, so I stopped before Continue. Nothing paid.",
+            session,
+            secrets,
+        )
+        return ""
     _note_live(phone, sheet)
     # Don't abort on a flash Connection lost here — click_continue → settle_checkout waits / retries.
     moved = session.click_continue()

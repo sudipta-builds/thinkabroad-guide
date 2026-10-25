@@ -67,6 +67,14 @@ def _clock_needles(hint: str) -> list[str]:
     return [item for item in needles if item]
 
 
+def time_in_card(text: str, hint: str) -> bool:
+    """True only when the card itself shows that clock. 1:15 must not match 11:15."""
+    for needle in _clock_needles(hint):
+        if re.search(rf"(^|[^0-9]){re.escape(needle)}([^0-9]|$)", text or ""):
+            return True
+    return False
+
+
 def _launch_browser(playwright: object, *, headed: bool, proxy: dict[str, str] | None = None) -> object:
     """Headless Chromium. A proxy is set on launch so authenticated residential exits work."""
     chrome_args = ["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage"]
@@ -515,7 +523,7 @@ class BrowserSession:
         assert self.page is not None
         self._lift_overlay()
         needles = _clock_needles(hint)
-        deadline = 90 if self.use_proxy else 20
+        deadline = 90 if self.use_proxy else 60
         started = time.monotonic()
         found = ""
         while time.monotonic() - started < deadline:
@@ -525,19 +533,27 @@ class BrowserSession:
                     const controls = [...document.querySelectorAll('button, a, [role="button"]')].filter(
                         b => /^book$/i.test(norm(b.innerText || b.textContent || ''))
                     );
-                    const blobOf = (el) => {
+                    const cardText = (el) => {
                         let node = el;
-                        let blob = '';
-                        for (let i = 0; i < 10 && node; i += 1) {
-                            blob += '\\n' + (node.innerText || '');
+                        let best = '';
+                        for (let i = 0; i < 8 && node; i += 1) {
+                            const text = (node.innerText || '').replace(/\\s+/g, ' ');
+                            const bookCount = (text.match(/\\bBook\\b/gi) || []).length;
+                            if (bookCount > 1) break;
+                            best = text;
                             node = node.parentElement;
                         }
-                        return blob;
+                        return best;
+                    };
+                    const hasTime = (text, needle) => {
+                        if (!needle) return false;
+                        const escaped = needle.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+                        return new RegExp('(^|[^0-9])' + escaped + '([^0-9]|$)').test(text);
                     };
                     const btn = controls.find(b => {
-                        if (!needles.length) return true;
-                        const blob = blobOf(b);
-                        return needles.some(n => n && blob.includes(n));
+                        if (!needles.length) return false;
+                        const blob = cardText(b);
+                        return needles.some(n => hasTime(blob, n));
                     });
                     if (!btn) return '';
                     btn.click();
@@ -547,7 +563,11 @@ class BrowserSession:
             )
             if found:
                 break
-            self.page.wait_for_timeout(2000)
+            try:
+                self.page.mouse.wheel(0, 1200)
+            except Exception:
+                pass
+            self.page.wait_for_timeout(1500)
         if not found:
             return f"Could not find a Book button for {hint or 'the first fare'}."
         try:

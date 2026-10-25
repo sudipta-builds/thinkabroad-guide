@@ -76,13 +76,14 @@ def time_in_card(text: str, hint: str) -> bool:
 
 
 def _launch_browser(playwright: object, *, headed: bool, proxy: dict[str, str] | None = None) -> object:
-    """Headless Chromium. A proxy is set on launch so authenticated residential exits work."""
-    chrome_args = ["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage"]
+    """Real Chrome when headed (Hetzner xvfb). Proxy stays headless Chromium."""
+    chrome_args = ["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu"]
     if headed and not proxy:
         try:
             return playwright.chromium.launch(channel="chrome", headless=False, args=chrome_args, timeout=20000)
         except Exception:
-            logger.warning("Headed Chrome did not start; using headless Chromium")
+            logger.warning("Google Chrome missing; opening headed Chromium")
+            return playwright.chromium.launch(headless=False, args=chrome_args, timeout=20000)
     kwargs: dict[str, object] = {"headless": True, "args": _LAUNCH_ARGS, "timeout": 15000}
     if proxy:
         kwargs["proxy"] = proxy
@@ -357,9 +358,13 @@ class BrowserSession:
             # Proxy is attached at launch. A second proxy on the context breaks the tunnel.
             headed = self.headed and not proxy
             self._browser = _launch_browser(playwright, headed=headed, proxy=proxy)
-            context_args: dict[str, object] = {"viewport": kwargs["viewport"], "ignore_https_errors": bool(proxy)}
-            if not headed:
-                context_args["user_agent"] = _UA
+            context_args: dict[str, object] = {
+                "viewport": kwargs["viewport"],
+                "ignore_https_errors": bool(proxy),
+                "locale": "en-IN",
+                "timezone_id": "Asia/Kolkata",
+            }
+            context_args["user_agent"] = _UA
             self._context = self._browser.new_context(**context_args)
             self._context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             self.page = self._context.new_page()
@@ -579,20 +584,28 @@ class BrowserSession:
     def click_continue(self) -> str:
         """The fare sheet and the review page both use a Continue button at the bottom."""
         assert self.page is not None
-        # Cleartrip "Select your fare" needs a fare family chosen before Continue → itinerary.
+        # Pick the visible fare inside the popup, then that popup's Continue.
         try:
             self.page.evaluate(
                 """() => {
-                    const radios = [...document.querySelectorAll('input[type="radio"]')];
-                    const unchecked = radios.find(r => !r.checked && r.offsetParent !== null);
-                    if (unchecked) { unchecked.click(); return; }
-                    if (radios.length && !radios.some(r => r.checked)) radios[0].click();
+                    const root = document.querySelector('[role="dialog"]') || document.body;
+                    const fare = [...root.querySelectorAll('label, div, button')].find(el => {
+                        const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                        return text.length > 0 && text.length < 120 && /₹|Rs\\.?/.test(text);
+                    });
+                    if (fare) fare.click();
+                    const radios = [...root.querySelectorAll('input[type="radio"]')];
+                    const pick = radios.find(r => !r.checked) || radios[0];
+                    if (pick) pick.click();
                 }"""
             )
-            self.page.wait_for_timeout(400)
+            self.page.wait_for_timeout(600)
         except Exception:
             pass
-        buttons = self.page.get_by_role("button", name=re.compile(r"^Continue$", re.I))
+        dialog = self.page.locator("[role=dialog]")
+        buttons = dialog.get_by_role("button", name=re.compile(r"^Continue$", re.I)) if dialog.count() else None
+        if buttons is None or buttons.count() == 0:
+            buttons = self.page.get_by_role("button", name=re.compile(r"^Continue$", re.I))
         if buttons.count() == 0:
             return "No Continue button on this page."
         target = buttons.nth(buttons.count() - 1)
@@ -619,14 +632,14 @@ class BrowserSession:
         """After Continue, wait for contact/pay. Cleartrip can take ~4 minutes on residential."""
         assert self.page is not None
         if deadline_ms is None:
-            deadline_ms = 240_000 if self.use_proxy else 20_000
+            deadline_ms = 180_000
         ready = re.compile(
             r"pay to complete|pay now|\bupi\b|card number|mobile number|date of birth|"
             r"add contact|traveller|passenger|review your itinerary|net banking",
             re.I,
         )
         lost = re.compile(r"connection lost|been disconnected|itinerary/failure|server error", re.I)
-        retried = False
+        retries = 0
         started = time.monotonic()
         while (time.monotonic() - started) * 1000 < deadline_ms:
             if self._context is not None and self._context.pages:
@@ -634,9 +647,9 @@ class BrowserSession:
             blob = self._observe(shoot=False)
             if ready.search(blob) and not lost.search(blob):
                 return self._observe(shoot=True)
-            if lost.search(blob) and not retried:
-                retried = True
-                logger.info("Cleartrip connection lost; clicking Try again once")
+            if lost.search(blob) and retries < 2:
+                retries += 1
+                logger.info("Cleartrip connection lost; clicking Try again (%s)", retries)
                 try:
                     self.page.get_by_role("button", name=re.compile(r"try again", re.I)).first.click(timeout=4000)
                 except Exception:
@@ -651,7 +664,7 @@ class BrowserSession:
                         )
                     except Exception:
                         pass
-                self.page.wait_for_timeout(5000)
+                self.page.wait_for_timeout(8000)
                 continue
             self.page.wait_for_timeout(3000)
         return self._observe(shoot=True)

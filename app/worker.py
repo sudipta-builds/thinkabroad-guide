@@ -120,7 +120,7 @@ def book(payload: BookRequest, authorization: str | None = Header(default=None))
             raise HTTPException(status_code=409, detail="worker busy")
         try:
             loaded = _load(phone)
-            with BrowserSession(phone, fresh=True, headed=False, use_proxy=use_proxy) as session:
+            with BrowserSession(phone, fresh=True, headed=not use_proxy, use_proxy=use_proxy) as session:
                 session.private = dict(payload.private or {})
                 missed = _book_on_seller(phone, text, session, secrets, None) or ""
             if missed == "proxy-miss":

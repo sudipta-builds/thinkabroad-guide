@@ -7,7 +7,7 @@ Type=simple
 User=root
 WorkingDirectory=/opt/thinkabroad-guide
 EnvironmentFile=/opt/thinkabroad-guide/.env
-ExecStart=/opt/thinkabroad-guide/.venv/bin/uvicorn app.worker:app --host 0.0.0.0 --port 8000
+ExecStart=/usr/bin/xvfb-run -a /opt/thinkabroad-guide/.venv/bin/uvicorn app.worker:app --host 0.0.0.0 --port 8000
 Restart=always
 RestartSec=3
 

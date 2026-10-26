@@ -34,6 +34,11 @@ def should_resume_kernel_otp(state: dict[str, Any], text: str) -> bool:
     return bool(re.fullmatch(r"\d{4,8}", (text or "").strip()))
 
 
+def keep_kernel_otp_session(status: str) -> bool:
+    """The login page is still waiting, so the same Kernel browser should stay up."""
+    return status in {"bad_code", "still_otp"}
+
+
 def otp_accepted(seller: str, code: str) -> bool:
     digits = re.sub(r"\D", "", code or "")
     if seller == "cleartrip":
@@ -146,22 +151,39 @@ def _find(page, kind: str, seller: str):
           }
           if (kind === 'otp') {
             const inputs = [...document.querySelectorAll('input')].filter(vis);
-            let boxes = [];
-            if (seller === 'cleartrip') {
-              boxes = inputs.filter(i => {
-                const r = i.getBoundingClientRect();
-                return r.width > 40 && r.width < 70 && r.height > 40 && r.height < 70;
-              });
-            } else {
-              boxes = inputs.filter(i => i.getAttribute('maxlength') === '1' || /otp|one-time|numeric/i.test((i.getAttribute('inputmode')||'')+(i.autocomplete||'')+(i.name||'')+(i.id||'')));
+            let boxes = inputs.filter(i => {
+              const r = i.getBoundingClientRect();
+              const ml = i.getAttribute('maxlength');
+              const small = r.width >= 16 && r.width < 80 && r.height >= 16 && r.height < 80;
+              if (seller === 'cleartrip') return r.width > 40 && r.width < 70 && r.height > 40 && r.height < 70;
+              return small && (ml === '1' || /otp|one-time|numeric/i.test((i.getAttribute('inputmode')||'')+(i.autocomplete||'')+(i.name||'')+(i.id||'')));
+            });
+            boxes.sort((a,b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x || a.getBoundingClientRect().y - b.getBoundingClientRect().y);
+            const row = [];
+            for (const el of boxes) {
+              const r = el.getBoundingClientRect();
+              const prev = row.length ? row[row.length - 1].getBoundingClientRect() : null;
+              if (prev && (Math.abs(r.y - prev.y) > 24 || r.x - prev.x > 90)) {
+                if (row.length >= (seller === 'cleartrip' ? 4 : 6)) break;
+                row.length = 0;
+              }
+              row.push(el);
+              if (row.length === (seller === 'cleartrip' ? 4 : 6)) break;
             }
-            boxes.sort((a,b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x);
-            return boxes.length ? boxes.map(box) : null;
+            const picked = row.length ? row : boxes.slice(0, seller === 'cleartrip' ? 4 : 6);
+            return picked.length ? picked.map(el => {
+              const b = box(el);
+              b.v = (el.value || '').slice(0, 4);
+              return b;
+            }) : null;
           }
           if (kind === 'verify') {
-            const hits = [...document.querySelectorAll('button,[role=button]')].filter(vis).filter(b => /^verify$/i.test(text(b)));
+            const hits = [...document.querySelectorAll('button,[role=button],div,span,a')].filter(vis).filter(b => /^verify$/i.test(text(b)));
             if (!hits.length) return null;
-            hits.sort((a,b) => b.getBoundingClientRect().x - a.getBoundingClientRect().x);
+            hits.sort((a,b) => {
+              const ar = a.getBoundingClientRect(), br = b.getBoundingClientRect();
+              return (ar.width * ar.height) - (br.width * br.height);
+            });
             return box(hits[0]);
           }
           return null;
@@ -323,6 +345,48 @@ def begin_login(
         return {"status": "error", "detail": type(exc).__name__}
 
 
+def _shot(page, seller: str, session_id: str, tag: str) -> str:
+    try:
+        from app.media_files import ensure_media_dir
+
+        dest = ensure_media_dir() / f"{tag}-{seller}-{session_id[:8]}.jpg"
+        page.screenshot(path=str(dest), type="jpeg", quality=55)
+        return str(dest)
+    except Exception:
+        return ""
+
+
+def _otp_page(context, seller: str):
+    pages = list(context.pages or [])
+    for page in reversed(pages):
+        try:
+            if _otp_visible(page, seller) or _find(page, "otp", seller):
+                return page
+        except Exception:
+            continue
+    if pages:
+        return pages[-1]
+    return context.new_page()
+
+
+def _type_otp(client, session_id: str, page, seller: str, digits: str) -> None:
+    boxes = _find(page, "otp", seller) or []
+    if not boxes:
+        return
+    for i, ch in enumerate(digits):
+        if i >= len(boxes):
+            break
+        _click(client, session_id, page, boxes[i])
+        page.wait_for_timeout(150)
+        client.browsers.computer.type_text(session_id, text=ch, delay=40)
+    page.wait_for_timeout(400)
+    filled_boxes = _find(page, "otp", seller) or []
+    if boxes and filled_boxes and not any(str(box.get("v") or "") for box in filled_boxes):
+        _click(client, session_id, page, boxes[0])
+        page.wait_for_timeout(200)
+        client.browsers.computer.type_text(session_id, text=digits, delay=80)
+
+
 def submit_otp(*, session_id: str, seller: str, code: str) -> dict[str, str]:
     """Type a chat OTP into the still-open Kernel browser and check the real session."""
     digits = re.sub(r"\D", "", code or "")
@@ -340,40 +404,67 @@ def submit_otp(*, session_id: str, seller: str, code: str) -> dict[str, str]:
         with sync_playwright() as p:
             pw = p.chromium.connect_over_cdp(browser.cdp_ws_url)
             context = pw.contexts[0] if pw.contexts else pw.new_context()
-            page = context.pages[0] if context.pages else context.new_page()
+            page = _otp_page(context, seller)
             boxes = _find(page, "otp", seller) or []
             if not boxes:
+                shot = _shot(page, seller, session_id, "otp-miss")
                 try:
                     pw.close()
                 except Exception:
                     pass
-                return {"status": "boxes_miss", "detail": "OTP boxes were not on screen. Say book again if you want a new code."}
-            for i, ch in enumerate(digits):
-                if i >= len(boxes):
-                    break
-                _click(client, session_id, page, boxes[i])
-                page.wait_for_timeout(120)
-                client.browsers.computer.type_text(session_id, text=ch, delay=30)
-            page.wait_for_timeout(400)
+                _drop(client, session_id)
+                return {
+                    "status": "boxes_miss",
+                    "detail": "OTP boxes were not on screen. Say the trip again if you want a new code.",
+                    "screenshot": shot,
+                }
+            _type_otp(client, session_id, page, seller, digits)
             if seller == "ixigo":
                 verify = _find(page, "verify", seller)
                 if verify:
                     _click(client, session_id, page, verify)
-            page.wait_for_timeout(3500)
-            if seller == "ixigo":
+            logged = False
+            still = False
+            for _ in range(16):
+                page.wait_for_timeout(700)
+                try:
+                    if page.is_closed():
+                        page = _latest(page)
+                except Exception:
+                    page = _latest(page)
+                if _logged_in(page, seller):
+                    logged = True
+                    break
+                if _otp_visible(page, seller):
+                    still = True
+                    continue
+                still = False
+            if seller == "ixigo" and not logged and not still:
                 try:
                     page.goto("https://www.ixigo.com/", wait_until="domcontentloaded", timeout=60000)
-                    page.wait_for_timeout(2500)
+                    page.wait_for_timeout(3000)
                 except Exception:
                     pass
-            logged = _logged_in(page, seller)
+                logged = _logged_in(page, seller)
+            shot = _shot(page, seller, session_id, "otp-after")
             try:
                 pw.close()
             except Exception:
                 pass
-        _drop(client, session_id)
         if logged:
-            return {"status": "logged_in", "seller": seller}
-        return {"status": "no_session", "detail": "The code was typed, but the site did not show a logged-in account."}
+            _drop(client, session_id)
+            return {"status": "logged_in", "seller": seller, "screenshot": shot}
+        if still:
+            return {
+                "status": "still_otp",
+                "detail": "The code screen is still open. Reply with the same digits again.",
+                "screenshot": shot,
+            }
+        _drop(client, session_id)
+        return {
+            "status": "no_session",
+            "detail": "The code was typed, but the site did not show a logged-in account.",
+            "screenshot": shot,
+        }
     except Exception as exc:
         return {"status": "error", "detail": type(exc).__name__}

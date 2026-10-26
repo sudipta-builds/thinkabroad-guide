@@ -1585,7 +1585,7 @@ def _run_kernel_login(phone: str, text: str, loaded: dict[str, Any], secrets: li
 
 
 def _run_kernel_otp_submit(phone: str, code: str, started_at: float | None) -> None:
-    from app.kernel_otp import submit_otp
+    from app.kernel_otp import keep_kernel_otp_session, submit_otp
 
     state = _load(phone)
     seller = str(state.get("kernel_seller") or "ixigo")
@@ -1593,13 +1593,14 @@ def _run_kernel_otp_submit(phone: str, code: str, started_at: float | None) -> N
     result = submit_otp(session_id=session_id, seller=seller, code=code)
     state = _load(phone)
     status = str(result.get("status") or "")
+    shots = [result["screenshot"]] if result.get("screenshot") else None
     if status == "logged_in":
         state["kernel_awaiting_otp"] = False
         state.pop("kernel_session_id", None)
         state["kernel_logged_in"] = seller
         state["stage"] = "booking"
         spoken = f"You're logged in on {_seller_label(seller)}. Nothing paid."
-    elif status == "bad_code":
+    elif keep_kernel_otp_session(status):
         state["kernel_awaiting_otp"] = True
         state["kernel_session_id"] = session_id
         spoken = str(result.get("detail") or "Reply with the code only.")
@@ -1608,7 +1609,7 @@ def _run_kernel_otp_submit(phone: str, code: str, started_at: float | None) -> N
         state.pop("kernel_session_id", None)
         spoken = str(result.get("detail") or "Login didn't finish. Nothing paid.")
     _save(phone, state)
-    _deliver(phone, spoken, None, [code])
+    _deliver(phone, spoken, None, [code], shot_paths=shots)
     _clear_busy(phone, started_at)
 
 

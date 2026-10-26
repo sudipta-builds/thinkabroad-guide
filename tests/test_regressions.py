@@ -863,13 +863,18 @@ class SellerChoiceAndProxy(unittest.TestCase):
             keep_kernel_otp_session,
             otp_accepted,
             otp_failure_detail,
+            resume_kernel_otp,
             should_resume_kernel_otp,
             verify_fallback,
         )
 
-        self.assertIn("in the boxes", otp_failure_detail(boxes_open=True))
+        self.assertIn("missed the boxes", otp_failure_detail(boxes_open=True, filled=False))
+        self.assertIn("in the boxes", otp_failure_detail(boxes_open=True, filled=True))
         self.assertIn("Log in", otp_failure_detail(boxes_open=False))
         self.assertIn("checking", otp_failure_detail(boxes_open=False, verifying=True))
+        waiting_live = {"kernel_awaiting_otp": True, "kernel_session_id": "sess", "kernel_seller": "ixigo"}
+        self.assertEqual(resume_kernel_otp(waiting_live, "1234"), "need_digits")
+        self.assertEqual(resume_kernel_otp(waiting_live, "123456"), "closed")
 
         self.assertTrue(ixigo_verify_in_progress("Please wait while we verify your details."))
         self.assertFalse(ixigo_verify_in_progress("Verify Your Mobile Number Enter the OTP"))

@@ -106,12 +106,26 @@ def viewport_click(metrics: dict[str, float], box: dict[str, Any]) -> tuple[int,
     )
 
 
-def otp_failure_detail(*, boxes_open: bool, verifying: bool = False) -> str:
+def otp_failure_detail(*, boxes_open: bool, verifying: bool = False, filled: bool = False) -> str:
+    if boxes_open and not filled:
+        return "The click missed the boxes. Say Ixigo again for a new code."
     if boxes_open:
         return "The code is in the boxes, but Verify did not submit. Say Ixigo again for a new code."
     if verifying:
         return "Ixigo is still checking that code. The account did not appear."
     return "The code screen closed, but Ixigo still shows Log in. Say Ixigo again for a new code."
+
+
+def resume_kernel_otp(state: dict[str, Any], text: str) -> str:
+    """What WhatsApp should do with a code. Never opens a second browser connection."""
+    if not should_resume_kernel_otp(state, text):
+        return ""
+    seller = str(state.get("kernel_seller") or "ixigo")
+    if seller in KERNEL_SELLERS and not otp_accepted(seller, text):
+        return "need_digits"
+    if handoff_whatsapp_otp(state, text):
+        return "type"
+    return "closed"
 
 
 def keep_kernel_otp_session(status: str) -> bool:
@@ -546,12 +560,12 @@ def begin_login(
                     outcome["session_id"] = sid
                     outcome["seller"] = seller
             elif ok:
-                _start_hold(sid, browser.cdp_ws_url)
-                try:
-                    pw.close()
-                except Exception:
-                    pass
-                outcome = {"status": "otp_sent", "session_id": sid, "seller": seller, "screenshot": shot}
+                outcome = {
+                    "status": "error",
+                    "detail": "Login keeps one browser connection, and this call did not.",
+                    "session_id": sid,
+                    "seller": seller,
+                }
         if outcome is None:
             _drop(client, sid)
             return {"status": "otp_ui_miss", "detail": "OTP screen did not open. Nothing was charged."}
@@ -588,16 +602,21 @@ def _otp_page(context, seller: str):
     return context.new_page()
 
 
-def _press_verify(client, session_id: str, page, boxes: list[dict[str, Any]]) -> bool:
-    """One OS mouse click on Verify — same path as the working Kernel PoC."""
-    hit = _find(page, "verify", "ixigo") or verify_fallback(boxes)
+def _press_verify(client, session_id: str, page) -> bool:
+    """One OS click on the Verify button. No guessed coordinate."""
+    hit = _find(page, "verify", "ixigo")
     if not hit:
         return False
     _click(client, session_id, page, hit)
     return True
 
 
+def _box_digits(boxes: list[dict[str, Any]]) -> str:
+    return "".join(str(box.get("v") or "") for box in boxes)
+
+
 def _type_otp(client, session_id: str, page, seller: str, digits: str) -> None:
+    """One Kernel click and one character per box. Same as the local login."""
     boxes = _find(page, "otp", seller) or []
     if not boxes:
         return
@@ -605,14 +624,8 @@ def _type_otp(client, session_id: str, page, seller: str, digits: str) -> None:
         if i >= len(boxes):
             break
         _click(client, session_id, page, boxes[i])
-        page.wait_for_timeout(150)
-        client.browsers.computer.type_text(session_id, text=ch, delay=40)
-    page.wait_for_timeout(400)
-    filled_boxes = _find(page, "otp", seller) or []
-    if boxes and filled_boxes and not any(str(box.get("v") or "") for box in filled_boxes):
-        _click(client, session_id, page, boxes[0])
-        page.wait_for_timeout(200)
-        client.browsers.computer.type_text(session_id, text=digits, delay=80)
+        page.wait_for_timeout(120)
+        client.browsers.computer.type_text(session_id, text=ch, delay=30)
 
 
 def _apply_otp(client, session_id: str, page, seller: str, code: str) -> dict[str, str]:
@@ -629,13 +642,26 @@ def _apply_otp(client, session_id: str, page, seller: str, code: str) -> dict[st
             "detail": "OTP boxes were not on screen. Say the trip again if you want a new code.",
             "screenshot": shot,
         }
-    existing = "".join(str(box.get("v") or "") for box in boxes)
+    existing = _box_digits(boxes)
     if existing != digits:
         _type_otp(client, session_id, page, seller, digits)
     page.wait_for_timeout(500)
-    if seller == "ixigo":
-        fresh = _find(page, "otp", seller) or boxes
-        _press_verify(client, session_id, page, fresh)
+    fresh = _find(page, "otp", seller) or []
+    filled = _box_digits(fresh) == digits
+    if not filled:
+        shot = _shot(page, seller, session_id, "otp-after")
+        return {
+            "status": "click_missed",
+            "detail": otp_failure_detail(boxes_open=True, filled=False),
+            "screenshot": shot,
+        }
+    if seller == "ixigo" and not _press_verify(client, session_id, page):
+        shot = _shot(page, seller, session_id, "otp-after")
+        return {
+            "status": "no_session",
+            "detail": "Verify was not on screen. Say Ixigo again for a new code.",
+            "screenshot": shot,
+        }
     logged = False
     still = False
     verifying = False
@@ -688,7 +714,7 @@ def _apply_otp(client, session_id: str, page, seller: str, code: str) -> dict[st
         return {"status": "logged_in", "seller": seller, "screenshot": shot}
     return {
         "status": "no_session",
-        "detail": otp_failure_detail(boxes_open=still, verifying=verifying),
+        "detail": otp_failure_detail(boxes_open=still, verifying=verifying, filled=True),
         "screenshot": shot,
     }
 

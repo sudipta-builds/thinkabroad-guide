@@ -180,30 +180,25 @@ def handle_turn(
         return Reply.of(reply, emoji="📱")
 
     if should_resume_kernel_otp(state, text):
-        from app.kernel_otp import handoff_whatsapp_otp, otp_accepted
+        from app.kernel_otp import resume_kernel_otp
 
         if message_sid:
             remember_inbound(phone, message_sid)
+        action = resume_kernel_otp(state, text)
         seller_id = str(state.get("kernel_seller") or "ixigo")
-        if seller_id in {"ixigo", "cleartrip"} and not otp_accepted(seller_id, text):
+        if action == "need_digits":
             need = "4" if seller_id == "cleartrip" else "6"
             reply = f"{_seller_label(seller_id)} needs {need} digits. Reply with only those digits."
             db.add_message(phone, "assistant", reply)
             return Reply.of(reply, emoji="🔐")
-        if handoff_whatsapp_otp(state, text):
+        if action == "type":
             reply = "Typing that code into the login now."
             db.add_message(phone, "assistant", reply)
             return Reply.of(reply, emoji="🔐")
-        state["busy_at"] = f"{time.time():.3f}"
-        state["stage"] = "login"
+        state["kernel_awaiting_otp"] = False
+        state.pop("kernel_session_id", None)
         _save(phone, state)
-        threading.Thread(
-            target=_run_kernel_otp_submit,
-            args=(phone, text.strip(), state.get("busy_at")),
-            name="guide-kernel-otp",
-            daemon=True,
-        ).start()
-        reply = "Typing that code into the login now."
+        reply = "The login page closed. Say the trip again and I'll request a new code. Nothing paid."
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="🔐")
     if not get_settings().llm_ready:
@@ -1653,17 +1648,6 @@ def _run_kernel_login(
             result,
             secrets,
         )
-    _clear_busy(phone, started_at)
-
-
-def _run_kernel_otp_submit(phone: str, code: str, started_at: float | None) -> None:
-    from app.kernel_otp import submit_otp
-
-    state = _load(phone)
-    seller = str(state.get("kernel_seller") or "ixigo")
-    session_id = str(state.get("kernel_session_id") or "")
-    result = submit_otp(session_id=session_id, seller=seller, code=code)
-    _publish_kernel_otp_result(phone, seller, session_id, result, [code])
     _clear_busy(phone, started_at)
 
 

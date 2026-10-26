@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
@@ -59,6 +60,7 @@ def health() -> JSONResponse:
             "agent": "travel",
             "channel": "whatsapp",
             "version": __version__,
+            "commit": (os.getenv("RENDER_GIT_COMMIT") or "").strip(),
             "meta_wa": settings.meta_wa_ready,
             "meta_verify": settings.meta_verify_ready,
             "twilio": settings.twilio_ready,

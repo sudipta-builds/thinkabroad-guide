@@ -202,8 +202,15 @@ def _find(page, kind: str, seller: str):
     )
 
 
+def ixigo_verify_in_progress(text: str) -> bool:
+    """Ixigo's spinner after Verify. The code screen is already gone."""
+    return bool(re.search(r"please wait while we verify|verifying your details", text or "", re.I))
+
+
 def _otp_visible(page, seller: str) -> bool:
     text, _url = _read(page)
+    if seller == "ixigo" and ixigo_verify_in_progress(text):
+        return False
     if seller == "cleartrip":
         return bool(re.search(r"enter otp", text or "", re.I))
     stage = classify_page(text, _url, book_count=_book_count(page))
@@ -491,30 +498,49 @@ def submit_otp(*, session_id: str, seller: str, code: str) -> dict[str, str]:
                 _press_verify(client, session_id, page, fresh)
             logged = False
             still = False
-            for attempt in range(16):
-                page.wait_for_timeout(700)
+            verifying = False
+            presses = 0
+            for attempt in range(40):
+                page.wait_for_timeout(800)
                 try:
                     if page.is_closed():
                         page = _latest(page)
                 except Exception:
                     page = _latest(page)
+                text, _url = _read(page)
+                if seller == "ixigo" and ixigo_verify_in_progress(text):
+                    verifying = True
+                    still = False
+                    continue
                 if _logged_in(page, seller):
                     logged = True
                     break
                 if _otp_visible(page, seller):
                     still = True
-                    if seller == "ixigo" and attempt in {2, 5, 8}:
+                    if seller == "ixigo" and not verifying and presses < 2 and attempt in {3, 8}:
                         fresh = _find(page, "otp", seller) or boxes
                         _press_verify(client, session_id, page, fresh)
+                        presses += 1
                     continue
                 still = False
-            if seller == "ixigo" and not logged and not still:
-                try:
-                    page.goto("https://www.ixigo.com/", wait_until="domcontentloaded", timeout=60000)
-                    page.wait_for_timeout(3000)
-                except Exception:
-                    pass
+                if verifying:
+                    break
+            if verifying and not logged:
+                for _ in range(20):
+                    text, _url = _read(page)
+                    if not ixigo_verify_in_progress(text):
+                        break
+                    page.wait_for_timeout(1000)
                 logged = _logged_in(page, seller)
+            if seller == "ixigo" and not logged and not still:
+                text, _url = _read(page)
+                if not ixigo_verify_in_progress(text):
+                    try:
+                        page.goto("https://www.ixigo.com/", wait_until="domcontentloaded", timeout=60000)
+                        page.wait_for_timeout(3000)
+                    except Exception:
+                        pass
+                    logged = _logged_in(page, seller)
             shot = _shot(page, seller, session_id, "otp-after")
             try:
                 pw.close()
@@ -523,6 +549,13 @@ def submit_otp(*, session_id: str, seller: str, code: str) -> dict[str, str]:
         if logged:
             _drop(client, session_id)
             return {"status": "logged_in", "seller": seller, "screenshot": shot}
+        if verifying and not logged:
+            _drop(client, session_id)
+            return {
+                "status": "no_session",
+                "detail": "Ixigo was checking that code, then the account didn't appear. Say Ixigo again for a new code.",
+                "screenshot": shot,
+            }
         if still:
             _drop(client, session_id)
             return {

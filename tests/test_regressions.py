@@ -857,7 +857,17 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertTrue(ixigo_auth_session_signals(text, url))
 
     def test_kernel_otp_lengths_and_whatsapp_resume(self) -> None:
-        from app.kernel_otp import indian_national, keep_kernel_otp_session, otp_accepted, should_resume_kernel_otp, verify_fallback
+        from app.kernel_otp import (
+            indian_national,
+            ixigo_verify_in_progress,
+            keep_kernel_otp_session,
+            otp_accepted,
+            should_resume_kernel_otp,
+            verify_fallback,
+        )
+
+        self.assertTrue(ixigo_verify_in_progress("Please wait while we verify your details."))
+        self.assertFalse(ixigo_verify_in_progress("Verify Your Mobile Number Enter the OTP"))
 
         point = verify_fallback([{"x": 800, "y": 360}, {"x": 900, "y": 360}])
         self.assertEqual(point["x"], 850)

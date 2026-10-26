@@ -95,13 +95,23 @@ def _metrics(page) -> dict[str, float]:
     )
 
 
+def verify_fallback(boxes: list[dict[str, Any]]) -> dict[str, float] | None:
+    """Point on the orange Verify bar under the OTP row when the button text is missed."""
+    if not boxes:
+        return None
+    return {
+        "x": sum(float(box["x"]) for box in boxes) / len(boxes),
+        "y": max(float(box["y"]) for box in boxes) + 110,
+    }
+
+
 def _click(client, sid: str, page, box: dict[str, Any]) -> None:
     metrics = _metrics(page)
     chrome_top = max(0, metrics["outerH"] - metrics["innerH"])
     chrome_left = max(0, (metrics["outerW"] - metrics["innerW"]) / 2)
     x = int((metrics["screenX"] + chrome_left + box["x"]) * metrics["dpr"])
     y = int((metrics["screenY"] + chrome_top + box["y"]) * metrics["dpr"])
-    client.browsers.computer.click_mouse(sid, x=x, y=y)
+    client.browsers.computer.click_mouse(sid, x=x, y=y, button="left", num_clicks=1)
 
 
 def _find(page, kind: str, seller: str):
@@ -369,6 +379,52 @@ def _otp_page(context, seller: str):
     return context.new_page()
 
 
+def _click_verify(client, session_id: str, page, boxes: list[dict[str, Any]]) -> bool:
+    """Click the Verify control under the OTP boxes. Falls back to that spot if the label is missed."""
+    anchor = verify_fallback(boxes)
+    hit = page.evaluate(
+        """(anchor) => {
+          const vis = (el) => {
+            const r = el.getBoundingClientRect();
+            const s = getComputedStyle(el);
+            return r.width > 8 && r.height > 8 && s.visibility !== 'hidden' && s.display !== 'none' && r.top < innerHeight && r.bottom > 0;
+          };
+          const label = (el) => (el.innerText || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+          const center = (el) => {
+            const r = el.getBoundingClientRect();
+            return {x: r.x + r.width/2, y: r.y + r.height/2, w: r.width, h: r.height};
+          };
+          const orange = (el) => {
+            const m = getComputedStyle(el).backgroundColor.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
+            if (!m) return false;
+            const r = +m[1], g = +m[2], b = +m[3];
+            return r > 180 && g > 60 && g < 190 && b < 90;
+          };
+          const nodes = [...document.querySelectorAll('button,[role=button],div,a,span')].filter(vis);
+          let hits = nodes.filter(el => /^verify$/i.test(label(el)));
+          if (anchor) {
+            const below = hits.filter(el => center(el).y >= anchor.y - 140);
+            if (below.length) hits = below;
+          }
+          const wide = hits.filter(el => center(el).w > 80);
+          let pick = wide[0] || hits[0] || null;
+          if (!pick && anchor) {
+            const bars = nodes.filter(el => orange(el) && center(el).w > 80 && center(el).y >= anchor.y - 40 && center(el).y < anchor.y + 220);
+            bars.sort((a,b) => Math.abs(center(a).y - anchor.y) - Math.abs(center(b).y - anchor.y));
+            pick = bars[0] || null;
+          }
+          if (!pick) return anchor ? {x: anchor.x, y: anchor.y, t: 'below-otp'} : null;
+          const c = center(pick);
+          return {x: c.x, y: c.y, t: label(pick).slice(0, 20) || 'verify'};
+        }""",
+        anchor,
+    )
+    if not hit:
+        return False
+    _click(client, session_id, page, hit)
+    return True
+
+
 def _type_otp(client, session_id: str, page, seller: str, digits: str) -> None:
     boxes = _find(page, "otp", seller) or []
     if not boxes:
@@ -420,9 +476,11 @@ def submit_otp(*, session_id: str, seller: str, code: str) -> dict[str, str]:
                 }
             _type_otp(client, session_id, page, seller, digits)
             if seller == "ixigo":
-                verify = _find(page, "verify", seller)
-                if verify:
-                    _click(client, session_id, page, verify)
+                fresh = _find(page, "otp", seller) or boxes
+                _click_verify(client, session_id, page, fresh)
+                page.wait_for_timeout(1200)
+                if _otp_visible(page, seller):
+                    _click_verify(client, session_id, page, fresh)
             logged = False
             still = False
             for _ in range(16):

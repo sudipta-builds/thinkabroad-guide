@@ -862,6 +862,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
         point = verify_fallback([{"x": 800, "y": 360}, {"x": 900, "y": 360}])
         self.assertEqual(point["x"], 850)
         self.assertEqual(point["y"], 470)
+        self.assertFalse(keep_kernel_otp_session("no_session"))
 
         self.assertTrue(keep_kernel_otp_session("still_otp"))
         self.assertFalse(keep_kernel_otp_session("no_session"))

@@ -379,49 +379,58 @@ def _otp_page(context, seller: str):
     return context.new_page()
 
 
-def _click_verify(client, session_id: str, page, boxes: list[dict[str, Any]]) -> bool:
-    """Click the Verify control under the OTP boxes. Falls back to that spot if the label is missed."""
+def _press_verify(client, session_id: str, page, boxes: list[dict[str, Any]]) -> bool:
+    """Press the orange Verify bar. Digits already land; this button was the miss."""
     anchor = verify_fallback(boxes)
     hit = page.evaluate(
         """(anchor) => {
-          const vis = (el) => {
+          const label = (el) => (el.innerText || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+          const nodes = [...document.querySelectorAll('button,[role=button],div,a')];
+          const hits = nodes.filter(el => {
             const r = el.getBoundingClientRect();
             const s = getComputedStyle(el);
-            return r.width > 8 && r.height > 8 && s.visibility !== 'hidden' && s.display !== 'none' && r.top < innerHeight && r.bottom > 0;
-          };
-          const label = (el) => (el.innerText || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
-          const center = (el) => {
-            const r = el.getBoundingClientRect();
-            return {x: r.x + r.width/2, y: r.y + r.height/2, w: r.width, h: r.height};
-          };
-          const orange = (el) => {
-            const m = getComputedStyle(el).backgroundColor.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
-            if (!m) return false;
-            const r = +m[1], g = +m[2], b = +m[3];
-            return r > 180 && g > 60 && g < 190 && b < 90;
-          };
-          const nodes = [...document.querySelectorAll('button,[role=button],div,a,span')].filter(vis);
-          let hits = nodes.filter(el => /^verify$/i.test(label(el)));
-          if (anchor) {
-            const below = hits.filter(el => center(el).y >= anchor.y - 140);
-            if (below.length) hits = below;
-          }
-          const wide = hits.filter(el => center(el).w > 80);
-          let pick = wide[0] || hits[0] || null;
-          if (!pick && anchor) {
-            const bars = nodes.filter(el => orange(el) && center(el).w > 80 && center(el).y >= anchor.y - 40 && center(el).y < anchor.y + 220);
-            bars.sort((a,b) => Math.abs(center(a).y - anchor.y) - Math.abs(center(b).y - anchor.y));
-            pick = bars[0] || null;
-          }
-          if (!pick) return anchor ? {x: anchor.x, y: anchor.y, t: 'below-otp'} : null;
-          const c = center(pick);
-          return {x: c.x, y: c.y, t: label(pick).slice(0, 20) || 'verify'};
+            if (r.width < 80 || r.height < 24) return false;
+            if (s.visibility === 'hidden' || s.display === 'none') return false;
+            return /^verify$/i.test(label(el));
+          });
+          hits.sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width);
+          const el = hits[0];
+          if (!el) return null;
+          el.scrollIntoView({block: 'center', inline: 'center'});
+          const r = el.getBoundingClientRect();
+          el.click();
+          return {x: r.x + r.width / 2, y: r.y + r.height / 2, t: 'verify', w: r.width};
         }""",
         anchor,
     )
-    if not hit:
+    point = hit or anchor
+    if not point:
         return False
-    _click(client, session_id, page, hit)
+    _click(client, session_id, page, point)
+    # OTP boxes can fill from one focused box. Verify only lands if this point is the bar,
+    # so also try the raw viewport pixel in case the scaled point sits low.
+    try:
+        client.browsers.computer.click_mouse(
+            session_id,
+            x=int(point["x"]),
+            y=int(point["y"]),
+            button="left",
+            num_clicks=1,
+        )
+    except Exception:
+        pass
+    try:
+        page.mouse.click(float(point["x"]), float(point["y"]))
+    except Exception:
+        pass
+    try:
+        page.get_by_text(re.compile(r"^\s*Verify\s*$")).click(timeout=2500, force=True)
+    except Exception:
+        pass
+    try:
+        client.browsers.computer.press_key(session_id, keys=["Return"])
+    except Exception:
+        pass
     return True
 
 
@@ -474,16 +483,15 @@ def submit_otp(*, session_id: str, seller: str, code: str) -> dict[str, str]:
                     "detail": "OTP boxes were not on screen. Say the trip again if you want a new code.",
                     "screenshot": shot,
                 }
-            _type_otp(client, session_id, page, seller, digits)
+            existing = "".join(str(box.get("v") or "") for box in boxes)
+            if existing != digits:
+                _type_otp(client, session_id, page, seller, digits)
             if seller == "ixigo":
                 fresh = _find(page, "otp", seller) or boxes
-                _click_verify(client, session_id, page, fresh)
-                page.wait_for_timeout(1200)
-                if _otp_visible(page, seller):
-                    _click_verify(client, session_id, page, fresh)
+                _press_verify(client, session_id, page, fresh)
             logged = False
             still = False
-            for _ in range(16):
+            for attempt in range(16):
                 page.wait_for_timeout(700)
                 try:
                     if page.is_closed():
@@ -495,6 +503,9 @@ def submit_otp(*, session_id: str, seller: str, code: str) -> dict[str, str]:
                     break
                 if _otp_visible(page, seller):
                     still = True
+                    if seller == "ixigo" and attempt in {2, 5, 8}:
+                        fresh = _find(page, "otp", seller) or boxes
+                        _press_verify(client, session_id, page, fresh)
                     continue
                 still = False
             if seller == "ixigo" and not logged and not still:
@@ -513,9 +524,10 @@ def submit_otp(*, session_id: str, seller: str, code: str) -> dict[str, str]:
             _drop(client, session_id)
             return {"status": "logged_in", "seller": seller, "screenshot": shot}
         if still:
+            _drop(client, session_id)
             return {
-                "status": "still_otp",
-                "detail": "The code screen is still open. Reply with the same digits again.",
+                "status": "no_session",
+                "detail": "The code is in the boxes, but Verify did not submit. Say Ixigo again for a new code.",
                 "screenshot": shot,
             }
         _drop(client, session_id)

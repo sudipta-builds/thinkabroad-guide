@@ -253,8 +253,9 @@ def _find(page, kind: str, seller: str):
             let boxes = inputs.filter(i => {
               const r = i.getBoundingClientRect();
               const ml = i.getAttribute('maxlength');
+              const mode = (i.getAttribute('inputmode') || '') + (i.autocomplete || '') + (i.name || '') + (i.id || '');
               if (seller === 'cleartrip') return r.width > 40 && r.width < 70 && r.height > 40 && r.height < 70;
-              return ml === '1' && r.width >= 16 && r.width < 90 && r.height >= 16 && r.height < 90;
+              return ml === '1' || /one-time|otp|numeric/i.test(mode);
             });
             boxes.sort((a,b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x);
             if (boxes.length > need) boxes = boxes.slice(-need);

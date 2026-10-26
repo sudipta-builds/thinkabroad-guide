@@ -106,9 +106,7 @@ def viewport_click(metrics: dict[str, float], box: dict[str, Any]) -> tuple[int,
     )
 
 
-def otp_failure_detail(*, boxes_open: bool, verifying: bool = False, filled: bool = False) -> str:
-    if boxes_open and not filled:
-        return "The click missed the boxes. Say Ixigo again for a new code."
+def otp_failure_detail(*, boxes_open: bool, verifying: bool = False) -> str:
     if boxes_open:
         return "The code is in the boxes, but Verify did not submit. Say Ixigo again for a new code."
     if verifying:
@@ -611,10 +609,6 @@ def _press_verify(client, session_id: str, page) -> bool:
     return True
 
 
-def _box_digits(boxes: list[dict[str, Any]]) -> str:
-    return "".join(str(box.get("v") or "") for box in boxes)
-
-
 def _type_otp(client, session_id: str, page, seller: str, digits: str) -> None:
     """One Kernel click and one character per box. Same as the local login."""
     boxes = _find(page, "otp", seller) or []
@@ -642,26 +636,10 @@ def _apply_otp(client, session_id: str, page, seller: str, code: str) -> dict[st
             "detail": "OTP boxes were not on screen. Say the trip again if you want a new code.",
             "screenshot": shot,
         }
-    existing = _box_digits(boxes)
-    if existing != digits:
-        _type_otp(client, session_id, page, seller, digits)
-    page.wait_for_timeout(500)
-    fresh = _find(page, "otp", seller) or []
-    filled = _box_digits(fresh) == digits
-    if not filled:
-        shot = _shot(page, seller, session_id, "otp-after")
-        return {
-            "status": "click_missed",
-            "detail": otp_failure_detail(boxes_open=True, filled=False),
-            "screenshot": shot,
-        }
-    if seller == "ixigo" and not _press_verify(client, session_id, page):
-        shot = _shot(page, seller, session_id, "otp-after")
-        return {
-            "status": "no_session",
-            "detail": "Verify was not on screen. Say Ixigo again for a new code.",
-            "screenshot": shot,
-        }
+    _type_otp(client, session_id, page, seller, digits)
+    page.wait_for_timeout(400)
+    if seller == "ixigo":
+        _press_verify(client, session_id, page)
     logged = False
     still = False
     verifying = False
@@ -714,7 +692,7 @@ def _apply_otp(client, session_id: str, page, seller: str, code: str) -> dict[st
         return {"status": "logged_in", "seller": seller, "screenshot": shot}
     return {
         "status": "no_session",
-        "detail": otp_failure_detail(boxes_open=still, verifying=verifying, filled=True),
+        "detail": otp_failure_detail(boxes_open=still, verifying=verifying),
         "screenshot": shot,
     }
 

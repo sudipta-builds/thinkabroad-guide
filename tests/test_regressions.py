@@ -868,8 +868,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
             verify_fallback,
         )
 
-        self.assertIn("missed the boxes", otp_failure_detail(boxes_open=True, filled=False))
-        self.assertIn("in the boxes", otp_failure_detail(boxes_open=True, filled=True))
+        self.assertIn("in the boxes", otp_failure_detail(boxes_open=True))
         self.assertIn("Log in", otp_failure_detail(boxes_open=False))
         self.assertIn("checking", otp_failure_detail(boxes_open=False, verifying=True))
         waiting_live = {"kernel_awaiting_otp": True, "kernel_session_id": "sess", "kernel_seller": "ixigo"}

@@ -869,6 +869,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
 
         self.assertIn("in the boxes", otp_failure_detail(boxes_open=True))
         self.assertIn("Log in", otp_failure_detail(boxes_open=False))
+        self.assertIn("checking", otp_failure_detail(boxes_open=False, verifying=True))
 
         self.assertTrue(ixigo_verify_in_progress("Please wait while we verify your details."))
         self.assertFalse(ixigo_verify_in_progress("Verify Your Mobile Number Enter the OTP"))
@@ -897,6 +898,78 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertTrue(should_resume_kernel_otp(waiting, "529779"))
         self.assertFalse(should_resume_kernel_otp(waiting, "book the 1:15"))
         self.assertFalse(should_resume_kernel_otp({}, "529779"))
+
+    def test_kernel_login_keeps_one_connection_for_the_code(self) -> None:
+        import inspect
+        import threading
+
+        from app.kernel_otp import (
+            _await_live_otp,
+            arm_live_otp,
+            begin_login,
+            cancel_live_otp,
+            handoff_whatsapp_otp,
+            offer_live_otp,
+            viewport_click,
+        )
+
+        # Window was 16,97 off the origin. Adding that offset missed the phone field.
+        self.assertEqual(
+            viewport_click(
+                {
+                    "outerH": 670,
+                    "innerH": 670,
+                    "outerW": 1247,
+                    "innerW": 1247,
+                    "screenX": 16,
+                    "screenY": 97,
+                    "dpr": 1,
+                },
+                {"x": 1091, "y": 308},
+            ),
+            (1091, 308),
+        )
+        self.assertIn("on_code_requested", inspect.signature(begin_login).parameters)
+
+        session = "live-conn-test"
+        cancel_live_otp(session)
+        waiting = {
+            "kernel_awaiting_otp": True,
+            "kernel_session_id": session,
+            "kernel_seller": "ixigo",
+        }
+        self.assertFalse(handoff_whatsapp_otp(waiting, "123456"))
+        arm_live_otp(session)
+        self.assertTrue(handoff_whatsapp_otp(waiting, "123456"))
+        self.assertTrue(handoff_whatsapp_otp(waiting, "654321"))
+
+        class _Page:
+            url = "https://www.ixigo.com/"
+
+        try:
+            self.assertEqual(_await_live_otp(_Page(), session, 2), "123456")
+            self.assertTrue(offer_live_otp(session, "654321"))
+        finally:
+            cancel_live_otp(session)
+
+        session_wait = "live-conn-wait"
+        cancel_live_otp(session_wait)
+        waiting_later = {
+            "kernel_awaiting_otp": True,
+            "kernel_session_id": session_wait,
+            "kernel_seller": "ixigo",
+        }
+        arm_live_otp(session_wait)
+
+        def _send_later() -> None:
+            threading.Event().wait(0.2)
+            handoff_whatsapp_otp(waiting_later, "123456")
+
+        threading.Thread(target=_send_later, daemon=True).start()
+        try:
+            self.assertEqual(_await_live_otp(_Page(), session_wait, 3), "123456")
+        finally:
+            cancel_live_otp(session_wait)
 
     def test_pause_on_auth_stops_without_login_phone(self) -> None:
         class _FakePage:

@@ -180,11 +180,23 @@ def handle_turn(
         return Reply.of(reply, emoji="📱")
 
     if should_resume_kernel_otp(state, text):
+        from app.kernel_otp import handoff_whatsapp_otp, otp_accepted
+
+        if message_sid:
+            remember_inbound(phone, message_sid)
+        seller_id = str(state.get("kernel_seller") or "ixigo")
+        if seller_id in {"ixigo", "cleartrip"} and not otp_accepted(seller_id, text):
+            need = "4" if seller_id == "cleartrip" else "6"
+            reply = f"{_seller_label(seller_id)} needs {need} digits. Reply with only those digits."
+            db.add_message(phone, "assistant", reply)
+            return Reply.of(reply, emoji="🔐")
+        if handoff_whatsapp_otp(state, text):
+            reply = "Typing that code into the login now."
+            db.add_message(phone, "assistant", reply)
+            return Reply.of(reply, emoji="🔐")
         state["busy_at"] = f"{time.time():.3f}"
         state["stage"] = "login"
         _save(phone, state)
-        if message_sid:
-            remember_inbound(phone, message_sid)
         threading.Thread(
             target=_run_kernel_otp_submit,
             args=(phone, text.strip(), state.get("busy_at")),
@@ -1537,60 +1549,34 @@ def _kernel_trip(state: dict[str, Any]) -> tuple[str, str, str, str]:
     return origin, destination, depart, hint
 
 
-def _run_kernel_login(phone: str, text: str, loaded: dict[str, Any], secrets: list[str], started_at: float | None) -> None:
-    from app.kernel_otp import begin_login
-
-    seller = str(loaded.get("seller") or loaded.get("preferred_seller") or "cleartrip")
-    if seller not in {"ixigo", "cleartrip"}:
-        seller = "cleartrip"
-    origin, destination, depart, hint = _kernel_trip(loaded)
-    result = begin_login(
-        seller=seller,
-        whatsapp_phone=phone,
-        explicit=str(loaded.get("login_phone") or loaded.get("phone") or ""),
-        origin=origin,
-        destination=destination,
-        depart=depart,
-        hint=hint,
+def _announce_kernel_code(phone: str, seller: str, result: dict[str, Any], secrets: list[str]) -> None:
+    state = _load(phone)
+    state["kernel_session_id"] = result.get("session_id")
+    state["kernel_seller"] = seller
+    state["kernel_awaiting_otp"] = True
+    state["kernel_awaiting_phone"] = False
+    state["stage"] = "login"
+    _save(phone, state)
+    need = "4" if seller == "cleartrip" else "6"
+    shots = [result["screenshot"]] if result.get("screenshot") else None
+    _deliver(
+        phone,
+        f"{_seller_label(seller)} sent a login code to your mobile. The screenshot is that screen. Reply with only the {need} digits. Nothing paid.",
+        None,
+        secrets,
+        shot_paths=shots,
     )
-    state = _load(phone)
-    if result.get("status") == "otp_sent":
-        state["kernel_session_id"] = result.get("session_id")
-        state["kernel_seller"] = seller
-        state["kernel_awaiting_otp"] = True
-        state["kernel_awaiting_phone"] = False
-        state["stage"] = "login"
-        _save(phone, state)
-        need = "4" if seller == "cleartrip" else "6"
-        shots = [result["screenshot"]] if result.get("screenshot") else None
-        _deliver(
-            phone,
-            f"{_seller_label(seller)} sent a login code to your mobile. The screenshot is that screen. Reply with only the {need} digits. Nothing paid.",
-            None,
-            secrets,
-            shot_paths=shots,
-        )
-    else:
-        state["kernel_awaiting_otp"] = False
-        state.pop("kernel_session_id", None)
-        _save(phone, state)
-        detail = str(result.get("detail") or result.get("status") or "login didn't open")
-        _deliver(
-            phone,
-            f"I couldn't open {_seller_label(seller)} login ({detail}). Nothing paid.",
-            None,
-            secrets,
-        )
-    _clear_busy(phone, started_at)
 
 
-def _run_kernel_otp_submit(phone: str, code: str, started_at: float | None) -> None:
-    from app.kernel_otp import keep_kernel_otp_session, submit_otp
+def _publish_kernel_otp_result(
+    phone: str,
+    seller: str,
+    session_id: str,
+    result: dict[str, Any],
+    redact: list[str],
+) -> None:
+    from app.kernel_otp import keep_kernel_otp_session
 
-    state = _load(phone)
-    seller = str(state.get("kernel_seller") or "ixigo")
-    session_id = str(state.get("kernel_session_id") or "")
-    result = submit_otp(session_id=session_id, seller=seller, code=code)
     state = _load(phone)
     status = str(result.get("status") or "")
     shots = [result["screenshot"]] if result.get("screenshot") else None
@@ -1609,7 +1595,75 @@ def _run_kernel_otp_submit(phone: str, code: str, started_at: float | None) -> N
         state.pop("kernel_session_id", None)
         spoken = str(result.get("detail") or "Login didn't finish. Nothing paid.")
     _save(phone, state)
-    _deliver(phone, spoken, None, [code], shot_paths=shots)
+    _deliver(phone, spoken, None, redact, shot_paths=shots)
+
+
+def _run_kernel_login(
+    phone: str,
+    text: str,
+    loaded: dict[str, Any],
+    secrets: list[str],
+    started_at: float | None,
+    release_lock=None,
+) -> None:
+    from app.kernel_otp import begin_login
+
+    seller = str(loaded.get("seller") or loaded.get("preferred_seller") or "cleartrip")
+    if seller not in {"ixigo", "cleartrip"}:
+        seller = "cleartrip"
+    origin, destination, depart, hint = _kernel_trip(loaded)
+    announced = False
+
+    def on_code_requested(result: dict[str, str]) -> None:
+        nonlocal announced
+        _announce_kernel_code(phone, seller, result, secrets)
+        announced = True
+        if release_lock is not None:
+            release_lock()
+
+    result = begin_login(
+        seller=seller,
+        whatsapp_phone=phone,
+        explicit=str(loaded.get("login_phone") or loaded.get("phone") or ""),
+        origin=origin,
+        destination=destination,
+        depart=depart,
+        hint=hint,
+        on_code_requested=on_code_requested,
+    )
+    if str(result.get("status") or "") == "otp_sent" and not announced:
+        on_code_requested(result)
+    elif not announced:
+        state = _load(phone)
+        state["kernel_awaiting_otp"] = False
+        state.pop("kernel_session_id", None)
+        _save(phone, state)
+        detail = str(result.get("detail") or result.get("status") or "login didn't open")
+        _deliver(
+            phone,
+            f"I couldn't open {_seller_label(seller)} login ({detail}). Nothing paid.",
+            None,
+            secrets,
+        )
+    else:
+        _publish_kernel_otp_result(
+            phone,
+            seller,
+            str(result.get("session_id") or ""),
+            result,
+            secrets,
+        )
+    _clear_busy(phone, started_at)
+
+
+def _run_kernel_otp_submit(phone: str, code: str, started_at: float | None) -> None:
+    from app.kernel_otp import submit_otp
+
+    state = _load(phone)
+    seller = str(state.get("kernel_seller") or "ixigo")
+    session_id = str(state.get("kernel_session_id") or "")
+    result = submit_otp(session_id=session_id, seller=seller, code=code)
+    _publish_kernel_otp_result(phone, seller, session_id, result, [code])
     _clear_busy(phone, started_at)
 
 
@@ -1668,11 +1722,20 @@ def _run_booking_on_worker(
 def _run_browse(phone: str, text: str, started_at: float | None = None, kind: str = "") -> None:
     secrets: list[str] = []
     acquired = False
+    lock_held = False
     direct = False
     use_proxy = False
     loaded: dict[str, Any] = {}
+
+    def release_browse_lock() -> None:
+        nonlocal lock_held
+        if lock_held:
+            _LOCK.release()
+            lock_held = False
+
     try:
         acquired = _LOCK.acquire(timeout=40)
+        lock_held = bool(acquired)
         if not acquired:
             _deliver(phone, "Another live page is still open. I'll send that result first.", None, secrets)
             _clear_busy(phone, started_at)
@@ -1685,7 +1748,7 @@ def _run_browse(phone: str, text: str, started_at: float | None = None, kind: st
 
             seller_id = str(loaded.get("seller") or loaded.get("preferred_seller") or "")
             if not direct and kernel_configured() and seller_id in {"ixigo", "cleartrip"}:
-                _run_kernel_login(phone, text, loaded, secrets, started_at)
+                _run_kernel_login(phone, text, loaded, secrets, started_at, release_lock=release_browse_lock)
                 return
             # Booking uses the residential proxy in production. Search stays direct unless PROXY_SEARCH=1.
             use_proxy = bool(settings.proxy_ready and (not direct or settings.proxy_search))
@@ -1724,7 +1787,7 @@ def _run_browse(phone: str, text: str, started_at: float | None = None, kind: st
                         secrets,
                     )
         finally:
-            _LOCK.release()
+            release_browse_lock()
     except Exception:
         logger.exception("Live browse failed")
         seller_id = str(_load(phone).get("seller") or _load(phone).get("preferred_seller") or "cleartrip")

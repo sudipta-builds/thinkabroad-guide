@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import re
 import threading
+import time
+from collections.abc import Callable
 from typing import Any
 
 from app.config import get_settings
@@ -23,10 +25,14 @@ from app.page_agent import (
 from app.search import ixigo_results_url
 
 KERNEL_SELLERS = {"ixigo", "cleartrip"}
-# Keep a CDP client attached while WhatsApp waits for the OTP. Kernel idles the
-# browser ~60s after the last disconnect, and that kills the Ixigo session path.
+# Legacy second connection. The prod login keeps the original CDP socket instead.
 _HOLDS: dict[str, dict[str, Any]] = {}
 _HOLD_LOCK = threading.Lock()
+# session_id -> {"event", "code"} for the thread that still holds the first CDP connection.
+_WAITERS: dict[str, dict[str, Any]] = {}
+_WAIT_LOCK = threading.Lock()
+# session_id -> monotonic time once that connection already accepted a code.
+_HANDED: dict[str, float] = {}
 
 
 def kernel_configured() -> bool:
@@ -39,9 +45,72 @@ def should_resume_kernel_otp(state: dict[str, Any], text: str) -> bool:
     return bool(re.fullmatch(r"\d{4,8}", (text or "").strip()))
 
 
-def otp_failure_detail(*, boxes_open: bool) -> str:
+def arm_live_otp(session_id: str) -> None:
+    """The open login thread will type whatever offer_live_otp stores."""
+    with _WAIT_LOCK:
+        _HANDED.pop(session_id, None)
+        _WAITERS[session_id] = {"event": threading.Event(), "code": ""}
+
+
+def offer_live_otp(session_id: str, code: str) -> bool:
+    """Hand a WhatsApp code to the still-open login. False when that connection is gone."""
+    digits = re.sub(r"\D", "", code or "")
+    if not session_id or not digits:
+        return False
+    with _WAIT_LOCK:
+        slot = _WAITERS.get(session_id)
+        if slot is not None:
+            if not slot.get("code"):
+                slot["code"] = digits
+                slot["event"].set()
+            return True
+        handed = _HANDED.get(session_id)
+    return bool(handed and (time.monotonic() - handed) < 120)
+
+
+def poll_live_otp(session_id: str) -> str | None:
+    """Digits once the traveller has replied. None while the login is still waiting."""
+    with _WAIT_LOCK:
+        slot = _WAITERS.get(session_id)
+        if not slot or not slot["event"].is_set():
+            return None
+        _WAITERS.pop(session_id, None)
+        digits = str(slot.get("code") or "")
+        if digits:
+            _HANDED[session_id] = time.monotonic()
+    return digits
+
+
+def cancel_live_otp(session_id: str) -> None:
+    with _WAIT_LOCK:
+        slot = _WAITERS.pop(session_id, None)
+    if slot is not None:
+        slot["event"].set()
+
+
+def handoff_whatsapp_otp(state: dict[str, Any], text: str) -> bool:
+    """True when the original login connection will type this code itself."""
+    if not should_resume_kernel_otp(state, text):
+        return False
+    return offer_live_otp(str(state.get("kernel_session_id") or ""), text)
+
+
+def viewport_click(metrics: dict[str, float], box: dict[str, Any]) -> tuple[int, int]:
+    """Kernel mouse point. Viewport CSS only — screenX/screenY clicks below the field."""
+    chrome_top = max(0, float(metrics["outerH"]) - float(metrics["innerH"]))
+    chrome_left = max(0, (float(metrics["outerW"]) - float(metrics["innerW"])) / 2)
+    dpr = float(metrics.get("dpr") or 1)
+    return (
+        int((chrome_left + float(box["x"])) * dpr),
+        int((chrome_top + float(box["y"])) * dpr),
+    )
+
+
+def otp_failure_detail(*, boxes_open: bool, verifying: bool = False) -> str:
     if boxes_open:
         return "The code is in the boxes, but Verify did not submit. Say Ixigo again for a new code."
+    if verifying:
+        return "Ixigo is still checking that code. The account did not appear."
     return "The code screen closed, but Ixigo still shows Log in. Say Ixigo again for a new code."
 
 
@@ -117,11 +186,7 @@ def verify_fallback(boxes: list[dict[str, Any]]) -> dict[str, float] | None:
 
 
 def _click(client, sid: str, page, box: dict[str, Any]) -> None:
-    metrics = _metrics(page)
-    chrome_top = max(0, metrics["outerH"] - metrics["innerH"])
-    chrome_left = max(0, (metrics["outerW"] - metrics["innerW"]) / 2)
-    x = int((metrics["screenX"] + chrome_left + box["x"]) * metrics["dpr"])
-    y = int((metrics["screenY"] + chrome_top + box["y"]) * metrics["dpr"])
+    x, y = viewport_click(_metrics(page), box)
     client.browsers.computer.click_mouse(sid, x=x, y=y, button="left", num_clicks=1)
 
 
@@ -270,7 +335,7 @@ def _open_browser(client, profile: str):
         stealth=True,
         kiosk_mode=True,
         viewport={"width": 1280, "height": 800, "refresh_rate": 25},
-        timeout_seconds=900,
+        timeout_seconds=1000,
         profile={"name": profile, "save_changes": True},
     )
 
@@ -303,10 +368,8 @@ def _start_hold(session_id: str, cdp_ws_url: str) -> None:
                             _ = contexts[0].pages[0].url
                     except Exception:
                         break
-                try:
-                    browser.close()
-                except Exception:
-                    pass
+                # Disconnect only. browser.close() shuts the Kernel Chrome and
+                # kills the Ixigo page before the OTP can be submitted.
         except Exception:
             ready.set()
 
@@ -330,6 +393,30 @@ def _stop_hold(session_id: str) -> None:
         thread.join(timeout=8)
 
 
+def _await_live_otp(page, session_id: str, timeout_sec: int) -> str:
+    """Block on the same page until WhatsApp hands over a code. Empty if it never arrives."""
+    deadline = time.monotonic() + max(1, timeout_sec)
+    while time.monotonic() < deadline:
+        found = poll_live_otp(session_id)
+        if found:
+            return found
+        if found == "":
+            return ""
+        with _WAIT_LOCK:
+            slot = _WAITERS.get(session_id)
+            event = slot["event"] if slot else None
+        if event is None:
+            return ""
+        try:
+            _ = page.url
+        except Exception:
+            cancel_live_otp(session_id)
+            return ""
+        event.wait(min(1.2, max(0.05, deadline - time.monotonic())))
+    cancel_live_otp(session_id)
+    return ""
+
+
 def begin_login(
     *,
     seller: str,
@@ -339,8 +426,14 @@ def begin_login(
     depart: str = "2026-12-04",
     hint: str = "1:15",
     explicit: str = "",
+    on_code_requested: Callable[[dict[str, str]], None] | None = None,
+    otp_wait_sec: int = 300,
 ) -> dict[str, str]:
-    """Open the seller and request one OTP. Leaves the Kernel browser running."""
+    """Open the seller and request one OTP.
+
+    With on_code_requested, the same CDP connection waits for the WhatsApp code,
+    types it, and clicks Verify. That is the path that produced an Ixigo account.
+    """
     if seller not in KERNEL_SELLERS:
         return {"status": "unsupported", "detail": seller}
     login_phone = login_phone_for(whatsapp_phone, explicit)
@@ -431,18 +524,44 @@ def begin_login(
                     shot = str(dest)
                 except Exception:
                     shot = ""
+            outcome: dict[str, str] | None = None
+            if ok and on_code_requested is not None:
+                # Stay on this CDP connection through Verify. A second connection
+                # reaches the spinner and never becomes an Ixigo account.
+                arm_live_otp(sid)
+                on_code_requested(
+                    {"status": "otp_sent", "session_id": sid, "seller": seller, "screenshot": shot}
+                )
+                code = _await_live_otp(page, sid, otp_wait_sec)
+                if not code:
+                    cancel_live_otp(sid)
+                    outcome = {
+                        "status": "otp_timeout",
+                        "detail": "The code didn't arrive in time. Say the trip again for a new code.",
+                        "session_id": sid,
+                        "seller": seller,
+                    }
+                else:
+                    outcome = _apply_otp(client, sid, page, seller, code)
+                    outcome["session_id"] = sid
+                    outcome["seller"] = seller
+            elif ok:
                 _start_hold(sid, browser.cdp_ws_url)
-            try:
-                pw.close()
-            except Exception:
-                pass
-        if not ok:
+                try:
+                    pw.close()
+                except Exception:
+                    pass
+                outcome = {"status": "otp_sent", "session_id": sid, "seller": seller, "screenshot": shot}
+        if outcome is None:
             _drop(client, sid)
             return {"status": "otp_ui_miss", "detail": "OTP screen did not open. Nothing was charged."}
-        return {"status": "otp_sent", "session_id": sid, "seller": seller, "screenshot": shot}
+        if outcome.get("status") != "otp_sent":
+            _drop(client, sid)
+        return outcome
     except Exception as exc:
+        cancel_live_otp(sid)
         _drop(client, sid)
-        return {"status": "error", "detail": type(exc).__name__}
+        return {"status": "error", "detail": f"{type(exc).__name__}: {str(exc)[:180]}"}
 
 
 def _shot(page, seller: str, session_id: str, tag: str) -> str:
@@ -496,8 +615,86 @@ def _type_otp(client, session_id: str, page, seller: str, digits: str) -> None:
         client.browsers.computer.type_text(session_id, text=digits, delay=80)
 
 
+def _apply_otp(client, session_id: str, page, seller: str, code: str) -> dict[str, str]:
+    """Type and verify on the page that is already open. Does not close the browser."""
+    digits = re.sub(r"\D", "", code or "")
+    if not otp_accepted(seller, digits):
+        need = "4" if seller == "cleartrip" else "6"
+        return {"status": "bad_code", "detail": f"{seller} needs {need} digits. Reply with only those digits."}
+    boxes = _find(page, "otp", seller) or []
+    if not boxes:
+        shot = _shot(page, seller, session_id, "otp-miss")
+        return {
+            "status": "boxes_miss",
+            "detail": "OTP boxes were not on screen. Say the trip again if you want a new code.",
+            "screenshot": shot,
+        }
+    existing = "".join(str(box.get("v") or "") for box in boxes)
+    if existing != digits:
+        _type_otp(client, session_id, page, seller, digits)
+    page.wait_for_timeout(500)
+    if seller == "ixigo":
+        fresh = _find(page, "otp", seller) or boxes
+        _press_verify(client, session_id, page, fresh)
+    logged = False
+    still = False
+    verifying = False
+    for _attempt in range(30):
+        page.wait_for_timeout(800)
+        try:
+            if page.is_closed():
+                page = _latest(page)
+        except Exception:
+            page = _latest(page)
+        text, _url = _read(page)
+        if seller == "ixigo" and ixigo_verify_in_progress(text):
+            verifying = True
+            still = False
+            continue
+        if _logged_in(page, seller):
+            logged = True
+            break
+        if _code_boxes_open(page, seller):
+            still = True
+            continue
+        still = False
+        if verifying:
+            break
+    if verifying and not logged:
+        for _ in range(45):
+            text, _url = _read(page)
+            if not ixigo_verify_in_progress(text):
+                break
+            page.wait_for_timeout(1000)
+        logged = _logged_in(page, seller)
+    if seller == "ixigo" and not logged and not _code_boxes_open(page, seller):
+        text, _url = _read(page)
+        if not ixigo_verify_in_progress(text):
+            try:
+                page.goto("https://www.ixigo.com/", wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(2500)
+            except Exception:
+                pass
+            logged = _logged_in(page, seller)
+    if seller == "ixigo" and logged:
+        try:
+            page.goto("https://www.ixigo.com/", wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2500)
+        except Exception:
+            pass
+        logged = _logged_in(page, seller)
+    shot = _shot(page, seller, session_id, "otp-after")
+    if logged:
+        return {"status": "logged_in", "seller": seller, "screenshot": shot}
+    return {
+        "status": "no_session",
+        "detail": otp_failure_detail(boxes_open=still, verifying=verifying),
+        "screenshot": shot,
+    }
+
+
 def submit_otp(*, session_id: str, seller: str, code: str) -> dict[str, str]:
-    """Type a chat OTP into the still-open Kernel browser and check the real session."""
+    """Fallback when the original login thread is gone. Reconnects, then types."""
     digits = re.sub(r"\D", "", code or "")
     if not otp_accepted(seller, digits):
         need = "4" if seller == "cleartrip" else "6"
@@ -515,79 +712,14 @@ def submit_otp(*, session_id: str, seller: str, code: str) -> dict[str, str]:
             pw = p.chromium.connect_over_cdp(browser.cdp_ws_url)
             context = pw.contexts[0] if pw.contexts else pw.new_context()
             page = _otp_page(context, seller)
-            boxes = _find(page, "otp", seller) or []
-            if not boxes:
-                shot = _shot(page, seller, session_id, "otp-miss")
-                try:
-                    pw.close()
-                except Exception:
-                    pass
-                _drop(client, session_id)
-                return {
-                    "status": "boxes_miss",
-                    "detail": "OTP boxes were not on screen. Say the trip again if you want a new code.",
-                    "screenshot": shot,
-                }
-            existing = "".join(str(box.get("v") or "") for box in boxes)
-            if existing != digits:
-                _type_otp(client, session_id, page, seller, digits)
-            page.wait_for_timeout(500)
-            if seller == "ixigo":
-                fresh = _find(page, "otp", seller) or boxes
-                _press_verify(client, session_id, page, fresh)
-            logged = False
-            still = False
-            verifying = False
-            for attempt in range(30):
-                page.wait_for_timeout(800)
-                try:
-                    if page.is_closed():
-                        page = _latest(page)
-                except Exception:
-                    page = _latest(page)
-                page = _latest(page)
-                text, _url = _read(page)
-                if seller == "ixigo" and ixigo_verify_in_progress(text):
-                    verifying = True
-                    still = False
-                    continue
-                if _logged_in(page, seller):
-                    logged = True
-                    break
-                if _code_boxes_open(page, seller):
-                    still = True
-                    continue
-                still = False
-                if verifying:
-                    break
-            if seller == "ixigo" and not logged and not _code_boxes_open(page, seller):
-                try:
-                    page.goto("https://www.ixigo.com/", wait_until="domcontentloaded", timeout=60000)
-                    page.wait_for_timeout(2500)
-                except Exception:
-                    pass
-                logged = _logged_in(page, seller)
-            if seller == "ixigo" and logged:
-                try:
-                    page.goto("https://www.ixigo.com/", wait_until="domcontentloaded", timeout=60000)
-                    page.wait_for_timeout(2500)
-                except Exception:
-                    pass
-                logged = _logged_in(page, seller)
-            shot = _shot(page, seller, session_id, "otp-after")
+            result = _apply_otp(client, session_id, page, seller, digits)
             try:
                 pw.close()
             except Exception:
                 pass
-        if logged:
-            _drop(client, session_id)
-            return {"status": "logged_in", "seller": seller, "screenshot": shot}
         _drop(client, session_id)
-        return {
-            "status": "no_session",
-            "detail": otp_failure_detail(boxes_open=still),
-            "screenshot": shot,
-        }
+        result["seller"] = seller
+        return result
     except Exception as exc:
         _stop_hold(session_id)
-        return {"status": "error", "detail": type(exc).__name__}
+        return {"status": "error", "detail": f"{type(exc).__name__}: {str(exc)[:180]}"}

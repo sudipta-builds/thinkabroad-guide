@@ -868,6 +868,11 @@ class SellerChoiceAndProxy(unittest.TestCase):
 
         self.assertTrue(ixigo_verify_in_progress("Please wait while we verify your details."))
         self.assertFalse(ixigo_verify_in_progress("Verify Your Mobile Number Enter the OTP"))
+        # Homepage "Login/SignUp" is logged out — do not treat "My Trips" alone as signed in.
+        from app.kernel_otp import _HOLDS, _stop_hold
+
+        self.assertNotIn("missing", _HOLDS)
+        _stop_hold("missing")
 
         point = verify_fallback([{"x": 800, "y": 360}, {"x": 900, "y": 360}])
         self.assertEqual(point["x"], 850)

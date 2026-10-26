@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from typing import Any
 
 from app.config import get_settings
@@ -22,6 +23,10 @@ from app.page_agent import (
 from app.search import ixigo_results_url
 
 KERNEL_SELLERS = {"ixigo", "cleartrip"}
+# Keep a CDP client attached while WhatsApp waits for the OTP. Kernel idles the
+# browser ~60s after the last disconnect, and that kills the Ixigo session path.
+_HOLDS: dict[str, dict[str, Any]] = {}
+_HOLD_LOCK = threading.Lock()
 
 
 def kernel_configured() -> bool:
@@ -218,13 +223,30 @@ def _otp_visible(page, seller: str) -> bool:
 
 
 def _logged_in(page, seller: str) -> bool:
-    text, _url = _read(page)
+    text, url = _read(page)
     if seller == "ixigo":
         if ixigo_auth_session_ready(page):
             return True
-        return bool(re.search(r"log\s*out|view profile|my profile", text or "", re.I))
+        if re.search(r"loginVisible=true", url or "", re.I):
+            return False
+        if re.search(r"log\s*in\s*/?\s*sign\s*up|login/signup", text or "", re.I):
+            return False
+        return bool(re.search(r"\blog\s*out\b|view profile|my profile|ixigoer", text or "", re.I))
     low = (text or "").lower()
     return "my account" in low and not re.search(r"enter otp|enter mobile number", low)
+
+
+def _reload_booking_without_login_visible(page) -> None:
+    try:
+        cur = str(page.url or "")
+        if "loginVisible=true" not in cur:
+            return
+        cleaned = re.sub(r"([?&])loginVisible=true&?", r"\1", cur)
+        cleaned = cleaned.replace("?&", "?").rstrip("?&")
+        page.goto(cleaned or cur, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(2500)
+    except Exception:
+        pass
 
 
 def _open_browser(client, profile: str):
@@ -242,10 +264,58 @@ def _open_browser(client, profile: str):
 
 
 def _drop(client, session_id: str) -> None:
+    _stop_hold(session_id)
     try:
         client.browsers.delete_by_id(session_id)
     except Exception:
         pass
+
+
+def _start_hold(session_id: str, cdp_ws_url: str) -> None:
+    """Hold a Playwright CDP socket open until the traveller replies with the code."""
+    _stop_hold(session_id)
+    stop = threading.Event()
+    ready = threading.Event()
+
+    def _run() -> None:
+        try:
+            from playwright.sync_api import sync_playwright
+
+            with sync_playwright() as p:
+                browser = p.chromium.connect_over_cdp(cdp_ws_url)
+                ready.set()
+                while not stop.wait(12):
+                    try:
+                        contexts = browser.contexts
+                        if contexts and contexts[0].pages:
+                            _ = contexts[0].pages[0].url
+                    except Exception:
+                        break
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+        except Exception:
+            ready.set()
+
+    thread = threading.Thread(target=_run, name=f"kernel-hold-{session_id[:8]}", daemon=True)
+    with _HOLD_LOCK:
+        _HOLDS[session_id] = {"stop": stop, "thread": thread}
+    thread.start()
+    ready.wait(timeout=25)
+
+
+def _stop_hold(session_id: str) -> None:
+    with _HOLD_LOCK:
+        hold = _HOLDS.pop(session_id, None)
+    if not hold:
+        return
+    stop = hold.get("stop")
+    thread = hold.get("thread")
+    if stop is not None:
+        stop.set()
+    if thread is not None:
+        thread.join(timeout=8)
 
 
 def begin_login(
@@ -349,6 +419,7 @@ def begin_login(
                     shot = str(dest)
                 except Exception:
                     shot = ""
+                _start_hold(sid, browser.cdp_ws_url)
             try:
                 pw.close()
             except Exception:
@@ -387,57 +458,11 @@ def _otp_page(context, seller: str):
 
 
 def _press_verify(client, session_id: str, page, boxes: list[dict[str, Any]]) -> bool:
-    """Press the orange Verify bar. Digits already land; this button was the miss."""
-    anchor = verify_fallback(boxes)
-    hit = page.evaluate(
-        """(anchor) => {
-          const label = (el) => (el.innerText || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
-          const nodes = [...document.querySelectorAll('button,[role=button],div,a')];
-          const hits = nodes.filter(el => {
-            const r = el.getBoundingClientRect();
-            const s = getComputedStyle(el);
-            if (r.width < 80 || r.height < 24) return false;
-            if (s.visibility === 'hidden' || s.display === 'none') return false;
-            return /^verify$/i.test(label(el));
-          });
-          hits.sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width);
-          const el = hits[0];
-          if (!el) return null;
-          el.scrollIntoView({block: 'center', inline: 'center'});
-          const r = el.getBoundingClientRect();
-          el.click();
-          return {x: r.x + r.width / 2, y: r.y + r.height / 2, t: 'verify', w: r.width};
-        }""",
-        anchor,
-    )
-    point = hit or anchor
-    if not point:
+    """One OS mouse click on Verify — same path as the working Kernel PoC."""
+    hit = _find(page, "verify", "ixigo") or verify_fallback(boxes)
+    if not hit:
         return False
-    _click(client, session_id, page, point)
-    # OTP boxes can fill from one focused box. Verify only lands if this point is the bar,
-    # so also try the raw viewport pixel in case the scaled point sits low.
-    try:
-        client.browsers.computer.click_mouse(
-            session_id,
-            x=int(point["x"]),
-            y=int(point["y"]),
-            button="left",
-            num_clicks=1,
-        )
-    except Exception:
-        pass
-    try:
-        page.mouse.click(float(point["x"]), float(point["y"]))
-    except Exception:
-        pass
-    try:
-        page.get_by_text(re.compile(r"^\s*Verify\s*$")).click(timeout=2500, force=True)
-    except Exception:
-        pass
-    try:
-        client.browsers.computer.press_key(session_id, keys=["Return"])
-    except Exception:
-        pass
+    _click(client, session_id, page, hit)
     return True
 
 
@@ -466,6 +491,7 @@ def submit_otp(*, session_id: str, seller: str, code: str) -> dict[str, str]:
         need = "4" if seller == "cleartrip" else "6"
         return {"status": "bad_code", "detail": f"{seller} needs {need} digits. Reply with only those digits."}
     client = _client()
+    _stop_hold(session_id)
     try:
         browser = client.browsers.retrieve(session_id)
     except Exception:
@@ -493,20 +519,21 @@ def submit_otp(*, session_id: str, seller: str, code: str) -> dict[str, str]:
             existing = "".join(str(box.get("v") or "") for box in boxes)
             if existing != digits:
                 _type_otp(client, session_id, page, seller, digits)
+            page.wait_for_timeout(500)
             if seller == "ixigo":
                 fresh = _find(page, "otp", seller) or boxes
                 _press_verify(client, session_id, page, fresh)
             logged = False
             still = False
             verifying = False
-            presses = 0
-            for attempt in range(40):
+            for attempt in range(30):
                 page.wait_for_timeout(800)
                 try:
                     if page.is_closed():
                         page = _latest(page)
                 except Exception:
                     page = _latest(page)
+                page = _latest(page)
                 text, _url = _read(page)
                 if seller == "ixigo" and ixigo_verify_in_progress(text):
                     verifying = True
@@ -517,30 +544,33 @@ def submit_otp(*, session_id: str, seller: str, code: str) -> dict[str, str]:
                     break
                 if _otp_visible(page, seller):
                     still = True
-                    if seller == "ixigo" and not verifying and presses < 2 and attempt in {3, 8}:
-                        fresh = _find(page, "otp", seller) or boxes
-                        _press_verify(client, session_id, page, fresh)
-                        presses += 1
                     continue
                 still = False
                 if verifying:
                     break
-            if verifying and not logged:
-                for _ in range(20):
-                    text, _url = _read(page)
-                    if not ixigo_verify_in_progress(text):
+            if seller == "ixigo" and not logged:
+                _reload_booking_without_login_visible(page)
+                page = _latest(page)
+                for _ in range(12):
+                    if _logged_in(page, seller):
+                        logged = True
                         break
-                    page.wait_for_timeout(1000)
+                    text, _url = _read(page)
+                    if ixigo_verify_in_progress(text):
+                        verifying = True
+                        page.wait_for_timeout(800)
+                        continue
+                    if _otp_visible(page, seller):
+                        still = True
+                        break
+                    page.wait_for_timeout(800)
+            if seller == "ixigo" and logged:
+                try:
+                    page.goto("https://www.ixigo.com/", wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(2500)
+                except Exception:
+                    pass
                 logged = _logged_in(page, seller)
-            if seller == "ixigo" and not logged and not still:
-                text, _url = _read(page)
-                if not ixigo_verify_in_progress(text):
-                    try:
-                        page.goto("https://www.ixigo.com/", wait_until="domcontentloaded", timeout=60000)
-                        page.wait_for_timeout(3000)
-                    except Exception:
-                        pass
-                    logged = _logged_in(page, seller)
             shot = _shot(page, seller, session_id, "otp-after")
             try:
                 pw.close()
@@ -549,13 +579,6 @@ def submit_otp(*, session_id: str, seller: str, code: str) -> dict[str, str]:
         if logged:
             _drop(client, session_id)
             return {"status": "logged_in", "seller": seller, "screenshot": shot}
-        if verifying and not logged:
-            _drop(client, session_id)
-            return {
-                "status": "no_session",
-                "detail": "Ixigo was checking that code, then the account didn't appear. Say Ixigo again for a new code.",
-                "screenshot": shot,
-            }
         if still:
             _drop(client, session_id)
             return {
@@ -566,8 +589,9 @@ def submit_otp(*, session_id: str, seller: str, code: str) -> dict[str, str]:
         _drop(client, session_id)
         return {
             "status": "no_session",
-            "detail": "The code was typed, but the site did not show a logged-in account.",
+            "detail": "Ixigo took the code, but no logged-in account appeared. Say Ixigo again for a new code.",
             "screenshot": shot,
         }
     except Exception as exc:
+        _stop_hold(session_id)
         return {"status": "error", "detail": type(exc).__name__}

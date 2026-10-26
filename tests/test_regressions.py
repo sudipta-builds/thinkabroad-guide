@@ -917,21 +917,21 @@ class SellerChoiceAndProxy(unittest.TestCase):
             viewport_click,
         )
 
-        # Window was 16,97 off the origin. Adding that offset missed the phone field.
+        # Kernel accepted the CSS center. Screen offset, chrome, and dpr must not move it.
         self.assertEqual(
             viewport_click(
                 {
-                    "outerH": 670,
+                    "outerH": 800,
                     "innerH": 670,
-                    "outerW": 1247,
+                    "outerW": 1400,
                     "innerW": 1247,
                     "screenX": 16,
                     "screenY": 97,
-                    "dpr": 1,
+                    "dpr": 2,
                 },
-                {"x": 1091, "y": 308},
+                {"x": 900, "y": 367},
             ),
-            (1091, 308),
+            (900, 367),
         )
         self.assertIn("on_code_requested", inspect.signature(begin_login).parameters)
 

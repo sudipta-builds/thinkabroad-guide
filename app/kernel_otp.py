@@ -96,14 +96,14 @@ def handoff_whatsapp_otp(state: dict[str, Any], text: str) -> bool:
 
 
 def viewport_click(metrics: dict[str, float], box: dict[str, Any]) -> tuple[int, int]:
-    """Kernel mouse point. Viewport CSS only — screenX/screenY clicks below the field."""
-    chrome_top = max(0, float(metrics["outerH"]) - float(metrics["innerH"]))
-    chrome_left = max(0, (float(metrics["outerW"]) - float(metrics["innerW"])) / 2)
-    dpr = float(metrics.get("dpr") or 1)
-    return (
-        int((chrome_left + float(box["x"])) * dpr),
-        int((chrome_top + float(box["y"])) * dpr),
-    )
+    """Kernel mouse point. The CSS center of the element.
+
+    The local login landed when the click equalled that center. Scaling by
+    devicePixelRatio or the window chrome offset misses the small OTP boxes
+    while still hitting the wide mobile field.
+    """
+    del metrics
+    return (int(float(box["x"])), int(float(box["y"])))
 
 
 def otp_failure_detail(*, boxes_open: bool, verifying: bool = False) -> str:
@@ -249,39 +249,25 @@ def _find(page, kind: str, seller: str):
           }
           if (kind === 'otp') {
             const inputs = [...document.querySelectorAll('input')].filter(vis);
+            const need = seller === 'cleartrip' ? 4 : 6;
             let boxes = inputs.filter(i => {
               const r = i.getBoundingClientRect();
               const ml = i.getAttribute('maxlength');
-              const small = r.width >= 16 && r.width < 80 && r.height >= 16 && r.height < 80;
               if (seller === 'cleartrip') return r.width > 40 && r.width < 70 && r.height > 40 && r.height < 70;
-              return small && (ml === '1' || /otp|one-time|numeric/i.test((i.getAttribute('inputmode')||'')+(i.autocomplete||'')+(i.name||'')+(i.id||'')));
+              return ml === '1' && r.width >= 16 && r.width < 90 && r.height >= 16 && r.height < 90;
             });
-            boxes.sort((a,b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x || a.getBoundingClientRect().y - b.getBoundingClientRect().y);
-            const row = [];
-            for (const el of boxes) {
-              const r = el.getBoundingClientRect();
-              const prev = row.length ? row[row.length - 1].getBoundingClientRect() : null;
-              if (prev && (Math.abs(r.y - prev.y) > 24 || r.x - prev.x > 90)) {
-                if (row.length >= (seller === 'cleartrip' ? 4 : 6)) break;
-                row.length = 0;
-              }
-              row.push(el);
-              if (row.length === (seller === 'cleartrip' ? 4 : 6)) break;
-            }
-            const picked = row.length ? row : boxes.slice(0, seller === 'cleartrip' ? 4 : 6);
-            return picked.length ? picked.map(el => {
+            boxes.sort((a,b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x);
+            if (boxes.length > need) boxes = boxes.slice(-need);
+            return boxes.length ? boxes.map(el => {
               const b = box(el);
               b.v = (el.value || '').slice(0, 4);
               return b;
             }) : null;
           }
           if (kind === 'verify') {
-            const hits = [...document.querySelectorAll('button,[role=button],div,span,a')].filter(vis).filter(b => /^verify$/i.test(text(b)));
+            const hits = [...document.querySelectorAll('button,[role=button]')].filter(vis).filter(b => /^verify$/i.test(text(b)));
             if (!hits.length) return null;
-            hits.sort((a,b) => {
-              const ar = a.getBoundingClientRect(), br = b.getBoundingClientRect();
-              return (ar.width * ar.height) - (br.width * br.height);
-            });
+            hits.sort((a,b) => b.getBoundingClientRect().x - a.getBoundingClientRect().x);
             return box(hits[0]);
           }
           return null;

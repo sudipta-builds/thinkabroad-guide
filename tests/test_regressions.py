@@ -857,8 +857,11 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertTrue(ixigo_auth_session_signals(text, url))
 
     def test_kernel_otp_lengths_and_whatsapp_resume(self) -> None:
-        from app.kernel_otp import otp_accepted, should_resume_kernel_otp
+        from app.kernel_otp import indian_national, otp_accepted, should_resume_kernel_otp
 
+        self.assertEqual(indian_national("+91 8638586171"), "8638586171")
+        self.assertEqual(indian_national("8638586171"), "8638586171")
+        self.assertEqual(indian_national("123456789012345"), "")
         self.assertTrue(otp_accepted("ixigo", "123456"))
         self.assertFalse(otp_accepted("ixigo", "1234"))
         self.assertTrue(otp_accepted("cleartrip", "1234"))

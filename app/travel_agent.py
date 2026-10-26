@@ -8,6 +8,7 @@ import re
 import threading
 import time
 from datetime import date
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -147,7 +148,36 @@ def handle_turn(
             state["seller"] = named
     _apply_stage(state, text, kind)
     _save(phone, state)
-    from app.kernel_otp import should_resume_kernel_otp
+    from app.kernel_otp import indian_national, kernel_configured, should_resume_kernel_otp
+
+    if state.get("kernel_awaiting_phone"):
+        national = indian_national(text)
+        seller_id = str(state.get("kernel_seller") or state.get("seller") or "ixigo")
+        if national and kernel_configured() and seller_id in {"ixigo", "cleartrip"}:
+            state["login_phone"] = "+91" + national
+            state["kernel_awaiting_phone"] = False
+            state["seller"] = seller_id
+            state["preferred_seller"] = seller_id
+            state["busy_at"] = f"{time.time():.3f}"
+            _save(phone, state)
+            if message_sid:
+                remember_inbound(phone, message_sid)
+            threading.Thread(
+                target=_run_browse,
+                args=(phone, text, state.get("busy_at"), "login"),
+                name="guide-browse",
+                daemon=True,
+            ).start()
+            need = "4" if seller_id == "cleartrip" else "6"
+            reply = (
+                f"Got it. Opening {_seller_label(seller_id)} now. "
+                f"This usually takes 1–2 minutes. I'll send a screenshot of the code screen, then reply with only the {need} digits."
+            )
+            db.add_message(phone, "assistant", reply)
+            return Reply.of(reply, emoji="🔐")
+        reply = "Send just the 10-digit mobile that should get the login code. Nothing is paid."
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply, emoji="📱")
 
     if should_resume_kernel_otp(state, text):
         state["busy_at"] = f"{time.time():.3f}"
@@ -210,6 +240,25 @@ def handle_turn(
             return Reply.of(reply, emoji="⚠️")
         state["seller"] = book_seller
         state["preferred_seller"] = book_seller
+        if kernel_book:
+            from app.kernel_otp import indian_national, login_phone_for
+
+            login = login_phone_for(phone, str(state.get("login_phone") or state.get("phone") or ""))
+            if not login and indian_national(text):
+                login = "+91" + indian_national(text)
+            if not login:
+                state["kernel_awaiting_phone"] = True
+                state["kernel_seller"] = book_seller
+                state.pop("busy_at", None)
+                _save(phone, state)
+                reply = (
+                    f"Send the 10-digit mobile that should get the {_seller_label(book_seller)} login code. "
+                    "Nothing is paid."
+                )
+                db.add_message(phone, "assistant", reply)
+                return Reply.of(reply, emoji="📱")
+            state["login_phone"] = login
+            state["kernel_awaiting_phone"] = False
         state["busy_at"] = f"{time.time():.3f}"
         _save(phone, state)
         threading.Thread(
@@ -222,7 +271,7 @@ def handle_turn(
             need = "4" if book_seller == "cleartrip" else "6"
             reply = (
                 f"Opening {_seller_label(book_seller)} for {_trip_line(state) or 'Guwahati to Delhi'}. "
-                f"I'll text you when the login code is sent. Reply with only the {need} digits. Nothing is paid."
+                f"This usually takes 1–2 minutes. I'll send a screenshot of the code screen, then reply with only the {need} digits."
             )
         else:
             reply = _booking_ack(state, kind, text)
@@ -1498,6 +1547,7 @@ def _run_kernel_login(phone: str, text: str, loaded: dict[str, Any], secrets: li
     result = begin_login(
         seller=seller,
         whatsapp_phone=phone,
+        explicit=str(loaded.get("login_phone") or loaded.get("phone") or ""),
         origin=origin,
         destination=destination,
         depart=depart,
@@ -1508,14 +1558,17 @@ def _run_kernel_login(phone: str, text: str, loaded: dict[str, Any], secrets: li
         state["kernel_session_id"] = result.get("session_id")
         state["kernel_seller"] = seller
         state["kernel_awaiting_otp"] = True
+        state["kernel_awaiting_phone"] = False
         state["stage"] = "login"
         _save(phone, state)
         need = "4" if seller == "cleartrip" else "6"
+        shots = [result["screenshot"]] if result.get("screenshot") else None
         _deliver(
             phone,
-            f"{_seller_label(seller)} sent a login code to your mobile. Reply with only the {need} digits. Nothing paid.",
+            f"{_seller_label(seller)} sent a login code to your mobile. The screenshot is that screen. Reply with only the {need} digits. Nothing paid.",
             None,
             secrets,
+            shot_paths=shots,
         )
     else:
         state["kernel_awaiting_otp"] = False
@@ -2008,7 +2061,13 @@ def _assistant_message(msg: dict[str, Any]) -> dict[str, Any]:
     return {"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls}
 
 
-def _deliver(phone: str, text: str, session: BrowserSession | None, secrets: list[str]) -> None:
+def _deliver(
+    phone: str,
+    text: str,
+    session: BrowserSession | None,
+    secrets: list[str],
+    shot_paths: list[str] | None = None,
+) -> None:
     from app.reply import for_send, strip_leading_emoji
     from app.twilio_wa import inbound_sid, send_reaction, send_whatsapp
 
@@ -2022,6 +2081,11 @@ def _deliver(phone: str, text: str, session: BrowserSession | None, secrets: lis
             if public:
                 urls.append(public)
         session.unsent.clear()
+    for raw_path in shot_paths or []:
+        public = public_url_for(Path(raw_path))
+        if public:
+            urls.append(public)
+            had_shot = True
     if had_shot and not urls:
         spoken += "\nI have the live screenshot, but this server has no public URL set, so WhatsApp cannot show the image."
         logger.warning("Screenshot saved but GUIDE_PUBLIC_URL is empty")

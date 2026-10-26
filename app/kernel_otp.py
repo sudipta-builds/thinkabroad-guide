@@ -17,7 +17,6 @@ from app.page_agent import (
     _read,
     classify_page,
     ixigo_auth_session_ready,
-    parse_login_phone,
     run_checkout_agent,
 )
 from app.search import ixigo_results_url
@@ -44,15 +43,28 @@ def otp_accepted(seller: str, code: str) -> bool:
     return False
 
 
-def login_phone_for(whatsapp_phone: str) -> str:
-    raw = (whatsapp_phone or "").strip()
-    digits = re.sub(r"\D", "", raw)
-    if digits.startswith("91") and len(digits) >= 12:
-        return "+" + digits
-    if len(digits) == 10:
-        return "+91" + digits
-    fallback = (os.getenv("IXIGO_LOGIN_PHONE") or "").strip()
-    return fallback or raw
+def indian_national(value: str) -> str:
+    """10-digit Indian mobile, or empty when the text is not one.
+
+    A long WhatsApp user id is not treated as a phone.
+    """
+    compact = re.sub(r"[\s\-()]", "", value or "")
+    match = re.search(r"(?:\+91|91)?([6-9]\d{9})(?!\d)", compact)
+    if not match:
+        return ""
+    start = match.start(1)
+    prefix = compact[:start]
+    if prefix and prefix[-1].isdigit() and not prefix.endswith("91"):
+        return ""
+    return match.group(1)
+
+
+def login_phone_for(whatsapp_phone: str, explicit: str = "") -> str:
+    for candidate in (explicit, whatsapp_phone, os.getenv("IXIGO_LOGIN_PHONE") or ""):
+        national = indian_national(candidate)
+        if national:
+            return "+91" + national
+    return ""
 
 
 def _client():
@@ -205,14 +217,15 @@ def begin_login(
     destination: str = "Delhi",
     depart: str = "2026-12-04",
     hint: str = "1:15",
+    explicit: str = "",
 ) -> dict[str, str]:
     """Open the seller and request one OTP. Leaves the Kernel browser running."""
     if seller not in KERNEL_SELLERS:
         return {"status": "unsupported", "detail": seller}
-    login_phone = login_phone_for(whatsapp_phone)
-    _dial, national = parse_login_phone(login_phone)
-    if len(national) < 10:
-        return {"status": "bad_phone", "detail": "Need an Indian mobile on this WhatsApp number."}
+    login_phone = login_phone_for(whatsapp_phone, explicit)
+    national = indian_national(login_phone)
+    if len(national) != 10:
+        return {"status": "bad_phone", "detail": "Need a 10-digit Indian mobile."}
     client = _client()
     profile = _profile(seller, whatsapp_phone)
     browser = _open_browser(client, profile)
@@ -287,6 +300,16 @@ def begin_login(
                     ok = True
                     break
                 page.wait_for_timeout(400)
+            shot = ""
+            if ok:
+                try:
+                    from app.media_files import ensure_media_dir
+
+                    dest = ensure_media_dir() / f"otp-{seller}-{sid[:8]}.jpg"
+                    page.screenshot(path=str(dest), type="jpeg", quality=55)
+                    shot = str(dest)
+                except Exception:
+                    shot = ""
             try:
                 pw.close()
             except Exception:
@@ -294,7 +317,7 @@ def begin_login(
         if not ok:
             _drop(client, sid)
             return {"status": "otp_ui_miss", "detail": "OTP screen did not open. Nothing was charged."}
-        return {"status": "otp_sent", "session_id": sid, "seller": seller}
+        return {"status": "otp_sent", "session_id": sid, "seller": seller, "screenshot": shot}
     except Exception as exc:
         _drop(client, sid)
         return {"status": "error", "detail": type(exc).__name__}

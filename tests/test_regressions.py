@@ -7,6 +7,20 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from app.page_agent import (
+    card_matches_depart_hint,
+    classify_page,
+    complete_ixigo_login_after_otp,
+    deterministic_action,
+    extract_trip_facts,
+    install_ixigo_otpless_tap,
+    interpret_itinerary_create,
+    ixigo_auth_session_signals,
+    parse_action,
+    parse_login_phone,
+    run_checkout_agent,
+    verify_trip_facts,
+)
 from app.browser_hands import (
     BrowserSession,
     _alt_clock,
@@ -689,6 +703,195 @@ class SellerChoiceAndProxy(unittest.TestCase):
             os.environ.pop("BOOKING_WORKER_URL", None)
             os.environ.pop("BOOKING_WORKER_TOKEN", None)
             get_settings.cache_clear()
+
+    def test_cookie_banner_is_not_a_passenger_form(self) -> None:
+        banner = "We respect your privacy. We use cookies. Accept all cookies."
+        self.assertEqual(classify_page(banner, "https://www.goindigo.in/"), "cookie")
+
+    def test_pay_page_is_recognized(self) -> None:
+        self.assertEqual(
+            classify_page("Pay to complete your booking. Card number. UPI.", "https://www.cleartrip.com/pay"),
+            "pay",
+        )
+
+    def test_itinerary_failure_is_an_error(self) -> None:
+        self.assertEqual(
+            classify_page("Server error", "https://www.cleartrip.com/flights/results/itinerary/failure"),
+            "error",
+        )
+
+    def test_nav_book_link_is_not_a_fare_list(self) -> None:
+        text = "Book | Trips | Check-in | Up to 8 IndiGo BluChips per ₹100 spent"
+        self.assertNotEqual(classify_page(text, "https://www.goindigo.in/"), "results")
+        self.assertNotEqual(classify_page(text, "https://www.goindigo.in/"), "pay")
+
+    def test_marketing_homepage_is_not_pay(self) -> None:
+        text = "EMTMate Corporate travel program Login or Signup"
+        self.assertNotEqual(classify_page(text, "https://www.easemytrip.com/"), "pay")
+
+    def test_priced_select_buttons_are_results(self) -> None:
+        self.assertEqual(classify_page("SpiceJet 09:10 Select ₹8,190", "https://flight.easemytrip.com/"), "results")
+
+    def test_results_with_book_buttons_choose_the_time(self) -> None:
+        action = deterministic_action("results", hint="1:15", recovers=0)
+        self.assertEqual(action["action"], "click_time")
+        self.assertEqual(action["target"], "1:15")
+
+    def test_fare_sheet_clicks_continue_without_a_model(self) -> None:
+        action = deterministic_action("fare_sheet", hint="1:15", recovers=0)
+        self.assertEqual(action["action"], "click")
+        self.assertEqual(action["target"], "Continue")
+
+    def test_model_action_json_is_parsed(self) -> None:
+        parsed = parse_action('Sure\n{"action":"click","target":"Search","value":""}')
+        self.assertEqual(parsed["action"], "click")
+        self.assertEqual(parsed["target"], "Search")
+        self.assertIsNone(parse_action('{"action":"pay","target":"Pay now"}'))
+
+    def test_itinerary_create_akamai_403_is_denied(self) -> None:
+        body = "<HTML><TITLE>Access Denied</TITLE><H1>Access Denied</H1></HTML>"
+        self.assertEqual(interpret_itinerary_create(403, body), "denied")
+
+    def test_itinerary_create_200_is_ok(self) -> None:
+        self.assertEqual(interpret_itinerary_create(200, '{"itineraryId":"x"}'), "ok")
+
+    def test_itinerary_create_missing_is_unknown(self) -> None:
+        self.assertEqual(interpret_itinerary_create(None, ""), "unknown")
+
+    def test_ixigo_card_matches_departure_not_arrival(self) -> None:
+        spice = (
+            "Fastest SpiceJet SG762 12:30 GAU 2h 45m Non-stop 15:15 DEL "
+            "₹8,992 Book Lock Price @₹309"
+        )
+        # Hint 1:15 → 13:15 must not hit this card via arrival 15:15.
+        self.assertFalse(card_matches_depart_hint(spice, "1:15"))
+        ix = (
+            "Air India Express IX-1513 13:15 GAU 2h 50m Non-stop 16:05 DEL "
+            "₹9,516 Book Lock Price @₹349"
+        )
+        self.assertTrue(card_matches_depart_hint(ix, "1:15"))
+        # Duplicate Book on one Ixigo card still matches by first clock.
+        dup = ix + " Fare Type Regular Fare ₹9,516 Book Lock Price @₹349"
+        self.assertTrue(card_matches_depart_hint(dup, "1:15"))
+
+    def test_ixigo_review_page_is_review_not_bare_other(self) -> None:
+        text = (
+            "Flight Selection 2 Review & Traveller Details 3 Add-ons 4 Payment "
+            "Fare Summary Total Amount ₹9,116 "
+            "Air-India Express | IX 1513 13:15 GAU 16:05 DEL VALUE "
+            "Add Free Cancellation to your trip Continue"
+        )
+        self.assertEqual(classify_page(text, "https://www.ixigo.com/flight/booking/1"), "review")
+        self.assertNotEqual(classify_page(text, "https://www.ixigo.com/flight/booking/1"), "addons")
+
+    def test_ixigo_login_modal_is_login(self) -> None:
+        text = "Log in to ixigo Enter Mobile Number Continue Sign in with Google"
+        self.assertEqual(
+            classify_page(text, "https://www.ixigo.com/flight/booking/1?loginVisible=true"),
+            "login",
+        )
+
+    def test_otp_page_stops_without_paying(self) -> None:
+        self.assertEqual(classify_page("Enter OTP OTP sent to your mobile Resend OTP", "https://www.ixigo.com/"), "otp")
+        self.assertEqual(
+            classify_page(
+                "Verify Your Mobile Number Enter the OTP received via SMS on +91 9876543210 Resend in 52 Sec Verify",
+                "https://www.ixigo.com/flight/booking/1",
+            ),
+            "otp",
+        )
+        action = deterministic_action("otp", hint="1:15", recovers=0)
+        self.assertEqual(action["action"], "done")
+
+    def test_trip_facts_from_ixigo_review(self) -> None:
+        text = (
+            "Fare Summary Total Amount ₹9,116 Guwahati New Delhi "
+            "Air-India Express | IX 1513\n13:15\nGAU - Guwahati\n16:05\nDEL - New Delhi VALUE"
+        )
+        facts = extract_trip_facts(text, "https://www.ixigo.com/flight/booking/x?fareKey=GAU-DEL-IX1513")
+        self.assertEqual(facts["flight"], "IX1513")
+        self.assertEqual(facts["depart_time"], "13:15")
+        self.assertEqual(facts["origin"], "GAU")
+        self.assertEqual(facts["destination"], "DEL")
+        self.assertEqual(facts["total"], "₹9116")
+        ok, problems = verify_trip_facts(facts, expect_hint="1:15", expect_origin="GAU", expect_dest="DEL", expect_flight="IX1513")
+        self.assertTrue(ok, problems)
+        bad, problems = verify_trip_facts(facts, expect_flight="6E2179")
+        self.assertFalse(bad)
+        self.assertTrue(problems)
+
+    def test_review_continues_and_pay_is_done_only(self) -> None:
+        self.assertEqual(deterministic_action("review", hint="1:15", recovers=0)["action"], "review_continue")
+        self.assertEqual(deterministic_action("pay", hint="1:15", recovers=0)["action"], "done")
+
+    def test_parse_login_phone_france_and_india(self) -> None:
+        self.assertEqual(parse_login_phone("+33759341005"), ("33", "759341005"))
+        self.assertEqual(parse_login_phone("+919876543210"), ("91", "9876543210"))
+        self.assertEqual(parse_login_phone("9876543210"), ("91", "9876543210"))
+
+    def test_otpless_handoff_helpers_exported(self) -> None:
+        from app.page_agent import install_ixigo_otpless_callback_bridge
+
+        self.assertTrue(callable(install_ixigo_otpless_tap))
+        self.assertTrue(callable(complete_ixigo_login_after_otp))
+        self.assertTrue(callable(install_ixigo_otpless_callback_bridge))
+
+    def test_ixigo_auth_session_signals_reject_otp_and_login(self) -> None:
+        self.assertFalse(
+            ixigo_auth_session_signals(
+                "Enter OTP OTP sent to your mobile",
+                "https://www.ixigo.com/flight/booking/1?loginVisible=true",
+            )
+        )
+        self.assertFalse(
+            ixigo_auth_session_signals(
+                "Log in to ixigo Enter Mobile Number Continue",
+                "https://www.ixigo.com/flight/booking/1?loginVisible=true",
+            )
+        )
+
+    def test_ixigo_auth_session_signals_accept_passenger(self) -> None:
+        text = "Primary passenger First name Last name Date of birth Gender Continue"
+        url = "https://www.ixigo.com/flight/booking/1"
+        self.assertEqual(classify_page(text, url), "passenger")
+        self.assertTrue(ixigo_auth_session_signals(text, url))
+
+    def test_kernel_otp_lengths_and_whatsapp_resume(self) -> None:
+        from app.kernel_otp import otp_accepted, should_resume_kernel_otp
+
+        self.assertTrue(otp_accepted("ixigo", "123456"))
+        self.assertFalse(otp_accepted("ixigo", "1234"))
+        self.assertTrue(otp_accepted("cleartrip", "1234"))
+        self.assertFalse(otp_accepted("cleartrip", "123456"))
+        waiting = {"kernel_awaiting_otp": True, "kernel_session_id": "sess"}
+        self.assertTrue(should_resume_kernel_otp(waiting, "529779"))
+        self.assertFalse(should_resume_kernel_otp(waiting, "book the 1:15"))
+        self.assertFalse(should_resume_kernel_otp({}, "529779"))
+
+    def test_pause_on_auth_stops_without_login_phone(self) -> None:
+        class _FakePage:
+            url = "https://www.ixigo.com/flight/booking/1?loginVisible=true"
+            context = type("C", (), {"pages": []})()
+
+            def inner_text(self, _sel, timeout=8000):
+                return "Log in to ixigo Enter Mobile Number Continue Sign in with Google"
+
+            def evaluate(self, *_a, **_k):
+                return 0
+
+        out = run_checkout_agent(
+            _FakePage(),
+            hint="1:15",
+            seller="ixigo",
+            origin="Guwahati",
+            destination="Delhi",
+            depart="2026-12-04",
+            allow_pay=False,
+            pause_on_auth=True,
+            max_steps=3,
+        )
+        self.assertEqual(out.stage, "auth_required")
+        self.assertTrue(any("auth_pause" in x for x in out.log))
 
 
 if __name__ == "__main__":

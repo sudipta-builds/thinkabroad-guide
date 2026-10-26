@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     booking_worker_url: str = Field(default="", validation_alias=AliasChoices("BOOKING_WORKER_URL"))
     booking_worker_token: str = Field(default="", validation_alias=AliasChoices("BOOKING_WORKER_TOKEN"))
 
+    # Kernel cloud browser for Ixigo and Cleartrip WhatsApp OTP login.
+    kernel_api_key: str = Field(default="", validation_alias=AliasChoices("KERNEL_API_KEY"))
+
     @property
     def twilio_ready(self) -> bool:
         return bool(self.twilio_account_sid and self.twilio_auth_token and self.twilio_whatsapp_from)
@@ -103,6 +106,10 @@ class Settings(BaseSettings):
     @property
     def booking_worker_ready(self) -> bool:
         return bool(self.booking_worker_url.strip() and self.booking_worker_token.strip())
+
+    @property
+    def kernel_ready(self) -> bool:
+        return bool(self.kernel_api_key.strip())
 
 
 @lru_cache

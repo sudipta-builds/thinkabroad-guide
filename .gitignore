@@ -22,6 +22,8 @@ data/*.db
 data/*.sqlite
 data/*.sqlite3
 data/media/
+data/diagnostics/
 *.log
 .playwright/
+scripts/.bb_context
 node_modules/

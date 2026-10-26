@@ -147,6 +147,23 @@ def handle_turn(
             state["seller"] = named
     _apply_stage(state, text, kind)
     _save(phone, state)
+    from app.kernel_otp import should_resume_kernel_otp
+
+    if should_resume_kernel_otp(state, text):
+        state["busy_at"] = f"{time.time():.3f}"
+        state["stage"] = "login"
+        _save(phone, state)
+        if message_sid:
+            remember_inbound(phone, message_sid)
+        threading.Thread(
+            target=_run_kernel_otp_submit,
+            args=(phone, text.strip(), state.get("busy_at")),
+            name="guide-kernel-otp",
+            daemon=True,
+        ).start()
+        reply = "Typing that code into the login now."
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply, emoji="🔐")
     if not get_settings().llm_ready:
         reply = saved_secret or "DeepSeek isn't configured on the server, so I can't look or book yet."
         db.add_message(phone, "assistant", reply)
@@ -183,11 +200,14 @@ def handle_turn(
         db.add_message(phone, "assistant", cached)
         return Reply.of(cached, emoji="✈️")
     if kind in _BOOKING and _should_browse(state, text, busy=busy, changed=changed):
-        if not chromium_ready():
+        from app.kernel_otp import kernel_configured
+
+        book_seller = _booking_seller_id(state, text)
+        kernel_book = kernel_configured() and book_seller in {"ixigo", "cleartrip"}
+        if not chromium_ready() and not kernel_book:
             reply = "Chromium isn't installed on the server yet, so I can't open the booking page."
             db.add_message(phone, "assistant", reply)
             return Reply.of(reply, emoji="⚠️")
-        book_seller = _booking_seller_id(state, text)
         state["seller"] = book_seller
         state["preferred_seller"] = book_seller
         state["busy_at"] = f"{time.time():.3f}"
@@ -198,7 +218,14 @@ def handle_turn(
             name="guide-browse",
             daemon=True,
         ).start()
-        reply = _booking_ack(state, kind, text)
+        if kernel_book:
+            need = "4" if book_seller == "cleartrip" else "6"
+            reply = (
+                f"Opening {_seller_label(book_seller)} for {_trip_line(state) or 'Guwahati to Delhi'}. "
+                f"I'll text you when the login code is sent. Reply with only the {need} digits. Nothing is paid."
+            )
+        else:
+            reply = _booking_ack(state, kind, text)
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="✈️")
     if _should_browse(state, text, busy=busy, changed=changed) and _direct_results(state, text) and chromium_ready():
@@ -1290,10 +1317,36 @@ def _book_on_seller(
     saved = _load(phone)
     saved["seller"] = seller_id
     _save(phone, saved)
-    sheet = session.click_book(hint)
+    if session.page is None:
+        _deliver(
+            phone,
+            f"{seller['label']} didn't open a bookable fare for {_trip_line(state) or 'that trip'}. Nothing paid.",
+            session,
+            secrets,
+        )
+        return ""
+    from app.page_agent import run_checkout_agent
+
+    outcome = run_checkout_agent(
+        session.page,
+        hint=hint,
+        seller=seller["label"],
+        origin=origin,
+        destination=destination,
+        depart=depart,
+    )
     if _stale(phone, started_at):
         return ""
-    if sheet.startswith("Could not"):
+    logger.info("Checkout agent %s %s", outcome.stage, " | ".join(outcome.log))
+    if outcome.stage == "wrong_flight":
+        _deliver(
+            phone,
+            f"I did not click {hint}. The fare sheet on screen is a different flight, so I stopped before Continue. Nothing paid.",
+            session,
+            secrets,
+        )
+        return ""
+    if outcome.stage == "results":
         _deliver(
             phone,
             f"The results page didn't finish painting a Book button for {hint or 'that time'}. Nothing paid. "
@@ -1302,30 +1355,8 @@ def _book_on_seller(
             secrets,
         )
         return ""
-    from app.browser_hands import time_in_card
-
-    if hint and not time_in_card(sheet, hint):
-        _deliver(
-            phone,
-            f"I did not click {hint}. The fare sheet on screen is a different flight, so I stopped before Continue. Nothing paid.",
-            session,
-            secrets,
-        )
-        return ""
-    _note_live(phone, sheet)
-    # Don't abort on a flash Connection lost here — click_continue → settle_checkout waits / retries.
-    moved = session.click_continue()
-    if _stale(phone, started_at):
-        return ""
-    _note_live(phone, moved)
     _fill_what_we_can(phone, session, secrets)
-    if "Review your itinerary" in moved and not re.search(r"\bemail\b|mobile number|date of birth|pay now|\bupi\b", moved, re.I):
-        further = session.click_continue()
-        if not _stale(phone, started_at):
-            moved = further
-            _note_live(phone, moved)
-            _fill_what_we_can(phone, session, secrets)
-    page = session.read_page()
+    page = session.read_page() or outcome.text
     _note_live(phone, page)
     _deliver(phone, _booking_page_reply(_load(phone), hint, page, session), session, secrets)
     return ""
@@ -1449,6 +1480,85 @@ def _open_booking(phone: str, text: str, session: BrowserSession, secrets: list[
     return _book_on_seller(phone, text, session, secrets, started_at)
 
 
+def _kernel_trip(state: dict[str, Any]) -> tuple[str, str, str, str]:
+    origin = str(state.get("origin") or "Guwahati")
+    destination = str(state.get("destination") or "Delhi")
+    depart = str(state.get("depart") or "2026-12-04")[:10]
+    hint = str(state.get("selected_hint") or "1:15")
+    return origin, destination, depart, hint
+
+
+def _run_kernel_login(phone: str, text: str, loaded: dict[str, Any], secrets: list[str], started_at: float | None) -> None:
+    from app.kernel_otp import begin_login
+
+    seller = str(loaded.get("seller") or loaded.get("preferred_seller") or "cleartrip")
+    if seller not in {"ixigo", "cleartrip"}:
+        seller = "cleartrip"
+    origin, destination, depart, hint = _kernel_trip(loaded)
+    result = begin_login(
+        seller=seller,
+        whatsapp_phone=phone,
+        origin=origin,
+        destination=destination,
+        depart=depart,
+        hint=hint,
+    )
+    state = _load(phone)
+    if result.get("status") == "otp_sent":
+        state["kernel_session_id"] = result.get("session_id")
+        state["kernel_seller"] = seller
+        state["kernel_awaiting_otp"] = True
+        state["stage"] = "login"
+        _save(phone, state)
+        need = "4" if seller == "cleartrip" else "6"
+        _deliver(
+            phone,
+            f"{_seller_label(seller)} sent a login code to your mobile. Reply with only the {need} digits. Nothing paid.",
+            None,
+            secrets,
+        )
+    else:
+        state["kernel_awaiting_otp"] = False
+        state.pop("kernel_session_id", None)
+        _save(phone, state)
+        detail = str(result.get("detail") or result.get("status") or "login didn't open")
+        _deliver(
+            phone,
+            f"I couldn't open {_seller_label(seller)} login ({detail}). Nothing paid.",
+            None,
+            secrets,
+        )
+    _clear_busy(phone, started_at)
+
+
+def _run_kernel_otp_submit(phone: str, code: str, started_at: float | None) -> None:
+    from app.kernel_otp import submit_otp
+
+    state = _load(phone)
+    seller = str(state.get("kernel_seller") or "ixigo")
+    session_id = str(state.get("kernel_session_id") or "")
+    result = submit_otp(session_id=session_id, seller=seller, code=code)
+    state = _load(phone)
+    status = str(result.get("status") or "")
+    if status == "logged_in":
+        state["kernel_awaiting_otp"] = False
+        state.pop("kernel_session_id", None)
+        state["kernel_logged_in"] = seller
+        state["stage"] = "booking"
+        spoken = f"You're logged in on {_seller_label(seller)}. Nothing paid."
+    elif status == "bad_code":
+        state["kernel_awaiting_otp"] = True
+        state["kernel_session_id"] = session_id
+        spoken = str(result.get("detail") or "Reply with the code only.")
+    else:
+        state["kernel_awaiting_otp"] = False
+        state.pop("kernel_session_id", None)
+        spoken = str(result.get("detail") or "Login didn't finish. Nothing paid.")
+    _save(phone, state)
+    _deliver(phone, spoken, None, [code])
+    _clear_busy(phone, started_at)
+
+
 def _run_booking_on_worker(
     phone: str,
     text: str,
@@ -1517,6 +1627,12 @@ def _run_browse(phone: str, text: str, started_at: float | None = None, kind: st
             loaded = _load(phone)
             direct = _browse_is_search(kind, loaded, text)
             settings = get_settings()
+            from app.kernel_otp import kernel_configured
+
+            seller_id = str(loaded.get("seller") or loaded.get("preferred_seller") or "")
+            if not direct and kernel_configured() and seller_id in {"ixigo", "cleartrip"}:
+                _run_kernel_login(phone, text, loaded, secrets, started_at)
+                return
             # Booking uses the residential proxy in production. Search stays direct unless PROXY_SEARCH=1.
             use_proxy = bool(settings.proxy_ready and (not direct or settings.proxy_search))
             headed = not direct and not use_proxy

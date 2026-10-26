@@ -31,6 +31,8 @@ services:
         sync: false
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: /opt/render/project/src/.playwright
+      - key: KERNEL_API_KEY
+        sync: false
     disk:
       name: guide-data
       mountPath: /var/data

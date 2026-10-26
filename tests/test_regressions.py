@@ -862,9 +862,13 @@ class SellerChoiceAndProxy(unittest.TestCase):
             ixigo_verify_in_progress,
             keep_kernel_otp_session,
             otp_accepted,
+            otp_failure_detail,
             should_resume_kernel_otp,
             verify_fallback,
         )
+
+        self.assertIn("in the boxes", otp_failure_detail(boxes_open=True))
+        self.assertIn("Log in", otp_failure_detail(boxes_open=False))
 
         self.assertTrue(ixigo_verify_in_progress("Please wait while we verify your details."))
         self.assertFalse(ixigo_verify_in_progress("Verify Your Mobile Number Enter the OTP"))

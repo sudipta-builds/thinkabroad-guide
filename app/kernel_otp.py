@@ -39,6 +39,12 @@ def should_resume_kernel_otp(state: dict[str, Any], text: str) -> bool:
     return bool(re.fullmatch(r"\d{4,8}", (text or "").strip()))
 
 
+def otp_failure_detail(*, boxes_open: bool) -> str:
+    if boxes_open:
+        return "The code is in the boxes, but Verify did not submit. Say Ixigo again for a new code."
+    return "The code screen closed, but Ixigo still shows Log in. Say Ixigo again for a new code."
+
+
 def keep_kernel_otp_session(status: str) -> bool:
     """The login page is still waiting, so the same Kernel browser should stay up."""
     return status in {"bad_code", "still_otp"}
@@ -205,6 +211,12 @@ def _find(page, kind: str, seller: str):
         }""",
         {"kind": kind, "seller": seller},
     )
+
+
+def _code_boxes_open(page, seller: str) -> bool:
+    found = _find(page, "otp", seller) or []
+    need = 4 if seller == "cleartrip" else 6
+    return len(found) >= need
 
 
 def ixigo_verify_in_progress(text: str) -> bool:
@@ -542,28 +554,19 @@ def submit_otp(*, session_id: str, seller: str, code: str) -> dict[str, str]:
                 if _logged_in(page, seller):
                     logged = True
                     break
-                if _otp_visible(page, seller):
+                if _code_boxes_open(page, seller):
                     still = True
                     continue
                 still = False
                 if verifying:
                     break
-            if seller == "ixigo" and not logged:
-                _reload_booking_without_login_visible(page)
-                page = _latest(page)
-                for _ in range(12):
-                    if _logged_in(page, seller):
-                        logged = True
-                        break
-                    text, _url = _read(page)
-                    if ixigo_verify_in_progress(text):
-                        verifying = True
-                        page.wait_for_timeout(800)
-                        continue
-                    if _otp_visible(page, seller):
-                        still = True
-                        break
-                    page.wait_for_timeout(800)
+            if seller == "ixigo" and not logged and not _code_boxes_open(page, seller):
+                try:
+                    page.goto("https://www.ixigo.com/", wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(2500)
+                except Exception:
+                    pass
+                logged = _logged_in(page, seller)
             if seller == "ixigo" and logged:
                 try:
                     page.goto("https://www.ixigo.com/", wait_until="domcontentloaded", timeout=60000)
@@ -579,17 +582,10 @@ def submit_otp(*, session_id: str, seller: str, code: str) -> dict[str, str]:
         if logged:
             _drop(client, session_id)
             return {"status": "logged_in", "seller": seller, "screenshot": shot}
-        if still:
-            _drop(client, session_id)
-            return {
-                "status": "no_session",
-                "detail": "The code is in the boxes, but Verify did not submit. Say Ixigo again for a new code.",
-                "screenshot": shot,
-            }
         _drop(client, session_id)
         return {
             "status": "no_session",
-            "detail": "Ixigo took the code, but no logged-in account appeared. Say Ixigo again for a new code.",
+            "detail": otp_failure_detail(boxes_open=still),
             "screenshot": shot,
         }
     except Exception as exc:

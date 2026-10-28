@@ -250,22 +250,28 @@ def handle_turn(
         if kernel_book:
             from app.kernel_otp import indian_national, login_phone_for
 
-            login = login_phone_for(phone, str(state.get("login_phone") or state.get("phone") or ""))
-            if not login and indian_national(text):
-                login = "+91" + indian_national(text)
-            if not login:
-                state["kernel_awaiting_phone"] = True
-                state["kernel_seller"] = book_seller
-                state.pop("busy_at", None)
-                _save(phone, state)
-                reply = (
-                    f"Send the 10-digit mobile that should get the {_seller_label(book_seller)} login code. "
-                    "Nothing is paid."
-                )
-                db.add_message(phone, "assistant", reply)
-                return Reply.of(reply, emoji="📱")
-            state["login_phone"] = login
-            state["kernel_awaiting_phone"] = False
+            chosen = str(state.get("selected_hint") or "").strip()
+            signed_in = str(state.get("kernel_logged_in") or "") == book_seller
+            # Fares are public. Ask for a mobile only when a chosen flight needs a login code.
+            if chosen and not signed_in:
+                login = login_phone_for(phone, str(state.get("login_phone") or state.get("phone") or ""))
+                if not login and indian_national(text):
+                    login = "+91" + indian_national(text)
+                if not login:
+                    state["kernel_awaiting_phone"] = True
+                    state["kernel_seller"] = book_seller
+                    state.pop("busy_at", None)
+                    _save(phone, state)
+                    reply = (
+                        f"Send the 10-digit mobile that should get the {_seller_label(book_seller)} login code. "
+                        "Nothing is paid."
+                    )
+                    db.add_message(phone, "assistant", reply)
+                    return Reply.of(reply, emoji="📱")
+                state["login_phone"] = login
+                state["kernel_awaiting_phone"] = False
+            else:
+                state["kernel_awaiting_phone"] = False
         state["busy_at"] = f"{time.time():.3f}"
         _save(phone, state)
         threading.Thread(
@@ -276,10 +282,20 @@ def handle_turn(
         ).start()
         if kernel_book:
             need = "4" if book_seller == "cleartrip" else "6"
-            reply = (
-                f"Opening {_seller_label(book_seller)} for {_trip_line(state) or 'Guwahati to Delhi'}. "
-                f"This usually takes 1–2 minutes. I'll send a screenshot of the code screen, then reply with only the {need} digits."
-            )
+            chosen = str(state.get("selected_hint") or "").strip()
+            signed_in = str(state.get("kernel_logged_in") or "") == book_seller
+            trip = _spoken_trip(state)
+            if chosen and signed_in:
+                reply = f"Opening the {chosen} on {_seller_label(book_seller)}. I'll stop before payment."
+            elif chosen:
+                reply = (
+                    f"Opening the {chosen} on {_seller_label(book_seller)}. "
+                    f"If you're signed out, reply with the {need}-digit code. I'll stop before payment."
+                )
+            elif signed_in:
+                reply = f"You're already logged in on {_seller_label(book_seller)}. Checking {trip}."
+            else:
+                reply = f"Checking {_seller_label(book_seller)} for {trip}."
         else:
             reply = _booking_ack(state, kind, text)
         db.add_message(phone, "assistant", reply)
@@ -542,6 +558,8 @@ def _booking_seller_id(state: dict[str, Any], text: str = "") -> str:
     named = named_seller_from(text)
     if named and named not in NOT_BOOKABLE:
         return named
+    if str(state.get("seller") or "") == "ixigo" and str(state.get("kernel_logged_in") or "") == "ixigo":
+        return "ixigo"
     if _flight_hint(text):
         return "cleartrip"
     preferred = str(state.get("preferred_seller") or state.get("seller") or "cleartrip")
@@ -766,6 +784,24 @@ def _trip_line(state: dict[str, Any]) -> str:
     if until and until != state.get("depart"):
         return f"{origin} to {destination}, {state['depart']} through {until}"
     return f"{origin} to {destination} on {state['depart']}"
+
+
+def _spoken_date(iso: str) -> str:
+    from datetime import date
+
+    try:
+        when = date.fromisoformat(str(iso)[:10])
+    except ValueError:
+        return str(iso or "")
+    return f"{when.day} {when.strftime('%B')}"
+
+
+def _spoken_trip(state: dict[str, Any]) -> str:
+    line = _trip_line(state)
+    depart = str(state.get("depart") or "")[:10]
+    if depart and depart in line:
+        return line.replace(depart, _spoken_date(depart), 1)
+    return line or "Guwahati to Delhi"
 
 
 def _window_phrase(state: dict[str, Any]) -> str:
@@ -1026,6 +1062,18 @@ def _task_payload(phone: str, text: str, state: dict[str, Any]) -> str:
     )
 
 
+_IXIGO_CARD = re.compile(
+    r"(SpiceJet|IndiGo|Air India Express|Air India|Akasa Air)\s+"
+    r"((?:(?:SG|6E|IX|AI|QP)\d+)(?:\s*,\s*(?:SG|6E|IX|AI|QP)\d+)*)\s+"
+    r"(\d{1,2}:\d{2})\s+"
+    r"(?:[A-Z]{3}\s+)?"
+    r"(\d+h(?:\s*\d+m)?)\s+"
+    r"(Non-stop|\d+\s*stops?)\s+"
+    r"(\d{1,2}:\d{2})\s+"
+    r"(?:[A-Z]{3}\s+)?"
+    r"₹\s*([\d,]+)",
+    re.I,
+)
 _FLIGHT_CARD = re.compile(
     r"(SpiceJet|IndiGo|Air India Express|Air India|Akasa Air)\s+"
     r"((?:SG|6E|IX|AI|QP)-\d+)\s+"
@@ -1057,6 +1105,29 @@ def fare_options(text: str) -> list[dict[str, Any]]:
     flat = re.sub(r"\s+", " ", text or "")
     seen: set[tuple[str, str]] = set()
     options: list[dict[str, Any]] = []
+    for match in _IXIGO_CARD.finditer(flat):
+        flight_no = re.sub(r"\s+", "", match.group(2).upper())
+        depart = match.group(3)
+        key = (flight_no, depart)
+        if key in seen:
+            continue
+        seen.add(key)
+        price = int(match.group(7).replace(",", ""))
+        options.append(
+            {
+                "airline": match.group(1),
+                "flight": flight_no,
+                "depart": depart,
+                "arrive": match.group(6),
+                "duration": match.group(4),
+                "stops": match.group(5),
+                "price": f"{price:,}",
+                "price_n": price,
+                "minutes": _duration_minutes(match.group(4)),
+            }
+        )
+    if options:
+        return options[:8]
     for match in _FLIGHT_CARD.finditer(flat):
         flight_no = match.group(2).upper()
         depart = match.group(3)
@@ -1149,6 +1220,54 @@ def _seller_label(seller_id: str) -> str:
     return seller_id or "the seller"
 
 
+def _llm_recommend(options: list[dict[str, Any]]) -> str:
+    """One short sentence. Uses only flights that were on the page."""
+    if not options or not get_settings().llm_ready:
+        return ""
+    lines = []
+    for option in options[:5]:
+        lines.append(
+            " ".join(
+                part
+                for part in (
+                    str(option.get("airline") or ""),
+                    str(option.get("flight") or ""),
+                    str(option.get("stops") or ""),
+                    str(option.get("depart") or ""),
+                    str(option.get("arrive") or ""),
+                    f"₹{option.get('price')}" if option.get("price") else "",
+                )
+                if part
+            )
+        )
+    try:
+        from app import llm
+
+        data = llm.converse(
+            "You are texting on WhatsApp. Reply as JSON {\"reply\": \"...\"}. "
+            "One short sentence a person would text. Name one flight and why. "
+            "Use only flights in the list. Do not tell them what to reply. No emoji.",
+            "\n".join(lines),
+            timeout=8,
+        )
+    except Exception:
+        return ""
+    reply = re.sub(r"\s+", " ", str(data.get("reply") or "")).strip()
+    return reply[:240]
+
+
+def _ixigo_option_line(option: dict[str, Any]) -> str:
+    flight = str(option.get("flight") or "").replace(",", " + ")
+    if flight in {"", "—"}:
+        flight = ""
+    depart = str(option.get("depart") or "")
+    arrive = str(option.get("arrive") or "")
+    when = f"{depart}–{arrive}" if arrive else depart
+    stops = str(option.get("stops") or "")
+    bits = [str(option.get("airline") or ""), flight, when, stops, f"₹{option.get('price')}" if option.get("price") else ""]
+    return "- " + ", ".join(part for part in bits if part)
+
+
 def _options_reply(state: dict[str, Any], options: list[dict[str, Any]], seller: str = "") -> str:
     depart = str(state.get("depart") or "")
     until = str(state.get("depart_until") or "")
@@ -1162,6 +1281,16 @@ def _options_reply(state: dict[str, Any], options: list[dict[str, Any]], seller:
             f"{label} didn't list a flight for {trip}. The screenshot is the page I got. "
             "Tell me another day in that week and I'll check it."
         )
+    if (seller or "") == "ixigo":
+        when = _spoken_date(depart) if depart else ""
+        route = f"{_place(state.get('origin'))} to {_place(state.get('destination'))}"
+        lines = [f"{route}, {when}:" if when else f"{route}:"]
+        for option in options[:3]:
+            lines.append(_ixigo_option_line(option))
+        best = _pick_best(options, str(state.get("preference") or ""))
+        spoken = _llm_recommend(options) or f"I'd take the {best['airline']} at {best['depart']}."
+        lines.append(f"{spoken} Reply with the departure time and I'll book it. I stop before payment.")
+        return "\n".join(lines)
     lines = [f"{trip} on {label}. These are on the page:"]
     for option in options[:4]:
         bits = [option["airline"], option.get("flight") or "", f"{option['depart']}–{option.get('arrive') or '?'}"]
@@ -1540,7 +1669,7 @@ def _kernel_trip(state: dict[str, Any]) -> tuple[str, str, str, str]:
     origin = str(state.get("origin") or "Guwahati")
     destination = str(state.get("destination") or "Delhi")
     depart = str(state.get("depart") or "2026-12-04")[:10]
-    hint = str(state.get("selected_hint") or "1:15")
+    hint = str(state.get("selected_hint") or "").strip()
     return origin, destination, depart, hint
 
 
@@ -1593,6 +1722,50 @@ def _publish_kernel_otp_result(
     _deliver(phone, spoken, None, redact, shot_paths=shots)
 
 
+def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], secrets: list[str]) -> None:
+    """Already signed in: list the fares, or stop a chosen flight before payment."""
+    text = str(result.get("page") or "")
+    state = _load(phone)
+    signed_in = str(result.get("status") or "") == "already_logged_in"
+    if str(result.get("status") or "") in {"already_logged_in", "held"}:
+        state["kernel_logged_in"] = seller
+    state["kernel_awaiting_otp"] = False
+    state["seller"] = seller
+    state.pop("kernel_session_id", None)
+    shots = [result["screenshot"]] if result.get("screenshot") else None
+    label = _seller_label(seller)
+    if str(result.get("status") or "") in {"already_logged_in", "fares"}:
+        options = fare_options(text)
+        state["stage"] = "results"
+        if options:
+            state["options"] = [
+                {k: item[k] for k in ("airline", "flight", "depart", "arrive", "price") if k in item}
+                for item in options
+            ]
+        _save(phone, state)
+        body = _options_reply(state, options, seller=seller) if options else (
+            "The fare list didn't finish. The screenshot is the page."
+        )
+        intro = f"You're already logged in on {label}.\n" if signed_in else ""
+        _deliver(phone, f"{intro}{body}", None, secrets, shot_paths=shots)
+        return
+    state["stage"] = "booking"
+    _save(phone, state)
+    page_url = str(result.get("url") or "")
+
+    class _Open:
+        url = page_url
+
+    class _Session:
+        page = _Open()
+
+    spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), text, _Session())  # type: ignore[arg-type]
+    if re.search(r"\bupi\b|pay now|card number|pay to complete|net banking", text, re.I):
+        trip = _window_phrase(state)
+        spoken = f"I stopped before payment for {trip} on {label}. Nothing paid. The screenshot is that page."
+    _deliver(phone, spoken, None, secrets, shot_paths=shots)
+
+
 def _run_kernel_login(
     phone: str,
     text: str,
@@ -1626,8 +1799,11 @@ def _run_kernel_login(
         hint=hint,
         on_code_requested=on_code_requested,
     )
-    if str(result.get("status") or "") == "otp_sent" and not announced:
+    status = str(result.get("status") or "")
+    if status == "otp_sent" and not announced:
         on_code_requested(result)
+    elif status in {"already_logged_in", "fares", "held"} and not announced:
+        _deliver_signed_in_page(phone, seller, result, secrets)
     elif not announced:
         state = _load(phone)
         state["kernel_awaiting_otp"] = False

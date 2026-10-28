@@ -157,7 +157,13 @@ def indian_national(value: str) -> str:
 
 
 def login_phone_for(whatsapp_phone: str, explicit: str = "") -> str:
-    for candidate in (explicit, whatsapp_phone, os.getenv("IXIGO_LOGIN_PHONE") or ""):
+    """Indian mobile from the traveller's saved number or WhatsApp id.
+
+    A Meta WhatsApp id that is not a 10-digit Indian mobile returns empty so
+    the chat can ask for the number. Server env IXIGO_LOGIN_PHONE is not used —
+    that would force one number onto every traveller.
+    """
+    for candidate in (explicit, whatsapp_phone):
         national = indian_national(candidate)
         if national:
             return "+91" + national
@@ -437,7 +443,8 @@ def begin_login(
         return {"status": "unsupported", "detail": seller}
     login_phone = login_phone_for(whatsapp_phone, explicit)
     national = indian_national(login_phone)
-    if len(national) != 10:
+    # A fare list does not need a mobile. The code is only for a chosen flight.
+    if hint and len(national) != 10:
         return {"status": "bad_phone", "detail": "Need a 10-digit Indian mobile."}
     client = _client()
     profile = _profile(seller, whatsapp_phone)
@@ -451,68 +458,108 @@ def begin_login(
             pw = p.chromium.connect_over_cdp(browser.cdp_ws_url)
             context = pw.contexts[0] if pw.contexts else pw.new_context()
             page = context.pages[0] if context.pages else context.new_page()
+            outcome: dict[str, str] | None = None
             if seller == "ixigo":
                 page.goto(ixigo_results_url(origin, destination, depart), wait_until="domcontentloaded", timeout=120000)
                 for _ in range(50):
                     if _book_count(page) >= 2:
                         break
                     page.wait_for_timeout(400)
-                run_checkout_agent(
-                    page,
-                    hint=hint or "1:15",
-                    seller="ixigo",
-                    origin=origin,
-                    destination=destination,
-                    depart=depart,
-                    expect_flight="IX1513" if (hint or "1:15") == "1:15" else "",
-                    allow_pay=False,
-                    pause_on_auth=True,
-                    max_steps=16,
-                )
-                page = _latest(page)
-                for _ in range(4):
+                if not hint:
+                    # Leave the results alone. Clicking Log in here texts a code
+                    # before the traveller has chosen a flight.
+                    text, url = _read(page)
+                    outcome = {
+                        "status": "already_logged_in" if _logged_in(page, seller) else "fares",
+                        "session_id": sid,
+                        "seller": seller,
+                        "screenshot": _shot(page, seller, sid, "fares"),
+                        "page": (text or "")[:8000],
+                        "url": url or "",
+                    }
+                else:
+                    run_checkout_agent(
+                        page,
+                        hint=hint,
+                        seller="ixigo",
+                        origin=origin,
+                        destination=destination,
+                        depart=depart,
+                        expect_flight="IX1513" if hint == "1:15" else "",
+                        allow_pay=False,
+                        pause_on_auth=True,
+                        max_steps=16,
+                    )
                     page = _latest(page)
-                    if _find(page, "phone", seller) or _otp_visible(page, seller):
+                if hint:
+                    for _ in range(8):
+                        page = _latest(page)
+                        if _logged_in(page, seller) or _find(page, "phone", seller) or _otp_visible(page, seller):
+                            break
+                        if _find(page, "send", seller):
+                            _click(client, sid, page, _find(page, "send", seller))
+                            page.wait_for_timeout(1800)
+                            continue
+                        login = _find(page, "login", seller)
+                        if login:
+                            _click(client, sid, page, login)
+                            page.wait_for_timeout(1500)
+                            continue
                         break
-                    if _find(page, "send", seller):
-                        _click(client, sid, page, _find(page, "send", seller))
-                        page.wait_for_timeout(1800)
-                        continue
-                    login = _find(page, "login", seller)
-                    if login:
-                        _click(client, sid, page, login)
-                        page.wait_for_timeout(1500)
-                        continue
-                    break
             else:
                 page.goto("https://www.cleartrip.com/", wait_until="domcontentloaded", timeout=120000)
                 page.wait_for_timeout(3000)
-                if not _find(page, "phone", seller):
+                if not _find(page, "phone", seller) and not _logged_in(page, seller):
                     hit = _find(page, "login", seller)
                     if not hit:
                         _drop(client, sid)
                         return {"status": "login_miss", "detail": "Cleartrip login button was not on screen."}
                     _click(client, sid, page, hit)
                     page.wait_for_timeout(1500)
-            phone_box = _find(page, "phone", seller)
-            if not phone_box:
-                _drop(client, sid)
-                return {"status": "phone_miss", "detail": "Mobile field did not open."}
-            _click(client, sid, page, phone_box)
-            page.wait_for_timeout(300)
-            client.browsers.computer.type_text(sid, text=national, delay=40)
-            page.wait_for_timeout(300)
-            send = _find(page, "send", seller)
-            if send:
-                _click(client, sid, page, send)
-            client.browsers.computer.press_key(sid, keys=["Return"])
+            # A saved profile can already be signed in. A fare preview must not be overwritten.
+            if outcome is None and _logged_in(page, seller) and not _otp_visible(page, seller):
+                text, url = _read(page)
+                outcome = {
+                    "status": "already_logged_in" if not hint else "held",
+                    "session_id": sid,
+                    "seller": seller,
+                    "screenshot": _shot(page, seller, sid, "otp-after"),
+                    "page": (text or "")[:8000],
+                    "url": url or "",
+                }
             ok = False
-            for _ in range(30):
-                page = _latest(page)
-                if _otp_visible(page, seller):
-                    ok = True
-                    break
-                page.wait_for_timeout(400)
+            if outcome is None:
+                ok = _otp_visible(page, seller)
+            if outcome is None and not ok:
+                phone_box = _find(page, "phone", seller)
+                if not phone_box:
+                    shot = _shot(page, seller, sid, "otp-miss")
+                    try:
+                        pw.close()
+                    except Exception:
+                        pass
+                    _drop(client, sid)
+                    return {
+                        "status": "phone_miss",
+                        "detail": "Mobile field did not open.",
+                        "session_id": sid,
+                        "seller": seller,
+                        "screenshot": shot,
+                    }
+                _click(client, sid, page, phone_box)
+                page.wait_for_timeout(300)
+                client.browsers.computer.type_text(sid, text=national, delay=40)
+                page.wait_for_timeout(300)
+                send = _find(page, "send", seller)
+                if send:
+                    _click(client, sid, page, send)
+                client.browsers.computer.press_key(sid, keys=["Return"])
+                for _ in range(30):
+                    page = _latest(page)
+                    if _otp_visible(page, seller):
+                        ok = True
+                        break
+                    page.wait_for_timeout(400)
             shot = ""
             if ok:
                 try:
@@ -523,8 +570,7 @@ def begin_login(
                     shot = str(dest)
                 except Exception:
                     shot = ""
-            outcome: dict[str, str] | None = None
-            if ok and on_code_requested is not None:
+            if outcome is None and ok and on_code_requested is not None:
                 # Stay on this CDP connection through Verify. A second connection
                 # reaches the spinner and never becomes an Ixigo account.
                 arm_live_otp(sid)
@@ -544,6 +590,39 @@ def begin_login(
                     outcome = _apply_otp(client, sid, page, seller, code)
                     outcome["session_id"] = sid
                     outcome["seller"] = seller
+                    if hint and seller == "ixigo" and outcome.get("status") == "logged_in":
+                        page = _latest(page)
+                        page.goto(
+                            ixigo_results_url(origin, destination, depart),
+                            wait_until="domcontentloaded",
+                            timeout=120000,
+                        )
+                        for _ in range(40):
+                            if _book_count(page) >= 2:
+                                break
+                            page.wait_for_timeout(400)
+                        run_checkout_agent(
+                            page,
+                            hint=hint,
+                            seller="ixigo",
+                            origin=origin,
+                            destination=destination,
+                            depart=depart,
+                            expect_flight="IX1513" if hint == "1:15" else "",
+                            allow_pay=False,
+                            pause_on_auth=True,
+                            max_steps=16,
+                        )
+                        page = _latest(page)
+                        text, url = _read(page)
+                        outcome = {
+                            "status": "held",
+                            "session_id": sid,
+                            "seller": seller,
+                            "screenshot": _shot(page, seller, sid, "held"),
+                            "page": (text or "")[:8000],
+                            "url": url or "",
+                        }
             elif ok:
                 outcome = {
                     "status": "error",

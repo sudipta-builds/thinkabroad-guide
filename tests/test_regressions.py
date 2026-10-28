@@ -1000,6 +1000,74 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(out.stage, "auth_required")
         self.assertTrue(any("auth_pause" in x for x in out.log))
 
+    def test_login_phone_is_per_traveller(self) -> None:
+        import os
+
+        from app.kernel_otp import login_phone_for
+
+        previous = os.environ.get("IXIGO_LOGIN_PHONE")
+        os.environ["IXIGO_LOGIN_PHONE"] = "+919876543210"
+        try:
+            self.assertEqual(login_phone_for("15550001111"), "")
+            self.assertEqual(login_phone_for("+918638586171"), "+918638586171")
+            self.assertEqual(login_phone_for("15550001111", "9876543210"), "+919876543210")
+        finally:
+            if previous is None:
+                os.environ.pop("IXIGO_LOGIN_PHONE", None)
+            else:
+                os.environ["IXIGO_LOGIN_PHONE"] = previous
+
+    def test_ixigo_choice_stays_on_ixigo_and_recommends(self) -> None:
+        from app.travel_agent import _booking_seller_id, _kernel_trip, _options_reply
+
+        state = {
+            "seller": "ixigo",
+            "kernel_logged_in": "ixigo",
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+        }
+        self.assertEqual(_booking_seller_id(state, "1:15"), "ixigo")
+        self.assertEqual(_kernel_trip(state)[3], "")
+        state["selected_hint"] = "13:15"
+        self.assertEqual(_kernel_trip(state)[3], "13:15")
+        spoken = _options_reply(
+            state,
+            [
+                {
+                    "airline": "IndiGo",
+                    "flight": "6E201",
+                    "depart": "13:15",
+                    "arrive": "15:40",
+                    "price": "9,106",
+                    "price_n": 9106,
+                    "minutes": 145,
+                }
+            ],
+            seller="ixigo",
+        )
+        self.assertIn("IndiGo", spoken)
+        self.assertIn("4 December", spoken)
+        self.assertIn("Reply with the departure time", spoken)
+        self.assertIn("stop before payment", spoken)
+        self.assertNotIn("These are on the page", spoken)
+        self.assertNotIn("code screen", spoken)
+
+    def test_ixigo_results_keep_flight_number_and_arrival(self) -> None:
+        from app.travel_agent import fare_options
+
+        text = (
+            "Cheapest Akasa Air QP1341, QP1808 09:10 GAU 10h 1 stop 19:10 DEL ₹8,365 Book "
+            "Fastest SpiceJet SG762 12:30 GAU 2h 45m Non-stop 15:15 DEL ₹8,992 Book"
+        )
+        options = fare_options(text)
+        self.assertEqual(options[0]["flight"], "QP1341,QP1808")
+        self.assertEqual(options[0]["depart"], "09:10")
+        self.assertEqual(options[0]["arrive"], "19:10")
+        self.assertEqual(options[0]["price"], "8,365")
+        self.assertEqual(options[1]["flight"], "SG762")
+        self.assertEqual(options[1]["arrive"], "15:15")
+
 
 if __name__ == "__main__":
     unittest.main()

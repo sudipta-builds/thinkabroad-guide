@@ -85,6 +85,12 @@ class DateAndMemory(unittest.TestCase):
     def test_first_week_of_december_is_not_1_november(self) -> None:
         self.assertIsNone(explicit_date("1st week"))
         self.assertEqual(explicit_date("guwahati to delhi, 1st week of december"), "2026-12-01")
+        self.assertEqual(week_window("first week of dec"), ("2026-12-01", "2026-12-07"))
+        prior = [{"role": "user", "body": "guwahati to delhi, 1st week of december"}]
+        state = _recover_trip({"depart": "2026-11-01"}, prior, "1st week")
+        self.assertEqual(state["depart"], "2026-12-01")
+        self.assertEqual(state["depart_until"], "2026-12-07")
+        self.assertIn("2026-12-01 through 2026-12-07", " ".join(_memory_lines(state)))
 
     def test_birth_date_does_not_become_the_flight_date(self) -> None:
         self.assertIsNone(explicit_date("sudipta@example.com, 29/07/1997, Male"))
@@ -104,6 +110,20 @@ class DateAndMemory(unittest.TestCase):
         self.assertEqual(state["email"], "sudipta@example.com")
         self.assertEqual(state["gender"], "Male")
         self.assertEqual(infer_intent(state, "sudipta@example.com, 29/07/1997, Male"), "details")
+        stuck = _recover_trip(
+            {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2027-07-29",
+                "dob": "29/07/1997",
+                "stage": "booking",
+            },
+            [],
+            "Sudipta Saikia",
+        )
+        self.assertEqual(stuck["depart"], "2026-12-04")
+        self.assertEqual(stuck["name"], "Sudipta Saikia")
+        self.assertEqual(infer_intent(stuck, "Sudipta Saikia"), "details")
 
     def test_deepseek_is_read_before_the_rules(self) -> None:
         from unittest.mock import patch
@@ -128,12 +148,17 @@ class DateAndMemory(unittest.TestCase):
         asked.assert_called_once()
         self.assertEqual(kind, "details")
         self.assertIn("fill the form", spoken)
-        self.assertEqual(week_window("first week of dec"), ("2026-12-01", "2026-12-07"))
-        prior = [{"role": "user", "body": "guwahati to delhi, 1st week of december"}]
-        state = _recover_trip({"depart": "2026-11-01"}, prior, "1st week")
-        self.assertEqual(state["depart"], "2026-12-01")
-        self.assertEqual(state["depart_until"], "2026-12-07")
-        self.assertIn("2026-12-01 through 2026-12-07", " ".join(_memory_lines(state)))
+
+    def test_passenger_profile_is_not_the_kernel_browser_name(self) -> None:
+        import inspect
+
+        from app.kernel_otp import begin_login
+
+        source = inspect.getsource(begin_login)
+        self.assertIn("passenger = dict(profile or {})", source)
+        self.assertIn("browser_profile = _profile(", source)
+        self.assertIn("profile=passenger", source)
+        self.assertIn("_open_browser(client, browser_profile)", source)
 
     def test_a_second_route_does_not_delete_the_first(self) -> None:
         state = _recover_trip({}, [], "guwahati to delhi, 1st week of december")

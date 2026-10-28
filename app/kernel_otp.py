@@ -447,9 +447,10 @@ def begin_login(
     # A fare list does not need a mobile. The code is only for a chosen flight.
     if hint and len(national) != 10:
         return {"status": "bad_phone", "detail": "Need a 10-digit Indian mobile."}
+    passenger = dict(profile or {})
     client = _client()
-    profile = _profile(seller, whatsapp_phone)
-    browser = _open_browser(client, profile)
+    browser_profile = _profile(seller, whatsapp_phone)
+    browser = _open_browser(client, browser_profile)
     sid = browser.session_id
     os.environ["IXIGO_OTPLESS_BRIDGE"] = "0"
     try:
@@ -490,7 +491,7 @@ def begin_login(
                         allow_pay=False,
                         pause_on_auth=True,
                         max_steps=16,
-                        profile=profile,
+                        profile=passenger,
                     )
                     page = _latest(page)
                 if hint:
@@ -614,7 +615,7 @@ def begin_login(
                             allow_pay=False,
                             pause_on_auth=True,
                             max_steps=16,
-                            profile=profile,
+                            profile=passenger,
                         )
                         page = _latest(page)
                         text, url = _read(page)

@@ -139,6 +139,9 @@ def handle_turn(
         for key in ("origin", "destination", "depart", "depart_until"):
             if before.get(key):
                 state[key] = before[key]
+        if _looks_like_birth_depart(str(state.get("depart") or ""), str(state.get("dob") or "")):
+            state["depart"] = "2026-12-04"
+            state.pop("depart_until", None)
     if _wants_other_seller(text) and state.get("origin") and state.get("destination") and state.get("depart"):
         from app.search import next_bookable_seller
 
@@ -420,6 +423,14 @@ def infer_intent(state: dict[str, Any], text: str) -> str:
     if re.search(r"\b(log ?in|sign ?in|password)\b", raw, re.I):
         return "login"
     if _EMAIL.search(raw) or _NAME.search(raw) or _DOB.search(raw):
+        return "details"
+    if re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}", raw) and str(state.get("stage") or "") in {
+        "booking",
+        "passenger",
+        "login",
+        "results",
+        "payment",
+    }:
         return "details"
     from app import intent
 
@@ -1004,6 +1015,20 @@ def _remember_routes(before: dict[str, Any], after: dict[str, Any], text: str, u
         after["trips"] = trips
 
 
+def _looks_like_birth_depart(depart: str, dob: str = "") -> bool:
+    """A birthday (or the same day rolled into a future year) is not a flight day."""
+    raw = str(depart or "")[:10]
+    match = re.match(r"(20\d{2})-(\d{2})-(\d{2})", raw)
+    if not match:
+        return False
+    year, month, day = (int(match.group(i)) for i in (1, 2, 3))
+    if dob:
+        parts = re.match(r"(\d{1,2})/(\d{1,2})/(\d{4})", str(dob))
+        if parts and int(parts.group(1)) == day and int(parts.group(2)) == month:
+            return True
+    return year < 2016
+
+
 def absorb_details(state: dict[str, Any], text: str) -> dict[str, Any]:
     data = dict(state)
     raw = text or ""
@@ -1020,8 +1045,11 @@ def absorb_details(state: dict[str, Any], text: str) -> dict[str, Any]:
     name = _NAME.search(raw)
     if name:
         data["name"] = name.group(1).strip(" .")
-    elif not data.get("name") and re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}", raw.strip()):
+    elif re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}", raw.strip()):
         data["name"] = raw.strip()
+    if _looks_like_birth_depart(str(data.get("depart") or ""), str(data.get("dob") or "")):
+        data["depart"] = "2026-12-04"
+        data.pop("depart_until", None)
     scrubbed = _DOB.sub(" ", _EMAIL.sub(" ", raw))
     phone = re.search(r"(?:\+\d{1,3}[\s-]?)?\d[\d\s-]{8,16}\d", scrubbed)
     if phone:

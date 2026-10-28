@@ -237,6 +237,27 @@ def handle_turn(
         if not named_seller_from(text):
             state.pop("seller", None)
         _save(phone, state)
+    if _asks_for_filled_form(text) and state.get("origin") and state.get("destination"):
+        state["seller"] = "ixigo"
+        state["preferred_seller"] = "ixigo"
+        state["kernel_seller"] = "ixigo"
+        state["notes"] = [note for note in (state.get("notes") or []) if "not usable" not in str(note).lower()]
+        reply = _form_status_reply(state)
+        if passenger_gaps(state) or not kernel_configured():
+            state.pop("busy_at", None)
+            _save(phone, state)
+            db.add_message(phone, "assistant", reply)
+            return Reply.of(reply, emoji="📝")
+        state["busy_at"] = f"{time.time():.3f}"
+        _save(phone, state)
+        threading.Thread(
+            target=_run_browse,
+            args=(phone, text, state.get("busy_at"), "book"),
+            name="guide-browse",
+            daemon=True,
+        ).start()
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply, emoji="✈️")
     if _hold_live(state, text, busy=busy, changed=changed):
         reply = _live_hold_reply(state, text)
         db.add_message(phone, "assistant", reply)
@@ -467,6 +488,8 @@ def infer_intent(state: dict[str, Any], text: str) -> str:
 
 def _merge_intent(local: str, model: str, text: str, state: dict[str, Any]) -> str:
     """DeepSeek first. Rules keep payment, cancellation, and a passenger form from being restarted."""
+    if _asks_for_filled_form(text):
+        return "status"
     model = (model or "").lower()
     if model not in _INTENTS:
         return local
@@ -483,14 +506,35 @@ def _merge_intent(local: str, model: str, text: str, state: dict[str, Any]) -> s
     return model
 
 
+def _asks_for_filled_form(text: str) -> bool:
+    """They want the booking form, or proof of what was typed. Not a new fare search."""
+    raw = (text or "").strip()
+    if re.fullmatch(r"in\s+ixigo\??|ixigo\??", raw, re.I):
+        return True
+    return bool(
+        re.search(
+            r"did you fill|fill(?:ed)?(?: up)? (?:all )?the details|what (?:you|did you) fill|"
+            r"show (?:me )?(?:the )?(?:ss|screenshot|screen)",
+            raw,
+            re.I,
+        )
+    )
+
+
 def _usable_reply(state: dict[str, Any], spoken: str, fallback: str) -> str:
-    """Use DeepSeek's sentence unless it invents a fare or claims a payment."""
+    """Use DeepSeek's sentence unless it invents a fare, a payment, or a filled form."""
     text = re.sub(r"\s+", " ", spoken or "").strip()
     if not text or len(text) > 400:
         return fallback
     if re.search(r"₹|\bRs\.?\s*\d", text):
         return fallback
     if re.search(r"\b(i paid|payment (is )?done|ticket is booked|you(?:'re| are) charged)\b", text, re.I):
+        return fallback
+    if re.search(
+        r"details are filled|all passenger details|isn'?t usable|not usable|can'?t attach|can'?t show a filled",
+        text,
+        re.I,
+    ):
         return fallback
     if state.get("origin") and re.search(r"where are you flying|where from|which city", text, re.I):
         return fallback
@@ -632,6 +676,23 @@ def _booking_seller_id(state: dict[str, Any], text: str = "") -> str:
     return preferred
 
 
+def _form_status_reply(state: dict[str, Any]) -> str:
+    """Say what is saved. Call the form filled only after Ixigo kept the fields."""
+    if passenger_gaps(state):
+        return passenger_details_reply(state)
+    saved = ", ".join(
+        str(state.get(key)).strip()
+        for key in ("name", "email", "phone", "dob", "gender")
+        if str(state.get(key) or "").strip()
+    )
+    if state.get("form_filled"):
+        return f"Ixigo had {saved} on the form. I'll open that page again and send the screenshot. Nothing paid."
+    return (
+        f"I have {saved} saved. I won't call that filled until the Ixigo screenshot shows it. "
+        "Opening Ixigo now. Nothing paid."
+    )
+
+
 def _booking_ack(state: dict[str, Any], kind: str, text: str = "") -> str:
     trip = _trip_line(state) or "Guwahati to Delhi"
     hint = str(state.get("selected_hint") or _flight_hint(text) or "")
@@ -737,7 +798,9 @@ def _search_ack(state: dict[str, Any], text: str = "") -> str:
 
 
 def _hold_live(state: dict[str, Any], text: str, *, busy: bool, changed: bool) -> bool:
-    """A running search stays up. A new route or date is the only reason to replace it."""
+    """A running search stays up. A new route, or a request for the Ixigo form, replaces it."""
+    if _asks_for_filled_form(text) or named_seller_from(text) == "ixigo":
+        return False
     if not busy or changed:
         return False
     return True
@@ -797,6 +860,8 @@ def _direct_results(state: dict[str, Any], text: str) -> bool:
 
 def _should_browse(state: dict[str, Any], text: str, *, busy: bool, changed: bool) -> bool:
     """Booking continues even while a page is open. A new search waits."""
+    if _asks_for_filled_form(text):
+        return False
     kind = infer_intent(state, text)
     if kind in {"cancel", "pay_self", "status"}:
         return False
@@ -1890,6 +1955,8 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         and re.search(r"title:(?:ok|typed|none)\b", notes)
         and not re.search(r"(?:title|first|last|email|dob):(?:miss|set)\b", notes)
     )
+    state["form_filled"] = bool(filled)
+    _save(phone, state)
     waiting = passenger_details_reply(state)
     if waiting:
         spoken = waiting

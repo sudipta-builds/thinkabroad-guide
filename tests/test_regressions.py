@@ -143,6 +143,46 @@ class DateAndMemory(unittest.TestCase):
         self.assertEqual(passenger_gaps(ready), [])
         self.assertEqual(passenger_details_reply(ready), "")
 
+    def test_a_fill_question_reopens_ixigo_and_does_not_claim_the_form(self) -> None:
+        from app.travel_agent import (
+            _asks_for_filled_form,
+            _form_status_reply,
+            _hold_live,
+            _merge_intent,
+            _usable_reply,
+        )
+
+        trip = {"origin": "Guwahati", "destination": "Delhi", "depart": "2026-12-04", "stage": "booking"}
+        for message in (
+            "did you fill up all the details?",
+            "show me the ss, what you filled?",
+            "in ixigo?",
+            "ixigo",
+        ):
+            self.assertTrue(_asks_for_filled_form(message))
+            self.assertEqual(_merge_intent("search", "chat", message, trip), "status")
+        self.assertFalse(_hold_live({**trip, "busy_at": "1"}, "in ixigo?", busy=True, changed=False))
+        saved = {
+            **trip,
+            "name": "Sudipta Saikia",
+            "email": "sudipta@example.com",
+            "phone": "8638586171",
+            "dob": "29/07/1997",
+            "gender": "Male",
+        }
+        spoken = _form_status_reply(saved)
+        self.assertIn("8638586171", spoken)
+        self.assertIn("won't call that filled", spoken)
+        self.assertNotIn("8638586272", spoken)
+        self.assertEqual(
+            _usable_reply(saved, "Yes, all passenger details are filled. Nothing has been charged.", "Opening Ixigo."),
+            "Opening Ixigo.",
+        )
+        self.assertEqual(
+            _usable_reply(saved, "Ixigo isn't usable for booking right now.", "Opening Ixigo."),
+            "Opening Ixigo.",
+        )
+
     def test_form_is_ready_only_when_title_and_email_stick(self) -> None:
         from app.page_agent import _passenger_missing, _passenger_ready
 

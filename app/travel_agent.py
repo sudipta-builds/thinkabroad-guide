@@ -61,15 +61,16 @@ _PLANNER = (
 
 _UNDERSTAND = (
     "You read one WhatsApp message for a travel desk. The usual trip is Guwahati (GAU) to Delhi (DEL).\n"
-    'Return JSON only: {"intent":"search|select|book|login|details|pay|pay_self|cancel|status|chat","flight_hint":""}\n'
+    'Return JSON only: {"intent":"search|select|book|login|details|pay|pay_self|cancel|status|chat","flight_hint":"","reply":""}\n'
     "search: they want fares, or they named a route, including casual wording like fly, want to fly, show flights.\n"
     "select: they picked a fare already discussed, such as a time, an airline, that one, or done.\n"
     "book: they want you to continue into booking, in any wording (book the flight, go ahead, take it, buy it).\n"
     "login: a site sign-in, or they are giving a password.\n"
-    "details: name, email, phone, date of birth, or gender.\n"
+    "details: name, email, phone, date of birth, or gender. A birth date next to an email or male/female is not a new flight date.\n"
     "pay: they want you to pay with UPI, card, or OTP, or they just sent those.\n"
     "pay_self: they want the payment link and will pay themselves.\n"
-    "Do not ask for the route again when Memory already has it. flight_hint is a time or airline they named, else empty."
+    "Do not change a saved trip because a date of birth arrived. flight_hint is a departure time or airline they named, else empty.\n"
+    "reply is one or two short sentences you would actually text. No emoji. Do not invent fares or say anything was paid."
 )
 
 _BROWSER = (
@@ -132,7 +133,12 @@ def handle_turn(
     state = _recover_trip(state, prior, text)
     previous_stage = str(state.get("stage") or "")
     saved_secret = _capture_private(phone, text, state)
-    kind = _coerce_kind(text, resolve_intent(text, state, prior), state)
+    kind, spoken = resolve_intent(text, state, prior)
+    kind = _coerce_kind(text, kind, state)
+    if kind == "details":
+        for key in ("origin", "destination", "depart", "depart_until"):
+            if before.get(key):
+                state[key] = before[key]
     if _wants_other_seller(text) and state.get("origin") and state.get("destination") and state.get("depart"):
         from app.search import next_bookable_seller
 
@@ -281,23 +287,26 @@ def handle_turn(
             daemon=True,
         ).start()
         if kernel_book:
-            need = "4" if book_seller == "cleartrip" else "6"
-            chosen = str(state.get("selected_hint") or "").strip()
-            signed_in = str(state.get("kernel_logged_in") or "") == book_seller
-            trip = _spoken_trip(state)
-            if chosen and signed_in:
-                reply = f"Opening the {chosen} on {_seller_label(book_seller)}. I'll stop before payment."
-            elif chosen:
-                reply = (
-                    f"Opening the {chosen} on {_seller_label(book_seller)}. "
-                    f"If you're signed out, reply with the {need}-digit code. I'll stop before payment."
-                )
-            elif signed_in:
-                reply = f"You're already logged in on {_seller_label(book_seller)}. Checking {trip}."
-            else:
-                reply = f"Checking {_seller_label(book_seller)} for {trip}."
+            canned = _booking_ack(state, kind, text) if kind == "details" else ""
+            if kind != "details":
+                need = "4" if book_seller == "cleartrip" else "6"
+                chosen = str(state.get("selected_hint") or "").strip()
+                signed_in = str(state.get("kernel_logged_in") or "") == book_seller
+                trip = _spoken_trip(state)
+                if chosen and signed_in:
+                    canned = f"Opening the {chosen} on {_seller_label(book_seller)}. I'll stop before payment."
+                elif chosen:
+                    canned = (
+                        f"Opening the {chosen} on {_seller_label(book_seller)}. "
+                        f"If you're signed out, reply with the {need}-digit code. I'll stop before payment."
+                    )
+                elif signed_in:
+                    canned = f"You're already logged in on {_seller_label(book_seller)}. Checking {trip}."
+                else:
+                    canned = f"Checking {_seller_label(book_seller)} for {trip}."
+            reply = _usable_reply(state, spoken, canned)
         else:
-            reply = _booking_ack(state, kind, text)
+            reply = _usable_reply(state, spoken, _booking_ack(state, kind, text))
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="✈️")
     if _should_browse(state, text, busy=busy, changed=changed) and _direct_results(state, text) and chromium_ready():
@@ -309,13 +318,17 @@ def handle_turn(
             name="guide-browse",
             daemon=True,
         ).start()
-        reply = _search_ack(state, text)
+        reply = _usable_reply(state, spoken, _search_ack(state, text))
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="✈️")
     if kind == "search":
-        reply = "Where are you flying from and to?"
+        reply = _usable_reply(state, spoken, "Where are you flying from and to?")
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="🤔")
+    if kind == "chat" and _usable_reply(state, spoken, ""):
+        reply = _usable_reply(state, spoken, "")
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply, emoji="👍")
     with composing(phone):
         decision = llm.converse(_PLANNER, _planner_payload(phone, text, state, prior, busy=busy), timeout=7)
     action = str(decision.get("action") or "reply").lower()
@@ -434,18 +447,51 @@ def infer_intent(state: dict[str, Any], text: str) -> str:
     return "chat"
 
 
-def resolve_intent(text: str, state: dict[str, Any], prior: list[dict[str, Any]]) -> str:
-    local = infer_intent(state, text)
-    if local != "chat" or not get_settings().llm_ready:
+def _merge_intent(local: str, model: str, text: str, state: dict[str, Any]) -> str:
+    """DeepSeek first. Rules keep payment, cancellation, and a passenger form from being restarted."""
+    model = (model or "").lower()
+    if model not in _INTENTS:
         return local
-    data = llm.converse(_UNDERSTAND, _planner_payload(phone="", text=text, state=state, prior=prior, busy=False), timeout=7)
-    got = str(data.get("intent") or "").lower()
+    if local == model:
+        return local
+    if local in {"pay", "cancel", "pay_self"}:
+        return local
+    if local == "login" and re.search(r"log ?in|sign ?in|password", text or "", re.I):
+        return local
+    passenger = bool(_EMAIL.search(text or "") or _DOB.search(text or "") or _GENDER.search(text or ""))
+    booking = str(state.get("stage") or "") in {"booking", "passenger", "login", "payment", "results"}
+    if passenger and booking and "details" in {local, model}:
+        return "details"
+    return model
+
+
+def _usable_reply(state: dict[str, Any], spoken: str, fallback: str) -> str:
+    """Use DeepSeek's sentence unless it invents a fare or claims a payment."""
+    text = re.sub(r"\s+", " ", spoken or "").strip()
+    if not text or len(text) > 400:
+        return fallback
+    if re.search(r"₹|\bRs\.?\s*\d", text):
+        return fallback
+    if re.search(r"\b(i paid|payment (is )?done|ticket is booked|you(?:'re| are) charged)\b", text, re.I):
+        return fallback
+    if state.get("origin") and re.search(r"where are you flying|where from|which city", text, re.I):
+        return fallback
+    return text
+
+
+def resolve_intent(text: str, state: dict[str, Any], prior: list[dict[str, Any]]) -> tuple[str, str]:
+    """Ask DeepSeek first, then check the rules, and keep both."""
+    local = infer_intent(state, text)
+    if not get_settings().llm_ready:
+        return local, ""
+    data = llm.converse(_UNDERSTAND, _planner_payload(phone="", text=text, state=state, prior=prior, busy=False), timeout=8)
+    model = str(data.get("intent") or "")
+    spoken = str(data.get("reply") or "")
+    kind = _merge_intent(local, model, text, state)
     hint = str(data.get("flight_hint") or "").strip()
-    if hint:
+    if hint and kind != "details":
         state["selected_hint"] = hint[:40]
-    if got in _INTENTS:
-        return got
-    return local
+    return kind, spoken
 
 
 def _apply_stage(state: dict[str, Any], text: str, kind: str) -> None:
@@ -1797,6 +1843,10 @@ def _run_kernel_login(
         destination=destination,
         depart=depart,
         hint=hint,
+        profile={
+            key: str(loaded.get(key) or "")
+            for key in ("name", "email", "phone", "dob", "gender")
+        },
         on_code_requested=on_code_requested,
     )
     status = str(result.get("status") or "")

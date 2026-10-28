@@ -431,6 +431,7 @@ def begin_login(
     depart: str = "2026-12-04",
     hint: str = "1:15",
     explicit: str = "",
+    profile: dict[str, str] | None = None,
     on_code_requested: Callable[[dict[str, str]], None] | None = None,
     otp_wait_sec: int = 300,
 ) -> dict[str, str]:
@@ -489,6 +490,7 @@ def begin_login(
                         allow_pay=False,
                         pause_on_auth=True,
                         max_steps=16,
+                        profile=profile,
                     )
                     page = _latest(page)
                 if hint:
@@ -612,6 +614,7 @@ def begin_login(
                             allow_pay=False,
                             pause_on_auth=True,
                             max_steps=16,
+                            profile=profile,
                         )
                         page = _latest(page)
                         text, url = _read(page)

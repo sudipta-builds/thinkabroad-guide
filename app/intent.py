@@ -289,6 +289,10 @@ def _extract_date(text: str) -> tuple[date, bool]:
             found = _safe_date(year_n + 1, month, day, today)
         return found, False
 
+    birth = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](19\d{2}|200\d|201[0-4])\b", lower)
+    if birth:
+        lower = lower[: birth.start()] + " " + lower[birth.end() :]
+
     slash = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](20\d{2}))?\b", lower)
     if slash:
         day, month = int(slash.group(1)), int(slash.group(2))

@@ -85,6 +85,49 @@ class DateAndMemory(unittest.TestCase):
     def test_first_week_of_december_is_not_1_november(self) -> None:
         self.assertIsNone(explicit_date("1st week"))
         self.assertEqual(explicit_date("guwahati to delhi, 1st week of december"), "2026-12-01")
+
+    def test_birth_date_does_not_become_the_flight_date(self) -> None:
+        self.assertIsNone(explicit_date("sudipta@example.com, 29/07/1997, Male"))
+        state = _recover_trip(
+            {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-12-04",
+                "stage": "booking",
+                "selected_hint": "10:45",
+            },
+            [],
+            "sudipta@example.com, 29/07/1997, Male",
+        )
+        self.assertEqual(state["depart"], "2026-12-04")
+        self.assertEqual(state["dob"], "29/07/1997")
+        self.assertEqual(state["email"], "sudipta@example.com")
+        self.assertEqual(state["gender"], "Male")
+        self.assertEqual(infer_intent(state, "sudipta@example.com, 29/07/1997, Male"), "details")
+
+    def test_deepseek_is_read_before_the_rules(self) -> None:
+        from unittest.mock import patch
+
+        from app.travel_agent import _merge_intent, _usable_reply, resolve_intent
+
+        booking = {"stage": "booking", "origin": "Guwahati", "destination": "Delhi", "depart": "2026-12-04"}
+        message = "sudipta@example.com, 29/07/1997, Male"
+        self.assertEqual(_merge_intent("details", "search", message, booking), "details")
+        self.assertEqual(_merge_intent("chat", "select", "the 10:45", {"stage": "results"}), "select")
+        self.assertEqual(_merge_intent("pay", "book", "pay now", booking), "pay")
+        self.assertEqual(
+            _usable_reply(booking, "That fare is ₹9,000.", "Saved. I'll put that on the form."),
+            "Saved. I'll put that on the form.",
+        )
+        with patch("app.travel_agent.get_settings") as settings, patch(
+            "app.llm.converse",
+            return_value={"intent": "details", "flight_hint": "", "reply": "Got those. I'll fill the form and stop before payment."},
+        ) as asked:
+            settings.return_value.llm_ready = True
+            kind, spoken = resolve_intent(message, booking, [])
+        asked.assert_called_once()
+        self.assertEqual(kind, "details")
+        self.assertIn("fill the form", spoken)
         self.assertEqual(week_window("first week of dec"), ("2026-12-01", "2026-12-07"))
         prior = [{"role": "user", "body": "guwahati to delhi, 1st week of december"}]
         state = _recover_trip({"depart": "2026-11-01"}, prior, "1st week")

@@ -226,6 +226,11 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
     # Ixigo review also shows the "Add-ons" stepper label — require real add-on UI.
     if re.search(r"choose your seat|add meal|skip add-?ons|extra baggage", hay, re.I):
         return "addons"
+    # A review sheet that already shows the traveller is not the empty name form.
+    if re.search(r"review details", hay, re.I) and re.search(r"\bcontinue\b", hay, re.I) and not re.search(
+        r"please select your title", hay, re.I
+    ):
+        return "review"
     if re.search(r"first name|last name|date of birth|add adult|primary passenger", hay, re.I) and re.search(
         r"mobile|email|gender", hay, re.I
     ):
@@ -662,7 +667,27 @@ def _ixigo_opt_out_cancellation(page) -> str:
 
 
 def _safe_continue(page) -> bool:
-    """Click Continue but never a Pay control."""
+    """Click the lowest Continue on the page, never a Pay control."""
+    try:
+        clicked = page.evaluate(
+            """() => {
+              const buttons = [...document.querySelectorAll('button, [role=button]')].filter(el => {
+                const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                const rect = el.getBoundingClientRect();
+                return /^continue\\b/i.test(text) && !/\\bpay\\b/i.test(text) && rect.width > 8 && rect.height > 8;
+              });
+              if (!buttons.length) return false;
+              buttons.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
+              const btn = buttons[0];
+              btn.scrollIntoView({block: 'center'});
+              btn.click();
+              return true;
+            }"""
+        )
+        if clicked:
+            return True
+    except Exception:
+        pass
     try:
         btn = page.get_by_role("button", name=re.compile(r"^Continue", re.I)).last
         label = (btn.inner_text(timeout=2000) or "").strip()

@@ -183,6 +183,36 @@ class DateAndMemory(unittest.TestCase):
             "Opening Ixigo.",
         )
 
+    def test_click_continue_stays_on_the_review_step_without_a_link(self) -> None:
+        from app.travel_agent import _booking_page_reply, _merge_intent, infer_intent
+
+        booking = {
+            "stage": "booking",
+            "seller": "ixigo",
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "selected_hint": "10:45",
+        }
+        self.assertEqual(infer_intent(booking, "click continue"), "book")
+        self.assertEqual(_merge_intent("chat", "search", "click continue", booking), "book")
+
+        class _Page:
+            url = "https://www.ixigo.com/flight/booking/1044/abc?fareKey=GAU-DEL-6E5342"
+
+        class _Session:
+            page = _Page()
+
+        spoken = _booking_page_reply(
+            booking,
+            "10:45",
+            "Fare Summary Review Details Sudipta Saikia Continue",
+            _Session(),  # type: ignore[arg-type]
+        )
+        self.assertIn("Still on the review step", spoken)
+        self.assertNotIn("http", spoken)
+        self.assertNotIn("moved", spoken.lower())
+
     def test_form_is_ready_only_when_title_and_email_stick(self) -> None:
         from app.page_agent import _passenger_missing, _passenger_ready
 
@@ -928,6 +958,11 @@ class SellerChoiceAndProxy(unittest.TestCase):
             "Fare Summary Total Amount ₹9,091 Continue Guwahati New Delhi"
         )
         self.assertEqual(classify_page(stepper, "https://www.ixigo.com/flight/booking/1"), "review")
+        sheet = (
+            "Fare Summary Total Amount ₹9,091 Review Details Sudipta Saikia "
+            "sudipta@example.com Edit Continue 6E5342"
+        )
+        self.assertEqual(classify_page(sheet, "https://www.ixigo.com/flight/booking/1"), "review")
         form = (
             "Review & Traveller Details Traveller Details Title First & Middle Name Last Name "
             "Please select your title Nationality India Mobile Number Email Continue"

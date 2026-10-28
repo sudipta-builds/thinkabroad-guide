@@ -471,6 +471,9 @@ def infer_intent(state: dict[str, Any], text: str) -> str:
         return "book"
     if re.search(r"\b(book|buy|reserve)\b", raw, re.I):
         return "book"
+    if re.search(r"\bclick\s+continue\b", raw, re.I) or re.fullmatch(r"continue", raw, re.I):
+        if str(state.get("stage") or "") in {"booking", "passenger", "results", "payment", "login"}:
+            return "book"
     if _TIME.search(raw) or re.search(r"\b(that one|this one|spicejet|indigo|done|take it)\b", raw, re.I):
         if state.get("stage") in {"results", "booking", "payment", "login", "passenger"} or _TIME.search(raw):
             return "select"
@@ -490,6 +493,9 @@ def _merge_intent(local: str, model: str, text: str, state: dict[str, Any]) -> s
     """DeepSeek first. Rules keep payment, cancellation, and a passenger form from being restarted."""
     if _asks_for_filled_form(text):
         return "status"
+    if re.search(r"\bclick\s+continue\b", text or "", re.I) or re.fullmatch(r"continue", (text or "").strip(), re.I):
+        if str(state.get("stage") or "") in {"booking", "passenger", "results", "payment", "login"}:
+            return "book"
     model = (model or "").lower()
     if model not in _INTENTS:
         return local
@@ -1842,9 +1848,15 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             f"{which} is open for {trip} on {seller}. The total is on the screenshot. "
             "Send your Gmail and Indian mobile for the contact step, or a login if you want me to sign in. Nothing paid."
         )
-    if url.startswith("http"):
-        return f"I moved {trip} forward on {seller}. Nothing paid. The screenshot is this step. You can also open {url}"
-    return f"I moved {trip} forward on {seller}. Nothing paid. The screenshot is the page I'm on."
+    if re.search(r"\bcontinue\b", page, re.I) and re.search(
+        r"fare summary|review details|review & traveller", page, re.I
+    ):
+        which = hint or "that flight"
+        return (
+            f"Still on the review step for {which} on {seller}. "
+            "Continue is on the screenshot. Nothing paid."
+        )
+    return f"I'm on the {hint or 'selected'} step for {trip} on {seller}. Nothing paid. The screenshot is the page."
 
 
 def _open_booking(phone: str, text: str, session: BrowserSession, secrets: list[str], started_at: float | None, loaded: dict[str, Any]) -> str:

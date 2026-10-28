@@ -461,6 +461,7 @@ def begin_login(
             context = pw.contexts[0] if pw.contexts else pw.new_context()
             page = context.pages[0] if context.pages else context.new_page()
             outcome: dict[str, str] | None = None
+            checkout_notes = ""
             if seller == "ixigo":
                 page.goto(ixigo_results_url(origin, destination, depart), wait_until="domcontentloaded", timeout=120000)
                 for _ in range(50):
@@ -480,7 +481,7 @@ def begin_login(
                         "url": url or "",
                     }
                 else:
-                    run_checkout_agent(
+                    checkout = run_checkout_agent(
                         page,
                         hint=hint,
                         seller="ixigo",
@@ -493,8 +494,14 @@ def begin_login(
                         max_steps=16,
                         profile=passenger,
                     )
+                    checkout_notes = " | ".join(checkout.log)[:1500]
                     page = _latest(page)
-                if hint:
+                if hint and classify_page(*_read(page), book_count=_book_count(page)) not in {
+                    "passenger",
+                    "review",
+                    "addons",
+                    "pay",
+                }:
                     for _ in range(8):
                         page = _latest(page)
                         if _logged_in(page, seller) or _find(page, "phone", seller) or _otp_visible(page, seller):
@@ -520,6 +527,20 @@ def begin_login(
                     _click(client, sid, page, hit)
                     page.wait_for_timeout(1500)
             # A saved profile can already be signed in. A fare preview must not be overwritten.
+            # A traveller form is not a login screen, even when the header has no Logout text.
+            if outcome is None and seller == "ixigo":
+                text, url = _read(page)
+                stage = classify_page(text, url, book_count=_book_count(page))
+                if stage in {"passenger", "review", "addons", "pay"}:
+                    outcome = {
+                        "status": "held",
+                        "session_id": sid,
+                        "seller": seller,
+                        "screenshot": _shot(page, seller, sid, "held"),
+                        "page": (text or "")[:8000],
+                        "url": url or "",
+                        "notes": checkout_notes,
+                    }
             if outcome is None and _logged_in(page, seller) and not _otp_visible(page, seller):
                 text, url = _read(page)
                 outcome = {
@@ -604,7 +625,7 @@ def begin_login(
                             if _book_count(page) >= 2:
                                 break
                             page.wait_for_timeout(400)
-                        run_checkout_agent(
+                        checkout = run_checkout_agent(
                             page,
                             hint=hint,
                             seller="ixigo",
@@ -617,6 +638,7 @@ def begin_login(
                             max_steps=16,
                             profile=passenger,
                         )
+                        checkout_notes = " | ".join(checkout.log)[:1500]
                         page = _latest(page)
                         text, url = _read(page)
                         outcome = {
@@ -626,6 +648,7 @@ def begin_login(
                             "screenshot": _shot(page, seller, sid, "held"),
                             "page": (text or "")[:8000],
                             "url": url or "",
+                            "notes": checkout_notes,
                         }
             elif ok:
                 outcome = {
@@ -713,8 +736,10 @@ def _apply_otp(client, session_id: str, page, seller: str, code: str) -> dict[st
     logged = False
     still = False
     verifying = False
-    for _attempt in range(30):
-        page.wait_for_timeout(800)
+    # The working login stayed on this page through "Please wait while we verify".
+    # Leaving, or closing the browser, while that text is up drops the account.
+    for _attempt in range(150):
+        page.wait_for_timeout(1000)
         try:
             if page.is_closed():
                 page = _latest(page)
@@ -727,29 +752,22 @@ def _apply_otp(client, session_id: str, page, seller: str, code: str) -> dict[st
             continue
         if _logged_in(page, seller):
             logged = True
+            verifying = False
             break
         if _code_boxes_open(page, seller):
             still = True
             continue
         still = False
         if verifying:
+            verifying = False
             break
-    if verifying and not logged:
-        for _ in range(45):
-            text, _url = _read(page)
-            if not ixigo_verify_in_progress(text):
-                break
-            page.wait_for_timeout(1000)
+    if seller == "ixigo" and not logged and not _code_boxes_open(page, seller) and not verifying:
+        try:
+            page.goto("https://www.ixigo.com/", wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2500)
+        except Exception:
+            pass
         logged = _logged_in(page, seller)
-    if seller == "ixigo" and not logged and not _code_boxes_open(page, seller):
-        text, _url = _read(page)
-        if not ixigo_verify_in_progress(text):
-            try:
-                page.goto("https://www.ixigo.com/", wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(2500)
-            except Exception:
-                pass
-            logged = _logged_in(page, seller)
     if seller == "ixigo" and logged:
         try:
             page.goto("https://www.ixigo.com/", wait_until="domcontentloaded", timeout=60000)

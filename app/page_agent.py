@@ -231,10 +231,14 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
     ):
         return "passenger"
     if re.search(r"review & traveller|fare summary|total amount", hay, re.I) and re.search(
-        r"\b(?:IX|AI|6E|SG|QP)\s?\d+", hay, re.I
+        r"\b(?:IX|AI|6E|SG|QP)[\s-]*\d+", hay, re.I
     ):
         return "review"
-    if re.search(r"passenger details|traveller details", hay, re.I):
+    if re.search(r"fare summary", hay, re.I) and re.search(r"\bcontinue\b", hay, re.I) and not re.search(
+        r"first & middle|first name|last name", hay, re.I
+    ):
+        return "review"
+    if re.search(r"first & middle|first name|last name|add adult|primary passenger", hay, re.I):
         return "passenger"
     if re.search(r"select your fare", hay, re.I):
         return "fare_sheet"
@@ -1002,42 +1006,241 @@ def _fill_ixigo_login_phone(page, phone: str) -> str:
     return f"mobile_miss:{dial_note}"
 
 
+def _field_boxes(page) -> list[dict[str, str]]:
+    """Each visible input with the short wrapper text Ixigo uses as its label."""
+    try:
+        rows = page.evaluate(
+            """() => {
+              const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 8 && r.height > 8 && s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              const labelOf = (el) => {
+                let node = el;
+                for (let i = 0; i < 4 && node.parentElement; i++) {
+                  node = node.parentElement;
+                  const text = (node.innerText || '').replace(/\\s+/g, ' ').trim();
+                  if (text && text.length < 80) return text;
+                }
+                return '';
+              };
+              return [...document.querySelectorAll('input, textarea')].filter(el => vis(el) && !/hidden|radio|checkbox|submit/i.test(el.type || '')).map((el, index) => ({
+                index: String(index),
+                label: labelOf(el),
+                value: el.value || '',
+              }));
+            }"""
+        )
+    except Exception:
+        return []
+    return [row for row in (rows or []) if isinstance(row, dict)]
+
+
+def _set_box(page, index: int, value: str) -> str:
+    """Set one input by its position. ok only when that box keeps the text."""
+    try:
+        stuck = page.evaluate(
+            """({index, value}) => {
+              const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 8 && r.height > 8 && s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              const inputs = [...document.querySelectorAll('input, textarea')].filter(
+                el => vis(el) && !/hidden|radio|checkbox|submit/i.test(el.type || '')
+              );
+              const el = inputs[index];
+              if (!el) return 'gone';
+              el.focus();
+              el.scrollIntoView({block: 'center'});
+              const proto = el instanceof HTMLTextAreaElement
+                ? Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')
+                : Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+              if (proto && proto.set) proto.set.call(el, value);
+              else el.value = value;
+              el.dispatchEvent(new Event('input', {bubbles: true}));
+              el.dispatchEvent(new Event('change', {bubbles: true}));
+              return (el.value || '') === value ? 'ok' : 'soft';
+            }""",
+            {"index": index, "value": value},
+        )
+    except Exception:
+        return "miss"
+    if stuck == "ok":
+        return "ok"
+    if stuck == "gone":
+        return "miss"
+    try:
+        page.evaluate(
+            """(index) => {
+              const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 8 && r.height > 8 && s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              const inputs = [...document.querySelectorAll('input, textarea')].filter(
+                el => vis(el) && !/hidden|radio|checkbox|submit/i.test(el.type || '')
+              );
+              document.querySelectorAll('[data-guide-fill]').forEach(el => el.removeAttribute('data-guide-fill'));
+              if (inputs[index]) inputs[index].setAttribute('data-guide-fill', '1');
+            }""",
+            index,
+        )
+        box = page.locator("[data-guide-fill='1']")
+        box.click(timeout=2000)
+        page.keyboard.press("Control+A")
+        page.keyboard.insert_text(value)
+        got = (box.input_value(timeout=1500) or "").strip()
+        return "ok" if got == value.strip() else "miss"
+    except Exception:
+        return "miss"
+
+
+def _type_labeled(page, labels: tuple[str, ...], value: str, *, optional: bool = False) -> str:
+    """Type into the box whose wrapper text is exactly this label."""
+    if not value:
+        return "skip"
+    wanted = {item.lower() for item in labels}
+    match = next((row for row in _field_boxes(page) if str(row.get("label") or "").strip().lower() in wanted), None)
+    if match is None:
+        return "none" if optional else "miss"
+    if str(match.get("value") or "").strip() == value.strip():
+        return "ok"
+    return _set_box(page, int(match["index"]), value)
+
+
+def _title_selected(page, title: str) -> bool:
+    try:
+        if page.get_by_text(re.compile(r"Please select your title", re.I)).first.is_visible():
+            return False
+    except Exception:
+        pass
+    wanted = re.compile(rf"\b{re.escape(title)}\b", re.I)
+    for row in _field_boxes(page):
+        blob = f"{row.get('label') or ''} {row.get('value') or ''}"
+        if wanted.search(blob) and not re.search(r"first|last|email|mobile|city", blob, re.I):
+            return True
+    return False
+
+
+def _choose_title(page, title: str) -> tuple[str, str]:
+    """Open the Title box and pick Mr or Ms. Returns (status, menu texts seen)."""
+    if not title:
+        return "skip", ""
+    match = next(
+        (row for row in _field_boxes(page) if str(row.get("label") or "").strip().lower() == "title"),
+        None,
+    )
+    if match is None:
+        return "none", ""
+    try:
+        page.evaluate(
+            """(index) => {
+              const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 8 && r.height > 8 && s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              const inputs = [...document.querySelectorAll('input, textarea')].filter(
+                el => vis(el) && !/hidden|radio|checkbox|submit/i.test(el.type || '')
+              );
+              document.querySelectorAll('[data-guide-fill]').forEach(el => el.removeAttribute('data-guide-fill'));
+              const el = inputs[index];
+              if (!el) return;
+              el.setAttribute('data-guide-fill', '1');
+              el.scrollIntoView({block: 'center'});
+            }""",
+            int(match["index"]),
+        )
+        box = page.locator("[data-guide-fill='1']")
+        rect = box.bounding_box()
+        if rect:
+            page.mouse.click(rect["x"] + rect["width"] - 16, rect["y"] + rect["height"] / 2)
+        else:
+            box.click(timeout=2000)
+        page.wait_for_timeout(500)
+        menu = page.evaluate(
+            """(title) => {
+              const want = String(title || '').toLowerCase();
+              const leaves = [...document.querySelectorAll('body *')].filter(node => {
+                if (node.children.length) return false;
+                const text = (node.textContent || '').replace(/\\s+/g, ' ').trim();
+                const r = node.getBoundingClientRect();
+                return text && text.length < 16 && r.width > 4 && r.height > 4 && r.height < 48;
+              });
+              const hit = leaves.find(node => (node.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase().replace(/\\.$/, '') === want);
+              if (hit) hit.click();
+              const seen = [];
+              for (const node of leaves) {
+                const text = (node.textContent || '').replace(/\\s+/g, ' ').trim();
+                if (text && !seen.includes(text) && seen.length < 12) seen.push(text);
+              }
+              return seen.join('|');
+            }""",
+            title,
+        )
+    except Exception:
+        return "miss", ""
+    page.wait_for_timeout(300)
+    if _title_selected(page, title):
+        return "ok", str(menu or "")
+    return "miss", str(menu or "")
+
+
+def _field_state(notes: list[str], tag: str) -> str:
+    for item in notes:
+        if item.startswith(f"{tag}:"):
+            return item.split(":", 1)[1]
+    return ""
+
+
+def _passenger_missing(notes: list[str]) -> list[str]:
+    labels = {
+        "title": "title",
+        "first": "first name",
+        "last": "last name",
+        "email": "email",
+        "phone": "mobile",
+        "dob": "date of birth",
+    }
+    return [label for tag, label in labels.items() if _field_state(notes, tag) in {"miss", "set"}]
+
+
+def _passenger_ready(notes: list[str]) -> bool:
+    """Title, name, and email kept their values. A missing birth-date box is not a failure."""
+    for tag in ("title", "first", "email"):
+        if _field_state(notes, tag) not in {"ok", "typed", "skip", "none"}:
+            return False
+    if _field_state(notes, "last") in {"miss", "set"}:
+        return False
+    if _field_state(notes, "dob") in {"miss", "set"}:
+        return False
+    return True
+
+
 def _fill_passenger_fields(page, profile: dict[str, str]) -> list[str]:
-    notes: list[str] = []
+    """Type every traveller box we have. A label match is that box only, not a neighbour."""
     name = (profile.get("name") or "").strip()
     parts = name.split()
     first, last = (parts[0], " ".join(parts[1:])) if len(parts) >= 2 else (name, "")
-    pairs = [
-        (r"first\s*name|given", first),
-        (r"last\s*name|surname", last),
-        (r"email", profile.get("email") or ""),
-        (r"mobile|phone|contact", profile.get("phone") or ""),
-        (r"date of birth|dob|birth", profile.get("dob") or ""),
-    ]
-    for pattern, value in pairs:
-        if not value:
-            continue
-        ok = False
-        for getter in (
-            lambda p=pattern: page.get_by_placeholder(re.compile(p, re.I)),
-            lambda p=pattern: page.get_by_label(re.compile(p, re.I)),
-        ):
-            try:
-                loc = getter()
-                if loc.count():
-                    loc.first.fill(value, timeout=3000)
-                    ok = True
-                    break
-            except Exception:
-                continue
-        notes.append(f"{pattern}:{'ok' if ok else 'miss'}")
+    phone = re.sub(r"\D", "", profile.get("phone") or "")
+    if phone.startswith("91") and len(phone) == 12:
+        phone = phone[2:]
+    dob = (profile.get("dob") or "").strip()
     gender = (profile.get("gender") or "").strip()
-    if gender:
-        try:
-            page.get_by_text(re.compile(rf"^{re.escape(gender)}$", re.I)).first.click(timeout=2000)
-            notes.append("gender:ok")
-        except Exception:
-            notes.append("gender:miss")
+    title = {"male": "Mr", "female": "Ms"}.get(gender.lower(), "")
+    title_status, title_menu = _choose_title(page, title)
+    notes = [
+        f"title:{title_status}",
+        f"first:{_type_labeled(page, ('first & middle name', 'first name'), first)}",
+        f"last:{_type_labeled(page, ('last name',), last)}",
+        f"email:{_type_labeled(page, ('email',), profile.get('email') or '')}",
+        f"phone:{_type_labeled(page, ('mobile number',), phone)}",
+        f"dob:{_type_labeled(page, ('date of birth', 'dob'), dob, optional=True)}",
+    ]
+    if title_menu:
+        notes.append(f"title_menu:{title_menu[:120]}")
     return notes
 
 
@@ -1164,6 +1367,8 @@ def run_checkout_agent(
             break
         signature = f"{stage}|{url}|{text[:180]}"
         repeat = signature in seen
+        if stage == "passenger" and sum(1 for line in log if line.startswith("first:")) < 2:
+            repeat = False
         seen.add(signature)
         action = None if repeat else deterministic_action(stage, hint=hint, recovers=recovers, url=url)
         loading_waits = sum(1 for line in log if ":loading:wait" in line)
@@ -1249,6 +1454,30 @@ def run_checkout_agent(
         if kind == "fill_passenger":
             notes = _fill_passenger_fields(page, profile)
             log.extend(notes)
+            if not any(item.startswith(("first:ok", "first:typed")) for item in notes):
+                text, url, stage, facts = _snapshot()
+                if (
+                    sum(1 for line in log if line == "review_not_form") < 2
+                    and re.search(r"fare summary", text or "", re.I)
+                    and re.search(r"\bcontinue\b", text or "", re.I)
+                ):
+                    log.append("review_not_form")
+                    if not _safe_continue(page):
+                        log.append("passenger_continue_miss")
+                    _poll_ready(page, {"passenger", "addons", "pay", "review", "error"}, budget_ms=4000)
+                    continue
+                log.append("passenger_unfilled")
+                handoff = "Passenger form is open, but the name did not go into the fields. Nothing paid."
+                return CheckoutOutcome("passenger", text, url, log, facts=facts, checks=checks, handoff=handoff)
+            if not _passenger_ready(notes):
+                text, url, stage, facts = _snapshot()
+                missing = _passenger_missing(notes)
+                handoff = (
+                    "The traveller form is open, but "
+                    + (", ".join(missing) if missing else "a field")
+                    + " did not stick. Nothing paid."
+                )
+                return CheckoutOutcome("passenger", text, url, log, facts=facts, checks=checks, handoff=handoff)
             if not _safe_continue(page):
                 log.append("passenger_continue_miss")
             _poll_ready(page, {"addons", "review", "pay", "passenger", "error"}, budget_ms=3000)

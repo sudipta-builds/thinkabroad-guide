@@ -125,6 +125,38 @@ class DateAndMemory(unittest.TestCase):
         self.assertEqual(stuck["name"], "Sudipta Saikia")
         self.assertEqual(infer_intent(stuck, "Sudipta Saikia"), "details")
 
+    def test_half_details_are_named_and_full_details_are_ready(self) -> None:
+        from app.travel_agent import passenger_details_reply, passenger_gaps
+
+        half = {"name": "Sudipta Saikia", "email": "sudipta@example.com", "stage": "booking"}
+        spoken = passenger_details_reply(half)
+        self.assertIn("date of birth", spoken)
+        self.assertIn("gender", spoken)
+        self.assertIn("I have your name, email", spoken)
+        ready = {
+            "name": "Sudipta Saikia",
+            "email": "sudipta@example.com",
+            "dob": "29/07/1997",
+            "gender": "Male",
+            "phone": "8638586171",
+        }
+        self.assertEqual(passenger_gaps(ready), [])
+        self.assertEqual(passenger_details_reply(ready), "")
+
+    def test_form_is_ready_only_when_title_and_email_stick(self) -> None:
+        from app.page_agent import _passenger_missing, _passenger_ready
+
+        ready = ["title:ok", "first:ok", "last:ok", "email:ok", "phone:ok", "dob:none"]
+        self.assertTrue(_passenger_ready(ready))
+        self.assertEqual(_passenger_missing(ready), [])
+        half = ["title:miss", "first:ok", "last:ok", "email:miss", "phone:ok", "dob:none"]
+        self.assertFalse(_passenger_ready(half))
+        self.assertEqual(_passenger_missing(half), ["title", "email"])
+        # A value that did not stick is not a filled email, even when the name did.
+        soft = ["title:ok", "first:ok", "last:ok", "email:set", "phone:ok", "dob:none"]
+        self.assertFalse(_passenger_ready(soft))
+        self.assertIn("email", _passenger_missing(soft))
+
     def test_deepseek_is_read_before_the_rules(self) -> None:
         from unittest.mock import patch
 
@@ -851,6 +883,16 @@ class SellerChoiceAndProxy(unittest.TestCase):
         )
         self.assertEqual(classify_page(text, "https://www.ixigo.com/flight/booking/1"), "review")
         self.assertNotEqual(classify_page(text, "https://www.ixigo.com/flight/booking/1"), "addons")
+        stepper = (
+            "Flight Selection Review & Traveller Details Add-ons Payment "
+            "Fare Summary Total Amount ₹9,091 Continue Guwahati New Delhi"
+        )
+        self.assertEqual(classify_page(stepper, "https://www.ixigo.com/flight/booking/1"), "review")
+        form = (
+            "Review & Traveller Details Traveller Details Title First & Middle Name Last Name "
+            "Please select your title Nationality India Mobile Number Email Continue"
+        )
+        self.assertEqual(classify_page(form, "https://www.ixigo.com/flight/booking/1"), "passenger")
 
     def test_ixigo_login_modal_is_login(self) -> None:
         text = "Log in to ixigo Enter Mobile Number Continue Sign in with Google"
@@ -890,6 +932,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
 
     def test_review_continues_and_pay_is_done_only(self) -> None:
         self.assertEqual(deterministic_action("review", hint="1:15", recovers=0)["action"], "review_continue")
+        self.assertEqual(deterministic_action("addons", hint="10:45", recovers=0)["action"], "click")
         self.assertEqual(deterministic_action("pay", hint="1:15", recovers=0)["action"], "done")
 
     def test_parse_login_phone_france_and_india(self) -> None:

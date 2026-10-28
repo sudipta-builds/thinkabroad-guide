@@ -245,6 +245,13 @@ def handle_turn(
     if cached:
         db.add_message(phone, "assistant", cached)
         return Reply.of(cached, emoji="✈️")
+    if kind == "details":
+        waiting = passenger_details_reply(state)
+        if waiting:
+            state.pop("busy_at", None)
+            _save(phone, state)
+            db.add_message(phone, "assistant", waiting)
+            return Reply.of(waiting, emoji="📝")
     if kind in _BOOKING and _should_browse(state, text, busy=busy, changed=changed):
         from app.kernel_otp import kernel_configured
 
@@ -1660,6 +1667,45 @@ def _try_fill_payment(phone: str, session: BrowserSession, secrets: list[str]) -
     return note + "\n" + session.read_page()
 
 
+def passenger_gaps(state: dict[str, Any]) -> list[str]:
+    """What the traveller form still needs. Login mobile counts as the contact number."""
+    gaps: list[str] = []
+    if not str(state.get("name") or "").strip():
+        gaps.append("full name")
+    if not str(state.get("email") or "").strip():
+        gaps.append("email")
+    if not str(state.get("dob") or "").strip():
+        gaps.append("date of birth")
+    if not str(state.get("gender") or "").strip():
+        gaps.append("gender")
+    phone = str(state.get("phone") or state.get("login_phone") or "")
+    if not _indian_mobile(phone):
+        gaps.append("Indian mobile")
+    return gaps
+
+
+def passenger_details_reply(state: dict[str, Any]) -> str:
+    """Ask only for the fields that were not sent. Empty when the form can be filled."""
+    gaps = passenger_gaps(state)
+    if not gaps:
+        return ""
+    have = [
+        label
+        for label, key in (
+            ("name", "name"),
+            ("email", "email"),
+            ("date of birth", "dob"),
+            ("gender", "gender"),
+        )
+        if str(state.get(key) or "").strip()
+    ]
+    phone = str(state.get("phone") or state.get("login_phone") or "")
+    if _indian_mobile(phone):
+        have.append("mobile")
+    got = f"I have your {', '.join(have)}. " if have else ""
+    return f"{got}I still need your {', '.join(gaps)} before I fill the form. Nothing paid."
+
+
 def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: BrowserSession) -> str:
     trip = _window_phrase(state)
     seller = _seller_label(str(state.get("seller") or "cleartrip"))
@@ -1711,8 +1757,12 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             missing.append("date of birth")
         if not state.get("gender"):
             missing.append("gender")
-    if not state.get("name") and re.search(r"full name|traveller name|passenger name", page, re.I):
+    if not state.get("name") and re.search(r"full name|traveller name|passenger name|first\s*&\s*middle|first name", page, re.I):
         missing.append("full name")
+    if re.search(r"traveller details|first\s*&\s*middle", page, re.I):
+        waiting = passenger_details_reply(state)
+        if waiting:
+            return waiting
     if missing:
         ahead = ""
         if needs_email or needs_phone:
@@ -1833,7 +1883,20 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
     class _Session:
         page = _Open()
 
-    spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), text, _Session())  # type: ignore[arg-type]
+    notes = str(result.get("notes") or "")
+    filled = (
+        re.search(r"first:(?:ok|typed)\b", notes)
+        and re.search(r"email:(?:ok|typed)\b", notes)
+        and re.search(r"title:(?:ok|typed|none)\b", notes)
+        and not re.search(r"(?:title|first|last|email|dob):(?:miss|set)\b", notes)
+    )
+    waiting = passenger_details_reply(state)
+    if waiting:
+        spoken = waiting
+    elif filled:
+        spoken = f"Filled your details for {str(state.get('selected_hint') or 'that flight')} on {label}. I stopped before payment."
+    else:
+        spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), text, _Session())  # type: ignore[arg-type]
     if re.search(r"\bupi\b|pay now|card number|pay to complete|net banking", text, re.I):
         trip = _window_phrase(state)
         spoken = f"I stopped before payment for {trip} on {label}. Nothing paid. The screenshot is that page."

@@ -1309,10 +1309,17 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertLess(source.index("resume_url"), source.index("ixigo_results_url"))
         click = inspect.getsource(_safe_continue)
         self.assertIn("mouse.click", click)
-        self.assertIn("div, span", click)
+        self.assertIn("elementFromPoint", click)
+        self.assertIn("continue|confirm|proceed", click)
+        self.assertNotIn("pay now", click.lower())
         review = inspect.getsource(run_checkout_agent)
         self.assertIn("Escape closes the Ixigo review sheet", review)
-        self.assertNotIn("_dismiss_overlays(page)", review.split("review_continue")[1][:500])
+        self.assertIn("One accurate click per attempt", review)
+        self.assertIn('sum(1 for line in log if "review_continue" in line) < 3', review)
+        self.assertNotIn('{"action": "done", "target": "review"', review)
+        self.assertNotIn("_dismiss_overlays(page)", review.split("review_continue")[1][:700])
+        handler = review.split('if kind == "review_continue"')[1][:800]
+        self.assertEqual(handler.count("_safe_continue(page)"), 1)
 
 
 if __name__ == "__main__":

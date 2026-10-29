@@ -663,20 +663,42 @@ def _ixigo_opt_out_cancellation(page) -> str:
         page.get_by_text(re.compile(r"don.?t want Free Cancellation", re.I)).first.click(timeout=2500)
         return "optout_text"
     except Exception:
-        return "optout_miss"
+        pass
+    try:
+        clicked = page.evaluate(
+            """() => {
+              const nodes = [...document.querySelectorAll('label, div, span, button, p')];
+              const hit = nodes.find(el => {
+                const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                return text.length > 0 && text.length < 90
+                  && /don.?t want free cancellation|no,? thanks|i don.?t want/i.test(text);
+              });
+              if (!hit) return false;
+              hit.click();
+              return true;
+            }"""
+        )
+        if clicked:
+            return "optout_js"
+    except Exception:
+        pass
+    return "optout_miss"
 
 
 def _safe_continue(page) -> bool:
-    """Click the lowest Continue on the page, never a Pay control.
+    """One mouse click on the visible Continue, Confirm, or Proceed control.
 
-    Ixigo's orange Continue is often a div or span, so a button-only search
-    misses it. A real mouse click is what the page's handler listens for.
+    The target is the smallest on-screen control with that exact label, never a
+    Pay button and never a parent that merely contains the word. The center is
+    checked with elementFromPoint so the click lands on that control.
     """
     try:
         point = page.evaluate(
             """() => {
+              const forward = /^(continue|confirm|proceed)$/i;
               const nodes = [...document.querySelectorAll('button, a, [role=button], div, span')];
-              const hits = nodes.filter(el => {
+              const hits = [];
+              for (const el of nodes) {
                 const own = [...el.childNodes]
                   .filter(n => n.nodeType === 3)
                   .map(n => n.textContent || '')
@@ -685,21 +707,31 @@ def _safe_continue(page) -> bool:
                   .trim();
                 const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
                 const label = own || (text.length <= 24 ? text : '');
-                if (!/^continue$/i.test(label)) return false;
-                if (/\\bpay\\b/i.test(text)) return false;
-                const rect = el.getBoundingClientRect();
-                if (rect.width < 24 || rect.height < 16) return false;
+                if (!forward.test(label) || /\\bpay\\b/i.test(text)) continue;
                 const style = window.getComputedStyle(el);
-                if (style.visibility === 'hidden' || style.display === 'none') return false;
-                return true;
-              });
+                if (style.visibility === 'hidden' || style.display === 'none' || style.pointerEvents === 'none') continue;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 48 || rect.height < 28 || rect.width > 480) continue;
+                hits.push(el);
+              }
               if (!hits.length) return null;
-              hits.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
+              hits.sort((a, b) => {
+                const ra = a.getBoundingClientRect();
+                const rb = b.getBoundingClientRect();
+                const areaA = ra.width * ra.height;
+                const areaB = rb.width * rb.height;
+                if (Math.abs(areaA - areaB) > 400) return areaA - areaB;
+                return rb.top - ra.top;
+              });
               const btn = hits[0];
-              btn.scrollIntoView({block: 'center'});
+              btn.scrollIntoView({block: 'center', inline: 'center'});
               const r = btn.getBoundingClientRect();
-              if (r.width < 24 || r.height < 16) return null;
-              return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+              const x = Math.round(r.x + r.width / 2);
+              const y = Math.round(r.y + r.height / 2);
+              if (x < 1 || y < 1 || x >= window.innerWidth || y >= window.innerHeight) return null;
+              const top = document.elementFromPoint(x, y);
+              if (!top || (top !== btn && !btn.contains(top) && !top.contains(btn))) return null;
+              return {x, y};
             }"""
         )
     except Exception:
@@ -711,10 +743,14 @@ def _safe_continue(page) -> bool:
         except Exception:
             pass
     try:
-        btn = page.get_by_role("button", name=re.compile(r"^Continue", re.I)).last
+        btn = page.get_by_role("button", name=re.compile(r"^(Continue|Confirm|Proceed)$", re.I)).last
         label = (btn.inner_text(timeout=2000) or "").strip()
         if re.search(r"\bpay\b", label, re.I):
             return False
+        box = btn.bounding_box()
+        if box and box.get("width", 0) > 8 and box.get("height", 0) > 8:
+            page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            return True
         btn.click(timeout=5000)
         return True
     except Exception:
@@ -1426,7 +1462,7 @@ def run_checkout_agent(
             action = {"action": "click_time", "target": hint, "value": ""}
         if action is None and stage == "fare_sheet" and sum(1 for line in log if line.startswith("confirm_fare")) < 2:
             action = {"action": "click", "target": "Continue", "value": ""}
-        if action is None and stage == "review" and sum(1 for line in log if "review_continue" in line) < 2:
+        if action is None and stage == "review" and sum(1 for line in log if "review_continue" in line) < 3:
             action = {"action": "review_continue", "target": "Continue", "value": ""}
         if action is None:
             buttons = ", ".join(_buttons(page)[:12])
@@ -1457,11 +1493,14 @@ def run_checkout_agent(
             continue
         if kind == "review_continue":
             # Escape closes the Ixigo review sheet, so the Continue control disappears.
+            # One accurate click per attempt. A miss can be retried; Pay is never clicked.
             log.append(_ixigo_opt_out_cancellation(page))
-            if not _safe_continue(page):
-                log.append("continue_refused_or_missing")
-                break
-            _poll_ready(page, {"login", "otp", "passenger", "addons", "pay", "error"}, budget_ms=6000)
+            log.append(f"continue_click:{_safe_continue(page)}")
+            _poll_ready(
+                page,
+                {"login", "otp", "passenger", "addons", "pay", "error"},
+                budget_ms=6000,
+            )
             continue
         if kind == "login_phone":
             # Do not press Escape here — it closes the Ixigo login drawer.

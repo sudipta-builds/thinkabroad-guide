@@ -89,11 +89,12 @@ _BROWSER = (
     "Work the Guwahati to Delhi trip in Memory. Click the fare they chose (flight hint) instead of opening a new search.\n"
     "If the page needs a login and a vault login exists, fill_saved_login. If it does not, tell_user you need the email and password for that site, then stop.\n"
     "If the page needs a phone, email, name, or OTP you do not have, tell_user that exact missing item, then stop. Do not invent an OTP.\n"
-    "Go as far as the payment page. Then tell_user the page link and ask whether they will pay on that link or want the saved UPI or card filled.\n"
+    "Go as far as the payment page. Then tell_user the total and that nothing is paid. Do not paste a URL.\n"
     "Call fill_payment to type the vault UPI or card, or a one-time CVV or OTP. Never write those digits in a message. Never store CVV or OTP.\n"
-    "Click the Pay button only when the task says pay is authorized. Otherwise leave it and send the link.\n"
+    "Click the Pay button only when the task says pay is authorized. Otherwise stop on the payment page.\n"
     "A screenshot is sent for you when a page loads. Do not call tell_user for that. "
-    "Call tell_user for a missing login, a missing phone or email or OTP, the payment link, or the total. "
+    "Call tell_user for a missing login, a missing phone or email or OTP, or the total. "
+    "Never paste a booking URL, fare key, or 'you can also open'. The screenshot is the page.\n"
     "If a search page has no fares, open the next seller. On a booking page, do not abandon it for a new search.\n"
     "End with a normal message and no tool call when you have asked for the missing item or reached payment. Do not repeat yourself.\n"
     "Call watch_fare with a price you actually saw, so a later change can be sent without them asking.\n"
@@ -112,7 +113,7 @@ _TOOLS: list[dict[str, Any]] = [
     {"type": "function", "function": {"name": "save_login", "description": "Encrypt a site login the traveller just dictated.", "parameters": {"type": "object", "properties": {"site": {"type": "string"}, "username": {"type": "string"}, "password": {"type": "string"}}, "required": ["site", "username", "password"]}}},
     {"type": "function", "function": {"name": "watch_fare", "description": "Remember a price that was visible on the last page.", "parameters": {"type": "object", "properties": {"price": {"type": "integer"}, "url": {"type": "string"}, "note": {"type": "string"}}, "required": ["price", "url"]}}},
     {"type": "function", "function": {"name": "fill_payment", "description": "Type the saved UPI or card, or the one-time CVV or OTP, into the payment form. Do not pass the digits yourself.", "parameters": {"type": "object", "properties": {}}}},
-    {"type": "function", "function": {"name": "page_link", "description": "Return the open page URL so the traveller can pay on it themselves.", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "page_link", "description": "Remember the open page for the next turn. Do not paste the URL into a message.", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "tell_user", "description": "Send a WhatsApp message now, with the latest screenshot. Ask for a missing login, phone, email, or OTP, or send the payment link.", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}},
 ]
 
@@ -327,7 +328,9 @@ def handle_turn(
                 chosen = str(state.get("selected_hint") or "").strip()
                 signed_in = str(state.get("kernel_logged_in") or "") == book_seller
                 trip = _spoken_trip(state)
-                if chosen and signed_in:
+                if chosen and resume_booking_url(state, text):
+                    canned = f"Continuing the {chosen} on {_seller_label(book_seller)}. I'll stop before payment."
+                elif chosen and signed_in:
                     canned = f"Opening the {chosen} on {_seller_label(book_seller)}. I'll stop before payment."
                 elif chosen:
                     canned = (
@@ -338,7 +341,7 @@ def handle_turn(
                     canned = f"You're already logged in on {_seller_label(book_seller)}. Checking {trip}."
                 else:
                     canned = f"Checking {_seller_label(book_seller)} for {trip}."
-            reply = _usable_reply(state, spoken, canned)
+            reply = canned or _usable_reply(state, spoken, _booking_ack(state, kind, text))
         else:
             reply = _usable_reply(state, spoken, _booking_ack(state, kind, text))
         db.add_message(phone, "assistant", reply)
@@ -543,6 +546,8 @@ def _usable_reply(state: dict[str, Any], spoken: str, fallback: str) -> str:
     text = re.sub(r"\s+", " ", spoken or "").strip()
     if not text or len(text) > 400:
         return fallback
+    if re.search(r"https?://", text, re.I) or _CLUMSY_STATUS.search(text):
+        return fallback
     if re.search(r"₹|\bRs\.?\s*\d", text):
         return fallback
     if re.search(r"\b(i paid|payment (is )?done|ticket is booked|you(?:'re| are) charged)\b", text, re.I):
@@ -669,6 +674,28 @@ def redact_for_history(text: str) -> str:
     spoken = _UPI.sub("[upi]", spoken)
     spoken = re.sub(r"\b(cvv|cvc)\s*[:\-]?\s*\d{3,4}\b", r"\1 [omitted]", spoken, flags=re.I)
     return spoken
+
+
+_PAGE_LINK = re.compile(r"https?://\S+", re.I)
+_OPEN_LEAD = re.compile(
+    r"\b(?:you can also open|open this(?: page)?|here(?:'s| is) the link)\b[:\s]*",
+    re.I,
+)
+_CLUMSY_STATUS = re.compile(
+    r"\bmoved\b.+\bforward\b|\byou can also open\b|\bthe screenshot is this step\b",
+    re.I,
+)
+
+
+def _hide_checkout_link(text: str) -> str:
+    """The booking URL stays in the trip record. It is not a WhatsApp message."""
+    spoken = _PAGE_LINK.sub("", text or "")
+    spoken = _OPEN_LEAD.sub("", spoken)
+    spoken = re.sub(r"[ \t]{2,}", " ", spoken)
+    spoken = re.sub(r" *\n *", "\n", spoken)
+    spoken = re.sub(r"\n{3,}", "\n\n", spoken)
+    spoken = re.sub(r"\s+([.!?])", r"\1", spoken)
+    return spoken.strip(" \n-")
 
 
 def _pay_link_reply(state: dict[str, Any]) -> str:
@@ -1267,7 +1294,11 @@ def _task_payload(phone: str, text: str, state: dict[str, Any]) -> str:
             f"Phone: {state.get('phone') or ''}",
             f"Date of birth: {state.get('dob') or ''}",
             f"Gender: {state.get('gender') or ''}",
-            f"Results page already found: {(state.get('live') or {}).get('url') or 'none'}. Open that URL first when booking, then click the chosen flight.",
+            (
+                "A checkout page is already saved. Continue on it. Never paste its URL."
+                if resume_booking_url(state, "")
+                else "No checkout page is saved yet."
+            ),
             f"Stage: {state.get('stage') or 'idle'}.",
             f"Chosen flight: {state.get('selected_hint') or 'not chosen yet'}.",
             f"Pay authorized: {bool(state.get('pay_authorized'))}. Click Pay only when this is true.",
@@ -1662,6 +1693,7 @@ def _book_on_seller(
     # Resume on the open checkout when the traveller just sent details or payment.
     if live_url and kind in {"details", "login", "pay", "book"} and state.get("stage") in {
         "booking",
+        "review",
         "login",
         "passenger",
         "payment",
@@ -2441,9 +2473,19 @@ def _dispatch(phone: str, session: BrowserSession, call: dict[str, Any], secrets
             live["url"] = url
             state["live"] = live
             _save(phone, state)
-            return f"URL: {url}"
+            return "Page saved for the next message. Do not paste the URL."
         if name == "tell_user":
-            spoken = _clean(str(args.get("text") or ""), secrets).strip()
+            raw = str(args.get("text") or "")
+            if _PAGE_LINK.search(raw) or _CLUMSY_STATUS.search(raw):
+                state = _load(phone)
+                spoken = _booking_page_reply(
+                    state,
+                    str(state.get("selected_hint") or ""),
+                    session.last_text or "",
+                    session,
+                )
+            else:
+                spoken = _clean(raw, secrets).strip()
             if not spoken:
                 return "Nothing to send."
             _deliver(phone, spoken, session, secrets)
@@ -2615,7 +2657,7 @@ def _deliver(
 
 
 def _clean(text: str, secrets: list[str]) -> str:
-    spoken = redact_card(text)
+    spoken = _hide_checkout_link(redact_card(text))
     for secret in secrets:
         if secret and len(secret) >= 4 and secret in spoken:
             spoken = spoken.replace(secret, "••••")

@@ -213,6 +213,20 @@ class DateAndMemory(unittest.TestCase):
         self.assertNotIn("http", spoken)
         self.assertNotIn("moved", spoken.lower())
 
+        from app.travel_agent import _clean, _hide_checkout_link, _usable_reply
+
+        dumped = (
+            "I moved Guwahati to Delhi on 2026-12-04 forward on Ixigo. Nothing paid. "
+            "The screenshot is this step. You can also open "
+            "https://www.ixigo.com/flight/booking/1044/abc?fareKey=GAU-DEL-6E5342-04122026"
+        )
+        hidden = _hide_checkout_link(dumped)
+        self.assertNotIn("http", hidden)
+        self.assertNotIn("fareKey", hidden)
+        self.assertEqual(_usable_reply(booking, dumped, "Continuing the 10:45 on Ixigo."), "Continuing the 10:45 on Ixigo.")
+        self.assertNotIn("http", _clean(dumped, []))
+        self.assertNotIn("also open", _clean(dumped, []).lower())
+
     def test_form_is_ready_only_when_title_and_email_stick(self) -> None:
         from app.page_agent import _passenger_missing, _passenger_ready
 

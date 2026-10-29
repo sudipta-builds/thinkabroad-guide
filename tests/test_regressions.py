@@ -1255,5 +1255,51 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(options[1]["arrive"], "15:15")
 
 
+    def test_mid_session_reopens_the_saved_booking_url(self) -> None:
+        import inspect
+
+        from app.kernel_otp import begin_login, is_resume_booking_url
+        from app.page_agent import _safe_continue, run_checkout_agent
+        from app.travel_agent import infer_intent, remember_booking_page, resume_booking_url
+
+        url = "https://www.ixigo.com/flight/booking/1044/abc?fareKey=GAU-DEL-6E5342-04122026"
+        self.assertTrue(is_resume_booking_url(url, "ixigo"))
+        self.assertFalse(is_resume_booking_url("https://www.ixigo.com/search/result/flight", "ixigo"))
+        self.assertFalse(is_resume_booking_url(url, "cleartrip"))
+
+        state = {
+            "seller": "ixigo",
+            "stage": "booking",
+            "selected_hint": "10:45",
+            "origin": "Guwahati",
+            "destination": "Delhi",
+        }
+        shown = (
+            "Fare Summary Total Amount ₹9,967 Review Details Sudipta Saikia "
+            "Continue 6E5342 10:45 GAU"
+        )
+        self.assertEqual(remember_booking_page(state, "ixigo", url, shown), "review")
+        self.assertEqual(state["live"]["url"], url)
+        self.assertEqual(state["live"]["stage"], "review")
+        state["stage"] = "review"
+        self.assertEqual(resume_booking_url(state, "go ahead and confirm"), url)
+        self.assertEqual(infer_intent(state, "go ahead and confirm"), "book")
+        self.assertEqual(resume_booking_url(state, "the 13:15"), "")
+        self.assertEqual(resume_booking_url({**state, "stage": "results"}, "go ahead"), "")
+        self.assertEqual(remember_booking_page(state, "ixigo", "https://www.ixigo.com/search/result/flight", "Book"), "booking")
+        self.assertNotIn("live", state)
+
+        source = inspect.getsource(begin_login)
+        self.assertIn("resume_url", source)
+        self.assertIn("is_resume_booking_url", source)
+        self.assertLess(source.index("resume_url"), source.index("ixigo_results_url"))
+        click = inspect.getsource(_safe_continue)
+        self.assertIn("mouse.click", click)
+        self.assertIn("div, span", click)
+        review = inspect.getsource(run_checkout_agent)
+        self.assertIn("Escape closes the Ixigo review sheet", review)
+        self.assertNotIn("_dismiss_overlays(page)", review.split("review_continue")[1][:500])
+
+
 if __name__ == "__main__":
     unittest.main()

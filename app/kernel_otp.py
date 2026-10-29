@@ -25,6 +25,7 @@ from app.page_agent import (
 from app.search import ixigo_results_url
 
 KERNEL_SELLERS = {"ixigo", "cleartrip"}
+_MID_BOOKING = {"passenger", "review", "addons", "pay", "login", "otp"}
 # Legacy second connection. The prod login keeps the original CDP socket instead.
 _HOLDS: dict[str, dict[str, Any]] = {}
 _HOLD_LOCK = threading.Lock()
@@ -175,6 +176,20 @@ def _client():
 
     key = (get_settings().kernel_api_key or os.getenv("KERNEL_API_KEY") or "").strip()
     return Kernel(api_key=key)
+
+
+def is_resume_booking_url(url: str, seller: str = "") -> bool:
+    """A checkout link we can reopen. A fare-list URL is not one."""
+    raw = (url or "").strip()
+    ixigo = bool(re.search(r"https?://(?:www\.)?ixigo\.com/flight/booking/\S+", raw, re.I))
+    cleartrip = bool(
+        re.search(r"https?://(?:www\.)?cleartrip\.com/\S*(?:itinerary|/flights/)\S*", raw, re.I)
+    )
+    if seller == "ixigo":
+        return ixigo
+    if seller == "cleartrip":
+        return cleartrip
+    return ixigo or cleartrip
 
 
 def _profile(seller: str, whatsapp_phone: str) -> str:
@@ -434,6 +449,7 @@ def begin_login(
     profile: dict[str, str] | None = None,
     on_code_requested: Callable[[dict[str, str]], None] | None = None,
     otp_wait_sec: int = 300,
+    resume_url: str = "",
 ) -> dict[str, str]:
     """Open the seller and request one OTP.
 
@@ -462,7 +478,37 @@ def begin_login(
             page = context.pages[0] if context.pages else context.new_page()
             outcome: dict[str, str] | None = None
             checkout_notes = ""
-            if seller == "ixigo":
+            resume_kept = False
+            # Reopen the saved checkout when the traveller left mid-step. A dead
+            # link falls through and the search runs again with the saved profile.
+            if hint and resume_url and is_resume_booking_url(resume_url, seller):
+                try:
+                    page.goto(resume_url, wait_until="domcontentloaded", timeout=120000)
+                    page.wait_for_timeout(1500)
+                    text, url = _read(page)
+                    stage = classify_page(text, url, book_count=_book_count(page))
+                    if stage in _MID_BOOKING:
+                        checkout = run_checkout_agent(
+                            page,
+                            hint=hint,
+                            seller=seller,
+                            origin=origin,
+                            destination=destination,
+                            depart=depart,
+                            expect_flight="IX1513" if hint == "1:15" else "",
+                            allow_pay=False,
+                            pause_on_auth=True,
+                            max_steps=16,
+                            profile=passenger,
+                        )
+                        checkout_notes = "resume | " + " | ".join(checkout.log)[:1500]
+                        page = _latest(page)
+                        text, url = _read(page)
+                        if classify_page(text, url, book_count=_book_count(page)) in _MID_BOOKING:
+                            resume_kept = True
+                except Exception:
+                    resume_kept = False
+            if seller == "ixigo" and not resume_kept:
                 page.goto(ixigo_results_url(origin, destination, depart), wait_until="domcontentloaded", timeout=120000)
                 for _ in range(50):
                     if _book_count(page) >= 2:
@@ -516,7 +562,7 @@ def begin_login(
                             page.wait_for_timeout(1500)
                             continue
                         break
-            else:
+            elif not resume_kept:
                 page.goto("https://www.cleartrip.com/", wait_until="domcontentloaded", timeout=120000)
                 page.wait_for_timeout(3000)
                 if not _find(page, "phone", seller) and not _logged_in(page, seller):

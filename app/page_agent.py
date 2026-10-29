@@ -667,27 +667,49 @@ def _ixigo_opt_out_cancellation(page) -> str:
 
 
 def _safe_continue(page) -> bool:
-    """Click the lowest Continue on the page, never a Pay control."""
+    """Click the lowest Continue on the page, never a Pay control.
+
+    Ixigo's orange Continue is often a div or span, so a button-only search
+    misses it. A real mouse click is what the page's handler listens for.
+    """
     try:
-        clicked = page.evaluate(
+        point = page.evaluate(
             """() => {
-              const buttons = [...document.querySelectorAll('button, [role=button]')].filter(el => {
+              const nodes = [...document.querySelectorAll('button, a, [role=button], div, span')];
+              const hits = nodes.filter(el => {
+                const own = [...el.childNodes]
+                  .filter(n => n.nodeType === 3)
+                  .map(n => n.textContent || '')
+                  .join(' ')
+                  .replace(/\\s+/g, ' ')
+                  .trim();
                 const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                const label = own || (text.length <= 24 ? text : '');
+                if (!/^continue$/i.test(label)) return false;
+                if (/\\bpay\\b/i.test(text)) return false;
                 const rect = el.getBoundingClientRect();
-                return /^continue\\b/i.test(text) && !/\\bpay\\b/i.test(text) && rect.width > 8 && rect.height > 8;
+                if (rect.width < 24 || rect.height < 16) return false;
+                const style = window.getComputedStyle(el);
+                if (style.visibility === 'hidden' || style.display === 'none') return false;
+                return true;
               });
-              if (!buttons.length) return false;
-              buttons.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
-              const btn = buttons[0];
+              if (!hits.length) return null;
+              hits.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
+              const btn = hits[0];
               btn.scrollIntoView({block: 'center'});
-              btn.click();
-              return true;
+              const r = btn.getBoundingClientRect();
+              if (r.width < 24 || r.height < 16) return null;
+              return {x: r.x + r.width / 2, y: r.y + r.height / 2};
             }"""
         )
-        if clicked:
-            return True
     except Exception:
-        pass
+        point = None
+    if isinstance(point, dict) and point.get("x") is not None and point.get("y") is not None:
+        try:
+            page.mouse.click(float(point["x"]), float(point["y"]))
+            return True
+        except Exception:
+            pass
     try:
         btn = page.get_by_role("button", name=re.compile(r"^Continue", re.I)).last
         label = (btn.inner_text(timeout=2000) or "").strip()
@@ -1434,12 +1456,12 @@ def run_checkout_agent(
             page.wait_for_timeout(1200 if stage == "loading" else 600)
             continue
         if kind == "review_continue":
-            _dismiss_overlays(page)
+            # Escape closes the Ixigo review sheet, so the Continue control disappears.
             log.append(_ixigo_opt_out_cancellation(page))
             if not _safe_continue(page):
                 log.append("continue_refused_or_missing")
                 break
-            _poll_ready(page, {"login", "otp", "passenger", "addons", "pay", "error"}, budget_ms=3000)
+            _poll_ready(page, {"login", "otp", "passenger", "addons", "pay", "error"}, budget_ms=6000)
             continue
         if kind == "login_phone":
             # Do not press Escape here — it closes the Ixigo login drawer.

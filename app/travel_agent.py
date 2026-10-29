@@ -147,12 +147,15 @@ def handle_turn(
 
         state["preferred_seller"] = next_bookable_seller(str(state.get("seller") or state.get("preferred_seller") or ""))
         state["seller"] = state["preferred_seller"]
+        state.pop("live", None)
         kind = "book"
     else:
         from app.search import NOT_BOOKABLE
 
         named = named_seller_from(text)
         if kind == "book" and named and named not in NOT_BOOKABLE:
+            if named != str(state.get("seller") or state.get("preferred_seller") or ""):
+                state.pop("live", None)
             state["preferred_seller"] = named
             state["seller"] = named
     _apply_stage(state, text, kind)
@@ -469,19 +472,25 @@ def infer_intent(state: dict[str, Any], text: str) -> str:
         return "book"
     if state.get("options") and re.search(r"\b(go ahead|book it|take it|do it)\b", raw, re.I):
         return "book"
+    if re.search(r"\b(go ahead|confirm|book it|take it|do it)\b", raw, re.I):
+        stage = str(state.get("stage") or "")
+        if stage == "payment":
+            return "pay"
+        if stage in {"booking", "review", "passenger", "login"}:
+            return "book"
     if re.search(r"\b(book|buy|reserve)\b", raw, re.I):
         return "book"
     if re.search(r"\bclick\s+continue\b", raw, re.I) or re.fullmatch(r"continue", raw, re.I):
-        if str(state.get("stage") or "") in {"booking", "passenger", "results", "payment", "login"}:
+        if str(state.get("stage") or "") in {"booking", "passenger", "results", "payment", "login", "review"}:
             return "book"
     if _TIME.search(raw) or re.search(r"\b(that one|this one|spicejet|indigo|done|take it)\b", raw, re.I):
-        if state.get("stage") in {"results", "booking", "payment", "login", "passenger"} or _TIME.search(raw):
+        if state.get("stage") in {"results", "booking", "payment", "login", "passenger", "review"} or _TIME.search(raw):
             return "select"
     if _YES.match(raw):
         stage = str(state.get("stage") or "")
         if stage == "payment":
             return "pay"
-        if stage in {"results", "booking", "login", "passenger"}:
+        if stage in {"results", "booking", "login", "passenger", "review"}:
             return "book"
         return "search"
     if re.search(r"\b(fly|flying|flight|flights|fare|fares|search|check|show|want to fly|wanna fly)\b", raw, re.I):
@@ -494,8 +503,10 @@ def _merge_intent(local: str, model: str, text: str, state: dict[str, Any]) -> s
     if _asks_for_filled_form(text):
         return "status"
     if re.search(r"\bclick\s+continue\b", text or "", re.I) or re.fullmatch(r"continue", (text or "").strip(), re.I):
-        if str(state.get("stage") or "") in {"booking", "passenger", "results", "payment", "login"}:
+        if str(state.get("stage") or "") in {"booking", "passenger", "results", "payment", "login", "review"}:
             return "book"
+    if local == "book" and resume_booking_url(state, text):
+        return "book"
     model = (model or "").lower()
     if model not in _INTENTS:
         return local
@@ -506,7 +517,7 @@ def _merge_intent(local: str, model: str, text: str, state: dict[str, Any]) -> s
     if local == "login" and re.search(r"log ?in|sign ?in|password", text or "", re.I):
         return local
     passenger = bool(_EMAIL.search(text or "") or _DOB.search(text or "") or _GENDER.search(text or ""))
-    booking = str(state.get("stage") or "") in {"booking", "passenger", "login", "payment", "results"}
+    booking = str(state.get("stage") or "") in {"booking", "passenger", "login", "payment", "results", "review"}
     if passenger and booking and "details" in {local, model}:
         return "details"
     return model
@@ -564,9 +575,13 @@ def resolve_intent(text: str, state: dict[str, Any], prior: list[dict[str, Any]]
 
 def _apply_stage(state: dict[str, Any], text: str, kind: str) -> None:
     hint = _flight_hint(text)
+    saved_hint = str(state.get("selected_hint") or "")
+    if hint and saved_hint and hint != saved_hint:
+        state.pop("live", None)
     if hint:
         state["selected_hint"] = hint
     if kind == "search":
+        state.pop("live", None)
         state["stage"] = "searching"
         state["pay_authorized"] = False
     elif kind == "select":
@@ -738,6 +753,59 @@ _OTHER_SELLER = re.compile(
 
 def _wants_other_seller(text: str) -> bool:
     return bool(_OTHER_SELLER.search(text or ""))
+
+
+def resume_booking_url(state: dict[str, Any], text: str = "") -> str:
+    """Saved checkout link for this same trip. Empty when the traveller changed it."""
+    from app.kernel_otp import is_resume_booking_url
+
+    live = state.get("live") if isinstance(state.get("live"), dict) else {}
+    url = str(live.get("url") or "")
+    seller = str(state.get("seller") or state.get("preferred_seller") or "")
+    if not is_resume_booking_url(url, seller):
+        return ""
+    stage = str(state.get("stage") or live.get("stage") or "")
+    if stage not in {"booking", "review", "passenger", "payment", "login", "addons"}:
+        return ""
+    hint = _flight_hint(text)
+    saved = str(state.get("selected_hint") or "")
+    if hint and saved and hint != saved:
+        return ""
+    named = named_seller_from(text)
+    if named and named != seller:
+        return ""
+    return url
+
+
+def remember_booking_page(state: dict[str, Any], seller: str, url: str, page_text: str) -> str:
+    """Store the open checkout URL and the step it shows. Returns the chat stage."""
+    from urllib.parse import urlparse
+
+    from app.kernel_otp import is_resume_booking_url
+    from app.page_agent import classify_page
+
+    if not is_resume_booking_url(url, seller):
+        live = state.get("live") if isinstance(state.get("live"), dict) else {}
+        if is_resume_booking_url(str(live.get("url") or ""), seller):
+            state.pop("live", None)
+        return "booking"
+    shown = classify_page(page_text, url)
+    host = (urlparse(url).hostname or seller).lower()
+    state["live"] = {
+        "host": host,
+        "url": url,
+        "stage": shown,
+        "prices": False,
+        "blocked": False,
+    }
+    # A payment page stays "booking" so "go ahead" reopens it and stops.
+    # Paying still requires an explicit pay message.
+    return {
+        "passenger": "passenger",
+        "review": "review",
+        "login": "login",
+        "otp": "login",
+    }.get(shown, "booking")
 
 
 def _bookable_live_url(url: str) -> str:
@@ -1936,6 +2004,10 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
     shots = [result["screenshot"]] if result.get("screenshot") else None
     label = _seller_label(seller)
     if str(result.get("status") or "") in {"already_logged_in", "fares"}:
+        from app.kernel_otp import is_resume_booking_url
+
+        if not is_resume_booking_url(str(result.get("url") or ""), seller):
+            state.pop("live", None)
         options = fare_options(text)
         state["stage"] = "results"
         if options:
@@ -1950,9 +2022,9 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         intro = f"You're already logged in on {label}.\n" if signed_in else ""
         _deliver(phone, f"{intro}{body}", None, secrets, shot_paths=shots)
         return
-    state["stage"] = "booking"
-    _save(phone, state)
     page_url = str(result.get("url") or "")
+    state["stage"] = remember_booking_page(state, seller, page_url, text)
+    _save(phone, state)
 
     class _Open:
         url = page_url
@@ -2018,6 +2090,7 @@ def _run_kernel_login(
             for key in ("name", "email", "phone", "dob", "gender")
         },
         on_code_requested=on_code_requested,
+        resume_url=resume_booking_url(loaded, text),
     )
     status = str(result.get("status") or "")
     if status == "otp_sent" and not announced:

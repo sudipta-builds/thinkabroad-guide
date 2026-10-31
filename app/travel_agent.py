@@ -1970,6 +1970,12 @@ def _addon_upsell(page: str) -> str:
     hay = page or ""
     if not re.search(r"free cancellation|\bassured\b", hay, re.I):
         return ""
+    if re.search(
+        r"i don.?t want free cancellation|please select an option before proceeding",
+        hay,
+        re.I,
+    ):
+        return "radio"
     if re.search(r"no,?\s*thanks|secure my trip|buy this|with assured", hay, re.I):
         if re.search(r"secure my trip|buy this", hay, re.I):
             return "secure"
@@ -2045,13 +2051,24 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             "I can't tap UPI or net banking myself. Approve that amount and say pay with card "
             "(or send a card to the vault), or say you'll pay yourself and I'll send the link."
         )
-    from app.step_read import describe_step, read_step
+    from app.step_read import decline_tap, describe_step, read_step
 
-    heard = read_step(page, seller=seller, hint=which)
-    if heard and heard.get("kind") != "pay":
+    controls = ""
+    if session.page is not None:
+        try:
+            from app.page_agent import control_digest
+
+            controls = control_digest(session.page)
+        except Exception:
+            controls = ""
+    heard = read_step(page, seller=seller, hint=which, controls=controls)
+    hay = f"{page or ''}\n{controls}"
+    if heard and heard.get("kind") in {"upsell", "other"}:
+        tap = heard.get("tap") or decline_tap(hay)
+        heard["tap"] = tap
         state["pending_step"] = {
-            "tap": heard.get("tap") or "",
-            "page": (page or "")[:1500],
+            "tap": tap,
+            "page": hay[:1500],
             "kind": heard.get("kind") or "other",
         }
         state["stuck_kind"] = heard.get("kind") or "other"
@@ -2078,7 +2095,10 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             missing.append("gender")
     if not state.get("name") and re.search(r"full name|traveller name|passenger name|first\s*&\s*middle|first name", page, re.I):
         missing.append("full name")
-    if re.search(r"traveller details|first\s*&\s*middle", page, re.I):
+    saved_list = bool(re.search(r"choose from the saved list", page, re.I)) and bool(
+        re.search(r"\b(mr|ms|mrs|mx)\b", page, re.I)
+    )
+    if re.search(r"traveller details|first\s*&\s*middle", page, re.I) and not saved_list:
         waiting = passenger_details_reply(state)
         if waiting:
             gaps = passenger_gaps(state)
@@ -2099,13 +2119,18 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         )
     offer = _addon_upsell(page)
     if offer:
-        cta = "No, Thanks vs Secure My Trip" if offer == "secure" else "No, Thanks vs the paid extra"
+        if offer == "radio":
+            cta = "I don't want Free Cancellation vs Assured"
+            rec = "skip. I'll tick I don't want Free Cancellation and your saved traveller. I will not buy Assured"
+        else:
+            cta = "No, Thanks vs Secure My Trip" if offer == "secure" else "No, Thanks vs the paid extra"
+            rec = "skip. I'll tap No, Thanks. I will not buy Assured"
         return _stuck_line(
             state,
             "addon_buy",
             f"{seller}'s paid Free Cancellation / Assured pop-up on the {which} ({cta})",
-            "an extra they want to sell — Continue is behind it, so saying continue does not move the booking",
-            "skip. I'll tap No, Thanks. I will not buy Assured",
+            "an extra they want to sell — Continue stays blocked until a cancellation option and a traveller are ticked",
+            rec,
         )
     if shown == "addons" or re.search(r"choose your seat|add meal|skip add-?ons|extra baggage", page, re.I):
         return _stuck_line(

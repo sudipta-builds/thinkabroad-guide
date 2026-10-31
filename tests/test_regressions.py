@@ -13,6 +13,7 @@ from app.page_agent import (
     card_matches_depart_hint,
     classify_page,
     complete_ixigo_login_after_otp,
+    control_digest,
     deterministic_action,
     extract_trip_facts,
     install_ixigo_otpless_tap,
@@ -228,6 +229,17 @@ class DateAndMemory(unittest.TestCase):
         self.assertIn("skip", cancel.lower())
         self.assertNotIn("look at the screenshot", cancel.lower())
         self.assertNotIn("Continue is on the screenshot", cancel)
+        radio = _booking_page_reply(
+            {**booking, "selected_hint": "12:30", "name": "Sudipta Saikia"},
+            "12:30",
+            "Add Free Cancellation to your trip Please select an option before proceeding "
+            "Assured Free Cancellation Assured Flex I don't want Free Cancellation. Pay ₹3,200 fee "
+            "Traveller Details Choose from the saved list Mr Sudipta Saikia Continue",
+            _Session(),  # type: ignore[arg-type]
+        )
+        self.assertIn("I don't want Free Cancellation", radio)
+        self.assertIn("saved traveller", radio.lower())
+        self.assertIn("skip", radio.lower())
         assured = _booking_page_reply(
             {**booking, "selected_hint": "12:30"},
             "12:30",
@@ -300,9 +312,86 @@ class DateAndMemory(unittest.TestCase):
 
         pending = {"tap": "Not this time", "page": page, "kind": "upsell"}
         self.assertEqual(accept_choice("yes", pending), "Not this time")
-        self.assertEqual(accept_choice("continue", pending), "")
-        self.assertEqual(accept_choice("Secure My Trip", {"tap": "No, Thanks", "page": "No, Thanks Secure My Trip", "kind": "upsell"}), "Secure My Trip")
+        self.assertEqual(accept_choice("continue", pending), "Not this time")
+        self.assertEqual(accept_choice("yes", {"tap": "", "page": page, "kind": "upsell"}), "Not this time")
+        self.assertEqual(
+            accept_choice("yes", {"tap": "", "page": "Fare Summary Continue Traveller Details", "kind": "upsell"}),
+            "__recommended__",
+        )
+        radio = "Add Free Cancellation I don't want Free Cancellation Assured Continue Mr Sudipta Saikia"
+        self.assertEqual(accept_choice("yes", {"tap": "Decline", "page": radio, "kind": "upsell"}), "I don't want Free Cancellation")
+        self.assertEqual(accept_choice("Secure My Trip", {"tap": "No, Thanks", "page": "No, Thanks Secure My Trip", "kind": "upsell"}), "")
         self.assertEqual(accept_choice("pay now", {"tap": "No, Thanks", "page": "Pay now No, Thanks", "kind": "upsell"}), "")
+
+    def test_control_digest_and_unknown_steps_wait(self) -> None:
+        import inspect
+        from unittest.mock import patch
+
+        from app.step_read import read_step
+        from app.travel_agent import _booking_page_reply
+
+        class _Page:
+            url = "https://www.ixigo.com/flight/booking/unknown"
+
+            def evaluate(self, _script):
+                return (
+                    "radio[ ] Assured\n"
+                    "radio[ ] I don't want Free Cancellation\n"
+                    "check[ ] Mr Sudipta Saikia\n"
+                    "btn[ ] Continue"
+                )
+
+        digest = control_digest(_Page())
+        self.assertIn("radio[ ] Assured", digest)
+        self.assertIn("check[ ] Mr Sudipta Saikia", digest)
+        src = inspect.getsource(control_digest)
+        self.assertIn("input[type=radio]", src)
+        self.assertIn("[role=checkbox]", src)
+        os.environ["GUIDE_STEP_READ"] = "1"
+        try:
+            with (
+                patch("app.step_read.step_read_enabled", return_value=True),
+                patch("app.llm.converse") as converse,
+            ):
+                converse.return_value = {
+                    "kind": "other",
+                    "what": "Ixigo is asking for trip insurance I have not seen before",
+                    "why": "not a known login or traveller form",
+                    "recommend": "skip it",
+                    "tap": "Not this time",
+                }
+                heard = read_step(
+                    "Trip cover Not this time",
+                    seller="ixigo",
+                    hint="12:30",
+                    controls="btn[ ] Not this time\ncheck[ ] Mr X",
+                )
+                prompt = converse.call_args[0][1]
+                spoken = _booking_page_reply(
+                    {
+                        "origin": "Guwahati",
+                        "destination": "Delhi",
+                        "depart": "2026-12-04",
+                        "seller": "ixigo",
+                        "selected_hint": "12:30",
+                    },
+                    "12:30",
+                    "Unknown insurance sheet Not this time",
+                    type("S", (), {"page": _Page()})(),
+                )
+        finally:
+            os.environ["GUIDE_STEP_READ"] = "0"
+        self.assertIsNotNone(heard)
+        self.assertEqual(heard["kind"], "other")
+        self.assertIn("Controls", prompt)
+        self.assertIn("check[ ] Mr X", prompt)
+        self.assertIn("insurance", spoken.lower())
+        self.assertIn("haven't tapped", spoken.lower())
+        loop = inspect.getsource(run_checkout_agent)
+        self.assertIn("return _pause_unknown", loop)
+        pause = loop.split("if action is None:")[-1]
+        self.assertIn("_pause_unknown", pause)
+        self.assertLess(pause.index("if not chosen_tap"), pause.index("_ask_model"))
 
     def test_checkout_links_stay_out_of_whatsapp(self) -> None:
         from app.travel_agent import _clean, _hide_checkout_link, _usable_reply
@@ -1412,7 +1501,12 @@ class SellerChoiceAndProxy(unittest.TestCase):
         import inspect
 
         from app.kernel_otp import begin_login, is_resume_booking_url
-        from app.page_agent import _ixigo_opt_out_cancellation, _safe_continue, run_checkout_agent
+        from app.page_agent import (
+            _ixigo_opt_out_cancellation,
+            _safe_continue,
+            _select_saved_traveller,
+            run_checkout_agent,
+        )
         from app.travel_agent import infer_intent, remember_booking_page, resume_booking_url
 
         url = "https://www.ixigo.com/flight/booking/1044/abc?fareKey=GAU-DEL-6E5342-04122026"
@@ -1457,16 +1551,23 @@ class SellerChoiceAndProxy(unittest.TestCase):
         opt = inspect.getsource(_ixigo_opt_out_cancellation)
         self.assertIn("buy this", opt.lower())
         self.assertIn("continue without", opt.lower())
+        self.assertIn("don.?t want Free Cancellation", inspect.getsource(_select_saved_traveller) + inspect.getsource(_ixigo_opt_out_cancellation))
+        pick = inspect.getsource(_select_saved_traveller)
+        self.assertIn("input[type=checkbox]", pick)
         review = inspect.getsource(run_checkout_agent)
         self.assertIn("Escape closes the Ixigo review sheet", review)
         self.assertIn("One accurate click per attempt", review)
         self.assertIn('sum(1 for line in log if "review_continue" in line) < 3', review)
         self.assertNotIn('{"action": "done", "target": "review"', review)
         self.assertNotIn("_dismiss_overlays(page)", review.split("review_continue")[1][:700])
-        handler = review.split('if kind == "review_continue"')[1][:1800]
+        handler = review.split('if kind == "review_continue"')[1][:2200]
         self.assertEqual(handler.count("_safe_continue(page)"), 1)
         self.assertIn("_ixigo_opt_out_cancellation", handler)
-        self.assertLess(handler.index('CheckoutOutcome(\n                        "ask"'), handler.index("_safe_continue(page)"))
+        self.assertIn("_select_saved_traveller", handler)
+        self.assertIn("_ixigo_buy_this_visible", handler)
+        self.assertIn("_pause_unknown", handler)
+        self.assertLess(handler.index("_select_saved_traveller"), handler.index("_safe_continue(page)"))
+        self.assertLess(handler.index("_pause_unknown"), handler.index("_safe_continue(page)"))
 
 
 if __name__ == "__main__":

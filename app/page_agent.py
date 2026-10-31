@@ -321,6 +321,102 @@ def deterministic_action(stage: str, *, hint: str, recovers: int, url: str = "")
     return None
 
 
+def control_digest(page) -> str:
+    """Visible radios, checkboxes, and buttons with selected/disabled state.
+
+    [x] is on, [ ] is off, a trailing ! is disabled. Empty when the DOM cannot be read.
+    """
+    try:
+        raw = page.evaluate(
+            """() => {
+              const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 4 && r.height > 4 && s.visibility !== 'hidden'
+                  && s.display !== 'none' && r.bottom > 0 && r.top < innerHeight;
+              };
+              const labelOf = (el) => {
+                const aria = el.getAttribute('aria-label') || '';
+                let t = (el.innerText || aria || el.value || '').replace(/\\s+/g, ' ').trim();
+                if ((!t || t.length > 100) && el.id) {
+                  const lab = document.querySelector('label[for=\"' + String(el.id).replace(/\"/g, '') + '\"]');
+                  if (lab) t = (lab.innerText || '').replace(/\\s+/g, ' ').trim();
+                }
+                if (!t || t.length > 100) {
+                  const wrap = el.closest('label');
+                  if (wrap) t = (wrap.innerText || '').replace(/\\s+/g, ' ').trim();
+                }
+                return t.slice(0, 80);
+              };
+              const onOf = (el) => !!(el.checked
+                || el.getAttribute('aria-checked') === 'true'
+                || el.getAttribute('aria-pressed') === 'true');
+              const disOf = (el) => !!(el.disabled || el.getAttribute('aria-disabled') === 'true');
+              const lines = [];
+              const seen = new Set();
+              const add = (kind, el) => {
+                if (!vis(el)) return;
+                const t = labelOf(el);
+                if (!t || t.length < 2) return;
+                const line = kind + '[' + (onOf(el) ? 'x' : ' ') + ']' + (disOf(el) ? '!' : '') + ' ' + t;
+                if (seen.has(line)) return;
+                seen.add(line);
+                lines.push(line);
+              };
+              for (const el of document.querySelectorAll('input[type=radio],[role=radio]')) add('radio', el);
+              for (const el of document.querySelectorAll('input[type=checkbox],[role=checkbox]')) add('check', el);
+              for (const el of document.querySelectorAll('button,a,[role=button]')) add('btn', el);
+              return lines.slice(0, 36).join('\\n');
+            }"""
+        )
+    except Exception:
+        return ""
+    return str(raw or "").strip()
+
+
+def _pause_unknown(
+    page,
+    *,
+    seller: str,
+    hint: str,
+    text: str,
+    url: str,
+    log: list[str],
+    facts: dict[str, str],
+    checks: list[str],
+    step: int,
+) -> CheckoutOutcome:
+    """Stop before a guessed click. WhatsApp gets the control list via describe_step."""
+    digest = control_digest(page)
+    from app.step_read import decline_tap, describe_step, read_step
+
+    heard = read_step(text, seller=seller, hint=hint, controls=digest)
+    hay = f"{text or ''}\n{digest}"
+    if not heard:
+        heard = {
+            "kind": "other",
+            "what": f"a {seller} step I don't treat as a known booking screen",
+            "why": "there is no fixed click for this layout",
+            "recommend": "send the exact button you want, or reply yes to skip extras and continue",
+            "tap": decline_tap(hay),
+        }
+    elif not heard.get("tap"):
+        heard["tap"] = decline_tap(hay)
+    facts["tap"] = heard.get("tap") or ""
+    facts["controls"] = digest[:800]
+    handoff = describe_step(heard)
+    log.append(f"{step}:ask:{heard.get('kind')}:{facts['tap']}")
+    return CheckoutOutcome(
+        "ask",
+        text,
+        url,
+        log,
+        facts=facts,
+        checks=checks,
+        handoff=handoff,
+    )
+
+
 def _buttons(page) -> list[str]:
     try:
         labels = page.evaluate(
@@ -603,16 +699,25 @@ def _poll_ready(page, ready: set[str], *, budget_ms: int = 4000, step_ms: int = 
 
 def _click_label(page, label: str) -> bool:
     wanted = (label or "").strip()
-    if not wanted:
+    if not wanted or wanted.startswith("__"):
         return False
     try:
         return bool(
             page.evaluate(
                 """(label) => {
                     const want = label.trim().toLowerCase();
-                    const nodes = [...document.querySelectorAll('button,a,[role=button]')];
-                    const exact = nodes.find(b => (b.innerText || '').trim().toLowerCase() === want);
-                    const fuzzy = exact || nodes.find(b => (b.innerText || '').trim().toLowerCase().includes(want));
+                    const nodes = [...document.querySelectorAll(
+                      'button,a,[role=button],label,input[type=radio],input[type=checkbox],[role=radio],[role=checkbox],span,p,div'
+                    )];
+                    const textOf = (el) => (
+                      (el.innerText || el.getAttribute('aria-label') || el.value || '')
+                        .replace(/\\s+/g, ' ').trim().toLowerCase()
+                    );
+                    const exact = nodes.find(b => textOf(b) === want);
+                    const fuzzy = exact || nodes.find(b => {
+                      const t = textOf(b);
+                      return t && t.length <= 120 && t.includes(want);
+                    });
                     if (!fuzzy) return false;
                     fuzzy.scrollIntoView({block:'center'});
                     fuzzy.click();
@@ -690,6 +795,63 @@ def _tap_step_decline(page) -> str:
     tap = str((heard or {}).get("tap") or "")
     if tap and _click_label(page, tap):
         return f"step_tap:{tap}"
+    return ""
+
+
+def _select_saved_traveller(page, name: str = "") -> str:
+    """Tick one saved adult on Ixigo Review & Traveller Details. Empty when none."""
+    wanted = re.sub(r"\s+", " ", (name or "").strip()).lower()
+    wanted = re.sub(r"^(mr|ms|mrs|mx)\.?\s+", "", wanted)
+    try:
+        picked = page.evaluate(
+            """(want) => {
+              const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 4 && r.height > 4 && s.visibility !== 'hidden'
+                  && s.display !== 'none' && r.bottom > 0 && r.top < innerHeight;
+              };
+              const rowText = (el) => {
+                let node = el;
+                for (let i = 0; i < 8 && node; i++) {
+                  const t = ((node.innerText || node.getAttribute && node.getAttribute('aria-label')) || '')
+                    .replace(/\\s+/g, ' ').trim().toLowerCase();
+                  if (t.length > 6 && /\\b(mr|ms|mrs|mx)\\b/.test(t)) return t;
+                  node = node.parentElement;
+                }
+                return '';
+              };
+              const boxes = [...document.querySelectorAll(
+                'input[type=checkbox],[role=checkbox],input[type=radio]'
+              )].filter(vis);
+              const adults = boxes.filter((el) => {
+                const t = rowText(el);
+                return t && !/i don.?t want|free cancellation|assured/.test(t);
+              });
+              const match = (want && adults.find((el) => rowText(el).includes(want)))
+                || adults[0];
+              if (match) {
+                const already = match.checked || match.getAttribute('aria-checked') === 'true';
+                if (!already) match.click();
+                return already ? 'already' : 'clicked';
+              }
+              const cards = [...document.querySelectorAll('label,button,div,li')].filter(vis);
+              const card = cards.find((el) => {
+                const t = (el.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                if (!t || t.length > 90) return false;
+                if (!/\\b(mr|ms|mrs|mx)\\b/.test(t)) return false;
+                if (/i don.?t want|free cancellation|assured|continue|lock price/.test(t)) return false;
+                return !want || t.includes(want);
+              });
+              if (card) { card.click(); return 'card'; }
+              return '';
+            }""",
+            wanted,
+        )
+        if picked:
+            return f"traveller_{picked}"
+    except Exception:
+        return ""
     return ""
 
 
@@ -1481,7 +1643,9 @@ def run_checkout_agent(
         if tap_pending:
             label = tap_pending
             tap_pending = ""
-            if re.search(r"pay now|pay to complete|make payment", label, re.I) and not allow_pay:
+            if label.startswith("__"):
+                log.append("user_tap:recommended")
+            elif re.search(r"pay now|pay to complete|make payment", label, re.I) and not allow_pay:
                 log.append("user_tap_refused")
             elif _click_label(page, label):
                 log.append(f"user_tap:{label}")
@@ -1540,10 +1704,24 @@ def run_checkout_agent(
         if action is None and stage == "review" and sum(1 for line in log if "review_continue" in line) < 3:
             action = {"action": "review_continue", "target": "Continue", "value": ""}
         if action is None:
+            if not chosen_tap:
+                return _pause_unknown(
+                    page,
+                    seller=seller,
+                    hint=hint,
+                    text=text,
+                    url=url,
+                    log=log,
+                    facts=facts,
+                    checks=checks,
+                    step=step,
+                )
             buttons = ", ".join(_buttons(page)[:12])
+            digest = control_digest(page)
             action = _ask_model(
                 f"Seller {seller}. Trip {origin} to {destination} on {depart}. Time {hint or 'any'}.\n"
-                f"Stage {stage}. URL {url}.\nButtons: {buttons}\nPage:\n{text[:1200]}"
+                f"Stage {stage}. URL {url}.\nButtons: {buttons}\n"
+                f"Controls:\n{digest[:800]}\nPage:\n{text[:1000]}"
             ) or {"action": "stuck", "target": stage, "value": ""}
         kind = action["action"]
         log.append(f"{step}:{stage}:{kind}:{action.get('target')}")
@@ -1568,30 +1746,27 @@ def run_checkout_agent(
             continue
         if kind == "review_continue":
             # Escape closes the Ixigo review sheet, so the Continue control disappears.
-            # An upsell or an unknown step is explained and left untouched until the traveller answers.
-            if not chosen_tap:
-                from app.step_read import describe_step, read_step
-
-                heard = read_step(text, seller=seller, hint=hint)
-                if heard and heard.get("kind") in {"upsell", "other"}:
-                    facts["tap"] = heard.get("tap") or ""
-                    handoff = describe_step(heard)
-                    log.append(f"{step}:ask:{heard.get('kind')}:{facts['tap']}")
-                    return CheckoutOutcome(
-                        "ask",
-                        text,
-                        url,
-                        log,
-                        facts=facts,
-                        checks=checks,
-                        handoff=handoff,
-                    )
-            # One accurate click per attempt. A miss can be retried; Pay is never clicked.
+            # Decline paid extras and tick a saved traveller before Continue.
+            # Ask only when a buy overlay still covers Continue and the traveller has not chosen.
             log.append(_ixigo_opt_out_cancellation(page))
+            log.append(_select_saved_traveller(page, str(profile.get("name") or "")))
             try:
                 page.wait_for_timeout(400)
             except Exception:
                 pass
+            if not chosen_tap and _ixigo_buy_this_visible(page):
+                return _pause_unknown(
+                    page,
+                    seller=seller,
+                    hint=hint,
+                    text=text,
+                    url=url,
+                    log=log,
+                    facts=facts,
+                    checks=checks,
+                    step=step,
+                )
+            # One accurate click per attempt. A miss can be retried; Pay is never clicked.
             log.append(f"continue_click:{_safe_continue(page)}")
             _poll_ready(
                 page,
@@ -1635,8 +1810,16 @@ def run_checkout_agent(
                 return CheckoutOutcome("otp", text, url, log, facts=facts, checks=checks, handoff=handoff)
             continue
         if kind == "fill_passenger":
+            saved = _select_saved_traveller(page, str(profile.get("name") or ""))
+            if saved:
+                log.append(saved)
             notes = _fill_passenger_fields(page, profile)
             log.extend(notes)
+            if saved.startswith("traveller_"):
+                if not _safe_continue(page):
+                    log.append("passenger_continue_miss")
+                _poll_ready(page, {"addons", "review", "pay", "passenger", "error"}, budget_ms=3000)
+                continue
             if not any(item.startswith(("first:ok", "first:typed")) for item in notes):
                 text, url, stage, facts = _snapshot()
                 if (

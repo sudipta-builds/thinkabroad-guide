@@ -2619,6 +2619,13 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         page = _Open()
 
     notes = str(result.get("notes") or "")
+    if notes.startswith("Skip add-ons is on screen"):
+        spoken = notes.split(" | ")[0][:500]
+        state["stuck_kind"] = "addons"
+        state["last_stuck"] = spoken
+        _save(phone, state)
+        _deliver(phone, spoken, None, secrets, shot_paths=shots)
+        return
     filled = (
         re.search(r"first:(?:ok|typed)\b", notes)
         and re.search(r"email:(?:ok|typed)\b", notes)
@@ -2690,22 +2697,33 @@ def _run_kernel_login(
         if release_lock is not None:
             release_lock()
 
-    result = begin_login(
-        seller=seller,
-        whatsapp_phone=phone,
-        explicit=str(loaded.get("login_phone") or loaded.get("phone") or ""),
-        origin=origin,
-        destination=destination,
-        depart=depart,
-        hint=hint,
-        profile={
-            key: str(loaded.get(key) or "")
-            for key in ("name", "email", "phone", "dob", "gender")
-        },
-        on_code_requested=on_code_requested,
-        resume_url=resume_booking_url(loaded, text),
-        chosen_tap=chosen_tap,
-    )
+    try:
+        result = begin_login(
+            seller=seller,
+            whatsapp_phone=phone,
+            explicit=str(loaded.get("login_phone") or loaded.get("phone") or ""),
+            origin=origin,
+            destination=destination,
+            depart=depart,
+            hint=hint,
+            profile={
+                key: str(loaded.get(key) or "")
+                for key in ("name", "email", "phone", "dob", "gender")
+            },
+            on_code_requested=on_code_requested,
+            resume_url=resume_booking_url(loaded, text),
+            chosen_tap=chosen_tap,
+        )
+    except Exception:
+        logger.exception("Kernel booking failed")
+        _deliver(
+            phone,
+            f"{_seller_label(seller)} didn't finish that step. Nothing paid. Say skip again if you're still on add-ons.",
+            None,
+            secrets,
+        )
+        _clear_busy(phone, started_at)
+        return
     status = str(result.get("status") or "")
     if status == "otp_sent" and not announced:
         on_code_requested(result)

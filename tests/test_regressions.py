@@ -1338,7 +1338,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
         import inspect
         import re as _re
 
-        from app.page_agent import deterministic_action, run_checkout_agent
+        from app.page_agent import _AIM_JS, _click_label, click_verified, deterministic_action, run_checkout_agent
         from app.step_read import accept_choice, decide_front
 
         page = "Choose add-ons Add seats No seat added Skip add-ons missed adding Meal(s) and Seat(s)"
@@ -1346,6 +1346,17 @@ class SellerChoiceAndProxy(unittest.TestCase):
             accept_choice("yes", {"tap": "Skip add-ons", "page": page, "kind": "addons"}),
             "Skip add-ons",
         )
+        self.assertEqual(
+            accept_choice("skip and next step", {"tap": "Skip add-ons", "page": page, "kind": "addons"}),
+            "Skip add-ons",
+        )
+        self.assertIn("click_verified", inspect.getsource(_click_label))
+        aim = inspect.getsource(click_verified)
+        self.assertIn("page.mouse.click", aim)
+        self.assertIn("_aim_mark", aim)
+        self.assertIn("0.72", _AIM_JS)
+        self.assertIn("role=dialog", _AIM_JS)
+        self.assertLess(_AIM_JS.index("textOf(el) !== want"), _AIM_JS.index("innerWidth * 0.72"))
         self.assertEqual(deterministic_action("addons", hint="18:20", recovers=0)["target"], "Skip add-ons")
         decision = decide_front(page, "btn[ ] Skip add-ons", seller="cleartrip", hint="18:20")
         self.assertEqual(decision.get("action"), "click")

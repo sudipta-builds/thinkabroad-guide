@@ -1034,37 +1034,107 @@ def _poll_ready(page, ready: set[str], *, budget_ms: int = 4000, step_ms: int = 
             return text, url, stage, facts
 
 
-def _click_label(page, label: str) -> bool:
+_AIM_JS = """(label) => {
+  const want = String(label || '').trim().toLowerCase();
+  if (!want) return [];
+  const vis = (el) => {
+    const r = el.getBoundingClientRect();
+    const s = getComputedStyle(el);
+    return r.width > 8 && r.height > 8 && r.bottom > 0 && r.top < innerHeight
+      && s.visibility !== 'hidden' && s.display !== 'none';
+  };
+  const textOf = (el) => (
+    (el.innerText || el.getAttribute('aria-label') || el.value || '')
+      .replace(/\\s+/g, ' ').trim().toLowerCase()
+  );
+  const dialogs = [...document.querySelectorAll('[role=dialog],[aria-modal=true]')].filter(vis);
+  dialogs.sort((a, b) => {
+    const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+    return (ra.width * ra.height) - (rb.width * rb.height);
+  });
+  const roots = dialogs.length ? [dialogs[0], document.body] : [document.body];
+  const seen = new Set();
+  const out = [];
+  for (const root of roots) {
+    const nodes = [...root.querySelectorAll('button,a,[role=button],label,span')].filter(vis);
+    for (const el of nodes) {
+      if (textOf(el) !== want) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width > innerWidth * 0.72 || r.height > innerHeight * 0.45) continue;
+      const key = Math.round(r.x) + ':' + Math.round(r.y) + ':' + Math.round(r.width);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const tag = (el.tagName || '').toLowerCase();
+      const role = (el.getAttribute('role') || '').toLowerCase();
+      const control = tag === 'button' || tag === 'a' || role === 'button' ? 0 : 1;
+      out.push({
+        x: r.x + r.width / 2,
+        y: r.y + r.height / 2,
+        w: r.width,
+        h: r.height,
+        control,
+        area: r.width * r.height,
+      });
+    }
+    if (out.length) break;
+  }
+  out.sort((a, b) => (a.control - b.control) || (a.area - b.area));
+  return out.slice(0, 3);
+}"""
+
+
+def _aim_mark(page, label: str) -> str:
+    """Fingerprint used to prove a click moved the sheet."""
+    text, url = _read(page)
+    try:
+        surface = read_surface(page)
+        front = apply_front_text(text, surface)
+        overlay = "1" if surface.get("overlay") else "0"
+    except Exception:
+        front, overlay = text, "0"
+    stage = classify_page(front, url, book_count=_book_count(page))
+    needle = re.sub(r"\s+", " ", (label or "").strip().lower())
+    present = "1" if needle and needle in re.sub(r"\s+", " ", front.lower()) else "0"
+    return f"{stage}|{overlay}|{present}|{re.sub(r'\\s+', ' ', front)[:180]}"
+
+
+def click_verified(page, label: str) -> bool:
+    """Mouse-click the smallest real control, then require the sheet to change.
+
+    A dialog-sized box is never a target. Two candidates max. True only when the
+    label disappears, the dialog closes, or the booking step changes.
+    """
     wanted = (label or "").strip()
     if not wanted or wanted.startswith("__"):
         return False
     try:
-        return bool(
-            page.evaluate(
-                """(label) => {
-                    const want = label.trim().toLowerCase();
-                    const nodes = [...document.querySelectorAll(
-                      'button,a,[role=button],label,input[type=radio],input[type=checkbox],[role=radio],[role=checkbox],span,p,div'
-                    )];
-                    const textOf = (el) => (
-                      (el.innerText || el.getAttribute('aria-label') || el.value || '')
-                        .replace(/\\s+/g, ' ').trim().toLowerCase()
-                    );
-                    const exact = nodes.find(b => textOf(b) === want);
-                    const fuzzy = exact || nodes.find(b => {
-                      const t = textOf(b);
-                      return t && t.length <= 120 && t.includes(want);
-                    });
-                    if (!fuzzy) return false;
-                    fuzzy.scrollIntoView({block:'center'});
-                    fuzzy.click();
-                    return true;
-                }""",
-                wanted,
-            )
-        )
+        points = page.evaluate(_AIM_JS, wanted) or []
     except Exception:
+        points = []
+    if not isinstance(points, list) or not points:
         return False
+    before = _aim_mark(page, wanted)
+    for point in points[:2]:
+        if not isinstance(point, dict):
+            continue
+        try:
+            page.mouse.click(float(point["x"]), float(point["y"]))
+        except Exception:
+            continue
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                page.wait_for_timeout(250)
+            except Exception:
+                break
+            if _aim_mark(page, wanted) != before:
+                return True
+    return False
+
+
+def _click_label(page, label: str) -> bool:
+    """Verified click. True only when the page actually changes."""
+    return click_verified(page, label)
 
 
 def _skip_addons(page) -> str:
@@ -2072,6 +2142,7 @@ def run_checkout_agent(
     origin_code = "GAU" if re.search(r"guwahati|gau", origin or "", re.I) else ""
     dest_code = "DEL" if re.search(r"delhi|del", destination or "", re.I) else ""
     tap_pending = (chosen_tap or "").strip()
+    deadline = time.monotonic() + 70
 
     def _snapshot() -> tuple[str, str, str, dict[str, str]]:
         t, u = _read(page)
@@ -2087,6 +2158,34 @@ def run_checkout_agent(
     for step in range(max_steps):
         page = _latest(page)
         text, url, stage, facts = _snapshot()
+        if time.monotonic() > deadline:
+            log.append("checkout_deadline")
+            handoff = handoff or (
+                "This step took too long, so I stopped and sent the page. Nothing paid."
+            )
+            return CheckoutOutcome(stage, text, url, log, facts=facts, checks=checks, handoff=handoff)
+        # Add-ons skip is an outcome loop, not a 16-step vision tour. Reply within ~20s.
+        skip_now = bool(
+            stage == "addons"
+            or re.search(r"choose add-ons|add seats|missed adding meal", text or "", re.I)
+        ) and (
+            stage == "addons"
+            or re.search(r"skip add", tap_pending or chosen_tap or "", re.I)
+        )
+        if skip_now:
+            log.append("addons_fast")
+            left = _leave_addons(page, log, rounds=3)
+            text, url, stage, facts = _snapshot()
+            tap_pending = ""
+            if left and stage != "addons":
+                log.append(f"addons_fast_left:{stage}")
+            else:
+                handoff = (
+                    "Skip add-ons is on screen, but the click did not close that sheet. "
+                    "The seat map may still be showing. Nothing paid."
+                )
+                log.append("addons_fast_still")
+                return CheckoutOutcome("addons", text, url, log, facts=facts, checks=checks, handoff=handoff)
         # Vision on every step: screenshot overrides a wrong DOM toast / sold-out miss.
         try:
             from app.vision_agent import capture_page_shot, classify_with_vision, vision_enabled

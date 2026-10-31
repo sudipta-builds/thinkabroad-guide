@@ -143,7 +143,7 @@ def accept_choice(text: str, pending: dict[str, str]) -> str:
         return ""
     if re.search(r"\b(pay now|pay to complete|make payment|secure my trip)\b", raw, re.I):
         return ""
-    if _AGREE.fullmatch(raw):
+    if _AGREE.fullmatch(raw) or re.search(r"\bskip\b", raw, re.I):
         if re.fullmatch(r"confirm", raw, re.I):
             return (
                 safe_tap("Confirm", page)

@@ -783,6 +783,48 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("+91", spoken)
         self.assertIn("Nothing paid", spoken)
 
+    def test_cleartrip_homepage_is_not_the_traveller_form(self) -> None:
+        from app.kernel_otp import cleartrip_looks_logged_in
+
+        home = (
+            "Book Domestic & International Flight Tickets One way Round trip "
+            "Where from Where to Search flights My Account Contact We use cookies"
+        )
+        url = "https://www.cleartrip.com/"
+        self.assertEqual(classify_page(home, url), "home")
+        self.assertFalse(cleartrip_looks_logged_in(home, url))
+        self.assertTrue(
+            cleartrip_looks_logged_in("Log out My Account", "https://www.cleartrip.com/flights/itinerary?x=1")
+        )
+
+        class FakeSession:
+            page = type("P", (), {"url": url})()
+
+        spoken = _booking_page_reply(
+            {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-12-04",
+                "seller": "cleartrip",
+                "selected_hint": "10:45",
+            },
+            "10:45",
+            home,
+            FakeSession(),  # type: ignore[arg-type]
+        )
+        self.assertIn("search page", spoken.lower())
+        self.assertNotIn("I'm on the 10:45 step", spoken)
+        self.assertNotIn("Indian mobile", spoken)
+        booking = {
+            "stage": "booking",
+            "seller": "cleartrip",
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "selected_hint": "10:45",
+        }
+        self.assertEqual(infer_intent(booking, "Go on"), "book")
+
     def test_payment_step_refuses_upi_self_tap(self) -> None:
         class FakeSession:
             page = type("P", (), {"url": "https://www.cleartrip.com/pay"})()
@@ -1307,6 +1349,8 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("resume_url", source)
         self.assertIn("is_resume_booking_url", source)
         self.assertLess(source.index("resume_url"), source.index("ixigo_results_url"))
+        self.assertIn("cleartrip_results_url", source)
+        self.assertNotIn('page.goto("https://www.cleartrip.com/"', source)
         click = inspect.getsource(_safe_continue)
         self.assertIn("mouse.click", click)
         self.assertIn("elementFromPoint", click)

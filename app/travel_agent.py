@@ -475,7 +475,7 @@ def infer_intent(state: dict[str, Any], text: str) -> str:
         return "book"
     if state.get("options") and re.search(r"\b(go ahead|book it|take it|do it)\b", raw, re.I):
         return "book"
-    if re.search(r"\b(go ahead|confirm|book it|take it|do it)\b", raw, re.I):
+    if re.search(r"\b(go ahead|go on|confirm|book it|take it|do it)\b", raw, re.I):
         stage = str(state.get("stage") or "")
         if stage == "payment":
             return "pay"
@@ -1883,6 +1883,21 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     url = ""
     if session.page is not None:
         url = str(session.page.url or "")
+    from app.page_agent import classify_page
+
+    shown = classify_page(page, url)
+    if shown in {"home", "cookie"}:
+        which = hint or "chosen"
+        return (
+            f"{seller} opened the search page, not the {which} traveller form for {trip}. "
+            "Nothing paid. Say go on and I'll open the fare list for that time."
+        )
+    if shown in {"results", "loading"}:
+        which = hint or "that time"
+        return (
+            f"The {seller} fare list is on screen for {trip}. I have not opened the {which} traveller form yet. "
+            "Nothing paid. Say go on and I'll click that time."
+        )
     if "itinerary/failure" in url or re.search(r"connection lost|been disconnected|server error", page, re.I):
         return (
             f"{seller} opened the {hint or 'selected'} fare for {trip}, then the itinerary page failed "
@@ -1890,10 +1905,10 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             "Say EaseMyTrip or Ixigo if you want another site."
         )
     needs_login = bool(re.search(r"\bpassword\b", page, re.I) and re.search(r"log ?in|sign in|sign up", page, re.I))
-    contact = bool(re.search(r"contact|add contact|traveller|passenger|mobile", page, re.I))
+    contact = bool(re.search(r"add contact|contact details|traveller details|passenger details", page, re.I))
     needs_email = bool(re.search(r"\b(email|gmail)\b", page, re.I) and contact)
     needs_phone = bool(re.search(r"mobile|phone", page, re.I) and contact)
-    needs_dob = bool(re.search(r"date of birth|dob|gender", page, re.I))
+    needs_dob = bool(re.search(r"date of birth|\bdob\b", page, re.I) and contact)
     payment = bool(re.search(r"\bupi\b|pay now|card number|pay to complete|net banking", page, re.I))
     if needs_login:
         site = str(state.get("seller") or "cleartrip")
@@ -2028,8 +2043,15 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
     text = str(result.get("page") or "")
     state = _load(phone)
     signed_in = str(result.get("status") or "") == "already_logged_in"
+    page_url = str(result.get("url") or "")
+    from app.page_agent import classify_page
+
+    shown = classify_page(text, page_url)
     if str(result.get("status") or "") in {"already_logged_in", "held"}:
-        state["kernel_logged_in"] = seller
+        if shown in {"home", "cookie"}:
+            state.pop("kernel_logged_in", None)
+        else:
+            state["kernel_logged_in"] = seller
     state["kernel_awaiting_otp"] = False
     state["seller"] = seller
     state.pop("kernel_session_id", None)
@@ -2054,7 +2076,6 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         intro = f"You're already logged in on {label}.\n" if signed_in else ""
         _deliver(phone, f"{intro}{body}", None, secrets, shot_paths=shots)
         return
-    page_url = str(result.get("url") or "")
     state["stage"] = remember_booking_page(state, seller, page_url, text)
     _save(phone, state)
 
@@ -2074,7 +2095,9 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
     state["form_filled"] = bool(filled)
     _save(phone, state)
     waiting = passenger_details_reply(state)
-    if waiting:
+    if shown in {"home", "cookie", "results", "loading"}:
+        spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), text, _Session())  # type: ignore[arg-type]
+    elif waiting:
         spoken = waiting
     elif filled:
         spoken = f"Filled your details for {str(state.get('selected_hint') or 'that flight')} on {label}. I stopped before payment."

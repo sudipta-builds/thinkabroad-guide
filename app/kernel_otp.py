@@ -22,7 +22,7 @@ from app.page_agent import (
     ixigo_auth_session_ready,
     run_checkout_agent,
 )
-from app.search import ixigo_results_url
+from app.search import cleartrip_results_url, ixigo_results_url
 
 KERNEL_SELLERS = {"ixigo", "cleartrip"}
 _MID_BOOKING = {"passenger", "review", "addons", "pay", "login", "otp"}
@@ -319,6 +319,19 @@ def _otp_visible(page, seller: str) -> bool:
     return stage == "otp" or bool(re.search(r"enter otp|verify your mobile|otp sent", text or "", re.I))
 
 
+def cleartrip_looks_logged_in(text: str, url: str = "") -> bool:
+    """Header My Account is on the logged-out homepage. Logout is the real session."""
+    hay = f"{text or ''}\n{url or ''}"
+    if re.search(r"enter otp|enter mobile number", hay, re.I):
+        return False
+    if re.search(r"log\s*in|sign\s*up", text or "", re.I) and not re.search(r"\blog\s*out\b", text or "", re.I):
+        return False
+    if re.search(r"one way|search flights|where from|book domestic", text or "", re.I):
+        if not re.search(r"/flights/results|itinerary", url or "", re.I):
+            return False
+    return bool(re.search(r"\blog\s*out\b", text or "", re.I))
+
+
 def _logged_in(page, seller: str) -> bool:
     text, url = _read(page)
     if seller == "ixigo":
@@ -329,8 +342,7 @@ def _logged_in(page, seller: str) -> bool:
         if re.search(r"log\s*in\s*/?\s*sign\s*up|login/signup", text or "", re.I):
             return False
         return bool(re.search(r"\blog\s*out\b|view profile|my profile|ixigoer", text or "", re.I))
-    low = (text or "").lower()
-    return "my account" in low and not re.search(r"enter otp|enter mobile number", low)
+    return cleartrip_looks_logged_in(text, url)
 
 
 def _reload_booking_without_login_visible(page) -> None:
@@ -508,9 +520,15 @@ def begin_login(
                             resume_kept = True
                 except Exception:
                     resume_kept = False
-            if seller == "ixigo" and not resume_kept:
-                page.goto(ixigo_results_url(origin, destination, depart), wait_until="domcontentloaded", timeout=120000)
-                for _ in range(50):
+            if not resume_kept:
+                results_url = (
+                    ixigo_results_url(origin, destination, depart)
+                    if seller == "ixigo"
+                    else cleartrip_results_url(origin, destination, depart)
+                )
+                page.goto(results_url, wait_until="domcontentloaded", timeout=120000)
+                wait_rounds = 90 if seller == "cleartrip" else 50
+                for _ in range(wait_rounds):
                     if _book_count(page) >= 2:
                         break
                     page.wait_for_timeout(400)
@@ -530,7 +548,7 @@ def begin_login(
                     checkout = run_checkout_agent(
                         page,
                         hint=hint,
-                        seller="ixigo",
+                        seller=seller,
                         origin=origin,
                         destination=destination,
                         depart=depart,
@@ -562,22 +580,23 @@ def begin_login(
                             page.wait_for_timeout(1500)
                             continue
                         break
-            elif not resume_kept:
-                page.goto("https://www.cleartrip.com/", wait_until="domcontentloaded", timeout=120000)
-                page.wait_for_timeout(3000)
-                if not _find(page, "phone", seller) and not _logged_in(page, seller):
-                    hit = _find(page, "login", seller)
-                    if not hit:
-                        _drop(client, sid)
-                        return {"status": "login_miss", "detail": "Cleartrip login button was not on screen."}
-                    _click(client, sid, page, hit)
-                    page.wait_for_timeout(1500)
             # A saved profile can already be signed in. A fare preview must not be overwritten.
             # A traveller form is not a login screen, even when the header has no Logout text.
-            if outcome is None and seller == "ixigo":
+            # A Cleartrip homepage "My Account" header is not a finished booking.
+            if outcome is None:
                 text, url = _read(page)
                 stage = classify_page(text, url, book_count=_book_count(page))
                 if stage in {"passenger", "review", "addons", "pay"}:
+                    outcome = {
+                        "status": "held",
+                        "session_id": sid,
+                        "seller": seller,
+                        "screenshot": _shot(page, seller, sid, "held"),
+                        "page": (text or "")[:8000],
+                        "url": url or "",
+                        "notes": checkout_notes,
+                    }
+                elif hint and stage in {"results", "loading", "fare_sheet", "home", "cookie"}:
                     outcome = {
                         "status": "held",
                         "session_id": sid,

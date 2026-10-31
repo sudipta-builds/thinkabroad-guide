@@ -1060,11 +1060,15 @@ _AIM_JS = """(label) => {
   const seen = new Set();
   const out = [];
   for (const root of roots) {
-    const nodes = [...root.querySelectorAll('button,a,[role=button],label,span')].filter(vis);
+    const nodes = [...root.querySelectorAll('button,a,[role=button],input[type=submit],label,span,div')];
     for (const el of nodes) {
       if (textOf(el) !== want) continue;
+      const rough = el.getBoundingClientRect();
+      if (rough.width < 8 || rough.height < 8) continue;
+      if (rough.width > innerWidth * 0.72 || rough.height > innerHeight * 0.45) continue;
+      el.scrollIntoView({block: 'center', inline: 'nearest'});
+      if (!vis(el)) continue;
       const r = el.getBoundingClientRect();
-      if (r.width > innerWidth * 0.72 || r.height > innerHeight * 0.45) continue;
       const key = Math.round(r.x) + ':' + Math.round(r.y) + ':' + Math.round(r.width);
       if (seen.has(key)) continue;
       seen.add(key);
@@ -1102,21 +1106,62 @@ def _aim_mark(page, label: str) -> str:
     return f"{stage}|{overlay}|{present}|{re.sub(r'\\s+', ' ', front)[:180]}"
 
 
+def _sheet_moved(page, label: str, before: str, *, wait_s: float = 2.0) -> bool:
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        try:
+            page.wait_for_timeout(250)
+        except Exception:
+            break
+        if _aim_mark(page, label) != before:
+            return True
+    return False
+
+
+def _locator_click(page, label: str) -> bool:
+    """Playwright hit-test for the same exact label when the mouse point misses."""
+    exact = re.compile(rf"^{re.escape(label)}$", re.I)
+    for loc in (
+        page.get_by_role("button", name=exact),
+        page.get_by_role("link", name=exact),
+        page.get_by_text(exact),
+    ):
+        try:
+            target = loc.first
+            target.scroll_into_view_if_needed(timeout=1500)
+            target.click(timeout=2000)
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def click_verified(page, label: str) -> bool:
     """Mouse-click the smallest real control, then require the sheet to change.
 
-    A dialog-sized box is never a target. Two candidates max. True only when the
-    label disappears, the dialog closes, or the booking step changes.
+    A dialog-sized box is never a target. Works for button, link, or a short div
+    with that exact label, including one that starts below the fold. True only
+    when the label disappears, the dialog closes, or the booking step changes.
     """
     wanted = (label or "").strip()
-    if not wanted or wanted.startswith("__"):
+    if not wanted or wanted.startswith("__") or re.search(r"\bpay\b", wanted, re.I):
         return False
     try:
         points = page.evaluate(_AIM_JS, wanted) or []
     except Exception:
         points = []
     if not isinstance(points, list) or not points:
-        return False
+        try:
+            page.mouse.wheel(0, 900)
+            page.wait_for_timeout(200)
+            points = page.evaluate(_AIM_JS, wanted) or []
+        except Exception:
+            points = []
+    if not isinstance(points, list) or not points:
+        before = _aim_mark(page, wanted)
+        if not _locator_click(page, wanted):
+            return False
+        return _sheet_moved(page, wanted, before)
     before = _aim_mark(page, wanted)
     for point in points[:2]:
         if not isinstance(point, dict):
@@ -1125,14 +1170,10 @@ def click_verified(page, label: str) -> bool:
             page.mouse.click(float(point["x"]), float(point["y"]))
         except Exception:
             continue
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            try:
-                page.wait_for_timeout(250)
-            except Exception:
-                break
-            if _aim_mark(page, wanted) != before:
-                return True
+        if _sheet_moved(page, wanted, before):
+            return True
+    if _locator_click(page, wanted) and _sheet_moved(page, wanted, before):
+        return True
     return False
 
 
@@ -2221,15 +2262,33 @@ def run_checkout_agent(
                 "This step took too long, so I stopped and sent the page. Nothing paid."
             )
             return CheckoutOutcome(stage, text, url, log, facts=facts, checks=checks, handoff=handoff)
+        # A named button is clicked before any add-ons shortcut. Review is not Choose add-ons.
+        if tap_pending and not tap_pending.startswith("__"):
+            if re.search(r"pay now|pay to complete|make payment", tap_pending, re.I) and not allow_pay:
+                log.append("user_tap_refused")
+                tap_pending = ""
+            elif _click_label(page, tap_pending):
+                log.append(f"user_tap:{tap_pending}")
+                tap_pending = ""
+                try:
+                    page.wait_for_timeout(800)
+                except Exception:
+                    pass
+                continue
+            else:
+                log.append("user_tap_miss")
+                tap_pending = ""
+        from app.step_read import on_review_itinerary
+
         # Add-ons skip is an outcome loop, not a 16-step vision tour. Reply within ~20s.
         skip_now = bool(
-            re.search(r"choose add-ons|skip add-?ons|add seats|missed adding meal", text or "", re.I)
+            not on_review_itinerary(text)
+            and re.search(r"choose add-ons|skip add-?ons|add seats|missed adding meal", text or "", re.I)
         )
         if skip_now:
             log.append("addons_fast")
             left = _leave_addons(page, log, rounds=3)
             text, url, stage, facts = _snapshot()
-            tap_pending = ""
             if not left or stage == "addons":
                 # Vision must not report success while Choose add-ons is still the DOM step.
                 text, url, stage, facts = _snapshot()

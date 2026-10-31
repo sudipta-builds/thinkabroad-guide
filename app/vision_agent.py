@@ -134,7 +134,7 @@ def see_step(
         out["kind"] = "unavailable"
     if out["fares_visible"] and out["kind"] not in {"unavailable", "pay", "login", "otp", "addons"}:
         out["kind"] = "results"
-    if out["kind"] == "addons" and not out["tap"]:
+    if out["kind"] == "addons" and not out["tap"] and not re.search(r"review your itinerary", page_text or "", re.I):
         out["tap"] = "Skip add-ons"
         out["auto"] = "1"
     from app.step_read import addons_sheet
@@ -219,6 +219,10 @@ def classify_with_vision(
     mapped = stage_map.get(kind, dom_stage)
     from app.step_read import addons_sheet
 
+    if re.search(r"review your itinerary", page_text or "", re.I):
+        seen["kind"] = "review"
+        seen["tap"] = "Continue" if re.search(r"\bcontinue\b", page_text or "", re.I) else seen.get("tap") or ""
+        return "review", seen
     if addons_sheet(page_text) and re.search(r"skip add-?ons|choose add-ons|add seats", page_text or "", re.I):
         seen["kind"] = "addons"
         if re.search(r"skip add-?ons", page_text or "", re.I):

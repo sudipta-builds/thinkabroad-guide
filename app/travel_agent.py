@@ -2267,10 +2267,14 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         }
     if vision_seen and vision_seen.get("sold_out"):
         shown = "unavailable"
-    if vision_seen and (
-        vision_seen.get("kind") == "addons"
-        or vision_seen.get("seat_map")
-        or vision_seen.get("meals_offered")
+    if (
+        vision_seen
+        and not re.search(r"review your itinerary", page or "", re.I)
+        and (
+            vision_seen.get("kind") == "addons"
+            or vision_seen.get("seat_map")
+            or vision_seen.get("meals_offered")
+        )
     ):
         shown = "addons"
     if vision_seen and vision_seen.get("fares_visible") and shown not in {"unavailable", "pay", "addons"}:
@@ -2401,6 +2405,15 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     hay = f"{page or ''}\n{controls}"
     from app.step_read import addons_sheet, visible_forward
 
+    if re.search(r"review your itinerary", hay, re.I):
+        tap = visible_forward(hay) or "Continue"
+        return _stuck_line(
+            state,
+            "review",
+            f"{seller} Review your itinerary for the {which} on {trip}",
+            "the next control is Continue on this page",
+            f"I'll press {tap}",
+        )
     if shown == "addons" or addons_sheet(hay):
         tap = visible_forward(hay) or "Continue"
         if addons_sheet(hay):

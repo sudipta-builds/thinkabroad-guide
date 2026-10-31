@@ -1532,6 +1532,85 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertTrue(any(line == "user_tap:Continue" for line in outcome.log), outcome.log)
         self.assertFalse(any("skip add" in line.lower() for line in outcome.log), outcome.log)
 
+    def test_continue_on_review_opens_login(self) -> None:
+        from app.page_agent import classify_page, run_checkout_agent
+        from app.step_read import addons_sheet
+        from app.travel_agent import _booking_page_reply
+        from playwright.sync_api import sync_playwright
+
+        review = (
+            "Review your itinerary Guwahati to New Delhi 6E 2092 10:45 "
+            "Make your journey fully flexible Add seats Fare summary Continue Log in"
+        )
+        self.assertEqual(classify_page(review, "https://www.cleartrip.com/flights/itinerary/1"), "review")
+        self.assertFalse(addons_sheet(review))
+        state = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "cleartrip",
+            "selected_hint": "10:45",
+            "stuck_kind": "addons",
+        }
+        reply = _booking_page_reply(state, "10:45", review, type("S", (), {"page": None})())
+        self.assertIn("Review your itinerary", reply)
+        self.assertIn("Continue", reply)
+        self.assertNotIn("Choose add-ons", reply)
+        html = """<!doctype html><html><body>
+        <h1>Review your itinerary</h1>
+        <p>6E 2092 10:45 Add seats Fare summary</p>
+        <button id="go" style="width:160px;height:44px">Continue</button>
+        <script>
+          document.getElementById('go').onclick = () => {
+            document.body.innerHTML = '<h1>Log in to Cleartrip</h1><p>Enter mobile number</p><button>Get OTP</button>';
+          };
+        </script></body></html>"""
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            page.set_content(html)
+            outcome = run_checkout_agent(
+                page,
+                hint="10:45",
+                seller="cleartrip",
+                origin="Guwahati",
+                destination="Delhi",
+                depart="2026-12-04",
+                max_steps=4,
+                chosen_tap="Continue",
+                pause_on_auth=True,
+            )
+            text = page.inner_text("body")
+            browser.close()
+        self.assertIn("Enter mobile number", text)
+        self.assertTrue(any(line == "user_tap:Continue" for line in outcome.log), outcome.log)
+        self.assertFalse(any("addons_fast" in line for line in outcome.log), outcome.log)
+        self.assertFalse(any("Skip add-ons" in line for line in outcome.log), outcome.log)
+
+    def test_named_control_below_the_fold_is_clicked(self) -> None:
+        from app.page_agent import click_verified
+        from playwright.sync_api import sync_playwright
+
+        html = """<!doctype html><html><body>
+        <p style="height:1400px">Fare summary. Please continue with your booking later.</p>
+        <div id="go" style="width:160px;height:44px">Continue</div>
+        <script>
+          document.getElementById('go').onclick = () => {
+            document.body.innerHTML = '<h1>Enter mobile number</h1>';
+          };
+        </script></body></html>"""
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 700})
+            page.set_content(html)
+            hit = click_verified(page, "Continue")
+            text = page.inner_text("body")
+            refused = click_verified(page, "Pay now")
+            browser.close()
+        self.assertTrue(hit)
+        self.assertIn("Enter mobile number", text)
+        self.assertFalse(refused)
+
     def test_kernel_success_is_the_live_page(self) -> None:
         import inspect
 

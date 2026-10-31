@@ -66,8 +66,15 @@ _AGREE_ONLY = re.compile(
 )
 
 
+def on_review_itinerary(page: str) -> bool:
+    """The heading that means extras are already behind us."""
+    return bool(re.search(r"review your itinerary", page or "", re.I))
+
+
 def addons_sheet(page: str) -> bool:
-    """Choose add-ons / seat map. A fare line that says extra baggage is not this sheet."""
+    """Choose add-ons / seat map. Review your itinerary is never this sheet."""
+    if on_review_itinerary(page):
+        return False
     return bool(_ADDONS_SHEET.search(page or ""))
 
 

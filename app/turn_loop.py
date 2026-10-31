@@ -37,6 +37,8 @@ _TURN = (
     "name-check Confirm, or Continue that does not spend money.\n"
     "If NO screenshot is attached, never invent a fare list or say results are ready. "
     "A new trip (from/to/date) is intent=search, goal=search.\n"
+    "If they say start fresh / start over / search again, intent=search, goal=search. "
+    "Ignore a stale add-ons screenshot and do not recommend Skip add-ons.\n"
     "reply: one short sentence for WhatsApp. No emoji. Nothing paid."
 )
 
@@ -77,6 +79,34 @@ def remember_shot(state: dict[str, Any], path: str) -> None:
         state["last_shot"] = path
 
 
+_FRESH = re.compile(
+    r"\b(?:let'?s )?start (?:fresh|over)\b|\bstart over\b|\bfresh (?:search|fare|start)\b|"
+    r"\bnew search\b|\bsearch again\b",
+    re.I,
+)
+
+
+def wants_fresh_search(text: str) -> bool:
+    """True when the traveller wants a new fare list, not Skip on a dead checkout."""
+    return bool(_FRESH.search(text or ""))
+
+
+def clear_checkout_memory(state: dict[str, Any]) -> None:
+    """Drop the saved itinerary and last screenshot so the next action can search."""
+    for key in (
+        "live",
+        "last_shot",
+        "last_vision",
+        "stuck_page",
+        "pending_step",
+        "stuck_kind",
+        "last_stuck",
+        "chosen_tap",
+        "options",
+    ):
+        state.pop(key, None)
+
+
 def _local_turn(text: str, page: str, state: dict[str, Any]) -> dict[str, Any]:
     """Offline stand-in so tests and a missing Gemini key still route the wish."""
     raw = re.sub(r"\s+", " ", (text or "").strip())
@@ -84,6 +114,20 @@ def _local_turn(text: str, page: str, state: dict[str, Any]) -> dict[str, Any]:
     kind = str(vision.get("kind") or state.get("stuck_kind") or "")
     hay = page or ""
     tap = str(vision.get("tap") or "")
+    if wants_fresh_search(raw):
+        return {
+            "goal": "search",
+            "intent": "search",
+            "kind": "",
+            "what": "a fresh fare list",
+            "why": "you asked to start over",
+            "recommend": "open results for this trip",
+            "tap": "",
+            "auto": "",
+            "reply": "I'll open a fresh fare list. Nothing paid.",
+            "facts": [],
+            "source": "local",
+        }
     if re.search(
         r"what (?:to do |should i do )?next|which step|check and tell|tell me what to do|"
         r"why (?:stuck|blocked)|what(?:'s| is) (?:wrong|happening)|what do you see",
@@ -245,8 +289,14 @@ def interpret_turn(
         tap = local.get("tap") if local.get("goal") == "forward" else ""
         if not tap and re.search(r"continue", page, re.I):
             tap = "Continue"
+    trip_ready = bool(state.get("origin") and state.get("destination") and state.get("depart"))
+    if wants_fresh_search(text) and trip_ready:
+        intent = "search"
+        goal = "search"
+        kind = ""
+        tap = ""
+        reply = ""
     if not shot and not page:
-        trip_ready = bool(state.get("origin") and state.get("destination") and state.get("depart"))
         if trip_ready and intent in {"status", "select", "book", "chat", ""}:
             intent = "search"
             goal = "search"
@@ -307,6 +357,9 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
         return {"do": "pay_self", "kind": "pay_self", "tap": "", "turn": turn, "reply": ""}
     if intent == "pay":
         return {"do": "pay_stop", "kind": "pay", "tap": "", "turn": turn, "reply": ""}
+
+    if wants_fresh_search(text) and trip:
+        return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
 
     if not live:
         if trip:

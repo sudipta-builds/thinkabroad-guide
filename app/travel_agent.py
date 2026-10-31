@@ -252,6 +252,12 @@ def handle_turn(
         if not named_seller_from(text):
             state.pop("seller", None)
         _save(phone, state)
+    from app.turn_loop import wants_fresh_search, clear_checkout_memory
+
+    if wants_fresh_search(text):
+        clear_checkout_memory(state)
+        state.pop("selected_hint", None)
+        _save(phone, state)
     if _asks_for_filled_form(text) and state.get("origin") and state.get("destination"):
         state["seller"] = "ixigo"
         state["preferred_seller"] = "ixigo"
@@ -330,6 +336,7 @@ def handle_turn(
         _save(phone, state)
     if do == "search":
         kind = "search"
+        state.pop("chosen_tap", None)
         _save(phone, state)
     if do == "book":
         kind = str(plan.get("kind") or "book")
@@ -392,12 +399,12 @@ def handle_turn(
                 chosen = str(state.get("selected_hint") or "").strip()
                 signed_in = str(state.get("kernel_logged_in") or "") == book_seller
                 trip = _spoken_trip(state)
-                if chosen and resume_booking_url(state, text):
+                if chosen and (resume_booking_url(state, text) or state.get("kernel_session_id")):
                     tap = str(state.get("chosen_tap") or "")
                     if re.search(r"skip add", tap, re.I):
                         canned = (
-                            f"Reopening {_seller_label(book_seller)} on the add-ons step to press Skip add-ons. "
-                            "I'll tell you if that sheet isn't there. Nothing paid."
+                            f"Pressing Skip add-ons on {_seller_label(book_seller)} if Choose add-ons is still open. "
+                            "If that page is gone I'll open a fresh fare list. Nothing paid."
                         )
                     else:
                         canned = _usable_reply(state, spoken, _mid_booking_ack(state, book_seller, chosen, text))
@@ -2643,7 +2650,11 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
             state["kernel_logged_in"] = seller
     state["kernel_awaiting_otp"] = False
     state["seller"] = seller
-    state.pop("kernel_session_id", None)
+    held_sid = str(result.get("session_id") or "")
+    if held_sid:
+        state["kernel_session_id"] = held_sid
+    else:
+        state.pop("kernel_session_id", None)
     shots = [result["screenshot"]] if result.get("screenshot") else None
     label = _seller_label(seller)
     if str(result.get("status") or "") in {"already_logged_in", "fares"} and shown in {
@@ -2779,6 +2790,7 @@ def _run_kernel_login(
             on_code_requested=on_code_requested,
             resume_url=resume_booking_url(loaded, text),
             chosen_tap=chosen_tap,
+            session_id=str(loaded.get("kernel_session_id") or ""),
         )
     except Exception:
         logger.exception("Kernel booking failed")

@@ -557,7 +557,7 @@ class DateAndMemory(unittest.TestCase):
         self.assertIn("passenger = dict(profile or {})", source)
         self.assertIn("browser_profile = _profile(", source)
         self.assertIn("profile=passenger", source)
-        self.assertIn("_open_browser(client, browser_profile)", source)
+        self.assertIn("_connect_browser(client, browser_profile, session_id)", source)
 
     def test_a_second_route_does_not_delete_the_first(self) -> None:
         state = _recover_trip({}, [], "guwahati to delhi, 1st week of december")
@@ -1271,10 +1271,15 @@ class SellerChoiceAndProxy(unittest.TestCase):
         login = inspect.getsource(begin_login)
         self.assertLess(login.index("resume_lost"), login.index("Mobile field did not open"))
         self.assertLess(login.index("resume_lost"), login.index("ixigo_results_url"))
+        self.assertIn("_connect_browser", login)
+        self.assertIn('stage == "error"', login)
+        self.assertIn('{"login", "otp"}', login)
+        self.assertIn("keep_kernel_browser", login)
         agent = Path("app/travel_agent.py").read_text(encoding="utf-8")
         self.assertIn('status == "resume_lost"', agent)
-        self.assertIn("Reopening", agent)
+        self.assertIn("fresh fare list", agent)
         self.assertIn("did not open login", agent)
+        self.assertIn("session_id=str(loaded.get(\"kernel_session_id\") or \"\")", agent)
 
     def test_fare_drawer_over_results_is_fare_sheet(self) -> None:
         from app.page_agent import _looks_like_fare_sheet
@@ -1474,6 +1479,44 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn('do == "search"', src)
         self.assertIn('do == "book"', src)
         self.assertIn("last_vision", inspect.getsource(handle_turn).split("if changed:")[1][:400])
+        self.assertIn("clear_checkout_memory", src)
+        self.assertIn("wants_fresh_search", src)
+        self.assertEqual(align_action("let's start fresh", addons)["do"], "search")
+        self.assertEqual(align_action("Skip add-ons", addons)["do"], "book")
+
+    def test_dead_itinerary_opens_fresh_fares_not_login(self) -> None:
+        import inspect
+
+        from app.kernel_otp import begin_login, keep_kernel_browser
+        from app.page_agent import classify_page
+        from app.turn_loop import clear_checkout_memory, wants_fresh_search
+
+        self.assertTrue(wants_fresh_search("let's start fresh"))
+        self.assertTrue(wants_fresh_search("search again"))
+        self.assertFalse(wants_fresh_search("Skip add-ons"))
+        stale = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "live": {"url": "https://www.cleartrip.com/flights/itinerary/abc", "stage": "addons"},
+            "last_vision": {"kind": "addons", "tap": "Skip add-ons"},
+            "selected_hint": "18:20",
+            "chosen_tap": "Skip add-ons",
+        }
+        clear_checkout_memory(stale)
+        self.assertNotIn("live", stale)
+        self.assertNotIn("last_vision", stale)
+        self.assertNotIn("chosen_tap", stale)
+        self.assertEqual(
+            classify_page("Server error Search again", "https://www.cleartrip.com/flights/itinerary/failure"),
+            "error",
+        )
+        self.assertTrue(keep_kernel_browser("held"))
+        self.assertTrue(keep_kernel_browser("fares"))
+        self.assertFalse(keep_kernel_browser("resume_lost"))
+        src = inspect.getsource(begin_login)
+        self.assertIn('skip_tap and stage in {"login", "otp"}', src)
+        self.assertLess(src.index('stage == "error"'), src.index("ixigo_results_url"))
 
     def test_addons_yes_arms_skip_and_checkout_leaves(self) -> None:
         import inspect

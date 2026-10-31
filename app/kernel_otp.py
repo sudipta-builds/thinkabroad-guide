@@ -132,6 +132,11 @@ def keep_kernel_otp_session(status: str) -> bool:
     return status in {"bad_code", "still_otp"}
 
 
+def keep_kernel_browser(status: str) -> bool:
+    """Leave the Kernel Chrome up so the next WhatsApp turn can click the same sheet."""
+    return status in {"otp_sent", "held", "already_logged_in", "fares"}
+
+
 def otp_accepted(seller: str, code: str) -> bool:
     digits = re.sub(r"\D", "", code or "")
     if seller == "cleartrip":
@@ -372,6 +377,18 @@ def _open_browser(client, profile: str):
     )
 
 
+def _connect_browser(client, profile: str, session_id: str = ""):
+    """Reuse the open Kernel tab when WhatsApp is still on the same booking."""
+    if session_id:
+        try:
+            browser = client.browsers.retrieve(session_id)
+            if browser is not None:
+                return browser, True
+        except Exception:
+            pass
+    return _open_browser(client, profile), False
+
+
 def _drop(client, session_id: str) -> None:
     _stop_hold(session_id)
     try:
@@ -463,6 +480,7 @@ def begin_login(
     otp_wait_sec: int = 300,
     resume_url: str = "",
     chosen_tap: str = "",
+    session_id: str = "",
 ) -> dict[str, str]:
     """Open the seller and request one OTP.
 
@@ -479,7 +497,7 @@ def begin_login(
     passenger = dict(profile or {})
     client = _client()
     browser_profile = _profile(seller, whatsapp_phone)
-    browser = _open_browser(client, browser_profile)
+    browser, reused = _connect_browser(client, browser_profile, session_id)
     sid = browser.session_id
     os.environ["IXIGO_OTPLESS_BRIDGE"] = "0"
     try:
@@ -490,47 +508,76 @@ def begin_login(
             context = pw.contexts[0] if pw.contexts else pw.new_context()
             page = context.pages[0] if context.pages else context.new_page()
             outcome: dict[str, str] | None = None
+            checkout = None
             checkout_notes = ""
             resume_kept = False
-            # Reopen the saved checkout when the traveller left mid-step. A dead
-            # link falls through and the search runs again with the saved profile.
-            if hint and resume_url and is_resume_booking_url(resume_url, seller):
+            skip_tap = bool(re.search(r"skip add", chosen_tap or "", re.I))
+            text, url = _read(page)
+            stage = classify_page(text, url, book_count=_book_count(page))
+
+            def _checkout_now() -> None:
+                nonlocal checkout, checkout_notes, page, text, url, stage
+                checkout = run_checkout_agent(
+                    page,
+                    hint=hint,
+                    seller=seller,
+                    origin=origin,
+                    destination=destination,
+                    depart=depart,
+                    expect_flight="IX1513" if hint == "1:15" else "",
+                    allow_pay=False,
+                    pause_on_auth=True,
+                    max_steps=6 if re.search(r"skip add", chosen_tap or "", re.I) else 16,
+                    profile=passenger,
+                    chosen_tap=chosen_tap,
+                )
+                checkout_notes = ((checkout.handoff + " | ") if checkout.handoff else "") + " | ".join(checkout.log)[:1500]
+                page = _latest(page)
+                text, url = _read(page)
+                stage = classify_page(text, url, book_count=_book_count(page))
+
+            # Same Kernel tab: press Skip on the sheet we just screenshotted.
+            if reused and hint and stage in {"passenger", "review", "addons", "pay"}:
+                try:
+                    _checkout_now()
+                    resume_kept = stage in _MID_BOOKING or stage in {"results", "fare_sheet"}
+                except Exception:
+                    resume_kept = False
+            elif reused and hint and stage in {"results", "loading", "fare_sheet"}:
+                if skip_tap:
+                    chosen_tap = ""
+                    skip_tap = False
+                try:
+                    _checkout_now()
+                    resume_kept = True
+                except Exception:
+                    resume_kept = False
+            elif reused and stage == "error":
+                chosen_tap = ""
+                skip_tap = False
+            # Saved checkout URL is a fallback when that tab is gone.
+            if not resume_kept and hint and resume_url and is_resume_booking_url(resume_url, seller):
                 try:
                     page.goto(resume_url, wait_until="domcontentloaded", timeout=45000 if chosen_tap else 120000)
                     page.wait_for_timeout(1500)
                     text, url = _read(page)
                     stage = classify_page(text, url, book_count=_book_count(page))
-                    if stage in _MID_BOOKING:
-                        checkout = run_checkout_agent(
-                            page,
-                            hint=hint,
-                            seller=seller,
-                            origin=origin,
-                            destination=destination,
-                            depart=depart,
-                            expect_flight="IX1513" if hint == "1:15" else "",
-                            allow_pay=False,
-                            pause_on_auth=True,
-                            max_steps=6 if re.search(r"skip add", chosen_tap or "", re.I) else 16,
-                            profile=passenger,
-                            chosen_tap=chosen_tap,
-                        )
-                        checkout_notes = ((checkout.handoff + " | ") if checkout.handoff else "") + "resume | " + " | ".join(checkout.log)[:1500]
-                        page = _latest(page)
-                        text, url = _read(page)
-                        if classify_page(text, url, book_count=_book_count(page)) in _MID_BOOKING:
-                            resume_kept = True
+                    if stage == "error":
+                        chosen_tap = ""
+                        skip_tap = False
+                    elif stage in _MID_BOOKING:
+                        _checkout_now()
+                        checkout_notes = ((checkout.handoff + " | ") if checkout and checkout.handoff else "") + "resume | " + " | ".join((checkout.log if checkout else []))[:1500]
+                        resume_kept = stage in _MID_BOOKING
                 except Exception:
                     resume_kept = False
-            # Skip means "press the button on the page we already had." A dead or
-            # misread link must not start a new search and then fail login.
-            if (
-                not resume_kept
-                and hint
-                and resume_url
-                and is_resume_booking_url(resume_url, seller)
-                and re.search(r"skip add", chosen_tap or "", re.I)
-            ):
+                    try:
+                        text, url = _read(page)
+                        stage = classify_page(text, url, book_count=_book_count(page))
+                    except Exception:
+                        stage = stage or ""
+            # Skip must not open a login form. A server-error itinerary is a new search.
+            if not resume_kept and skip_tap and stage in {"login", "otp"}:
                 shot = ""
                 try:
                     shot = _shot(page, seller, sid, "resume-miss")
@@ -590,7 +637,7 @@ def begin_login(
                     )
                     checkout_notes = ((checkout.handoff + " | ") if checkout.handoff else "") + " | ".join(checkout.log)[:1500]
                     page = _latest(page)
-                if hint and checkout.stage != "ask" and classify_page(*_read(page), book_count=_book_count(page)) not in {
+                if hint and checkout and checkout.stage != "ask" and classify_page(*_read(page), book_count=_book_count(page)) not in {
                     "passenger",
                     "review",
                     "addons",
@@ -756,7 +803,7 @@ def begin_login(
         if outcome is None:
             _drop(client, sid)
             return {"status": "otp_ui_miss", "detail": "OTP screen did not open. Nothing was charged."}
-        if outcome.get("status") != "otp_sent":
+        if not keep_kernel_browser(str(outcome.get("status") or "")):
             _drop(client, sid)
         return outcome
     except Exception as exc:

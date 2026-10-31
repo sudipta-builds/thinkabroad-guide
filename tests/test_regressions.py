@@ -1419,6 +1419,14 @@ class SellerChoiceAndProxy(unittest.TestCase):
         deliver = inspect.getsource(__import__("app.travel_agent", fromlist=["_deliver_signed_in_page"])._deliver_signed_in_page)
         self.assertIn("_form_ask_if_needed", deliver)
         self.assertIn('"addons"', deliver)
+        fresh = interpret_turn(
+            "Ghy to Delhi 4th December",
+            {"origin": "Guwahati", "destination": "Delhi", "depart": "2026-12-04"},
+        )
+        self.assertEqual(fresh.get("intent") or "search", "search")
+        self.assertNotRegex((fresh.get("reply") or "").lower(), r"select your preferred")
+        src = inspect.getsource(handle_turn)
+        self.assertIn("live_sheet", src)
         brain = inspect.getsource(converse)
         self.assertIn("gemini_chat", brain)
         self.assertNotIn("deepseek", brain.lower())

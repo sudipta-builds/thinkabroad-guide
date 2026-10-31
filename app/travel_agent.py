@@ -287,7 +287,13 @@ def handle_turn(
     if tap and kind in {"book", "select"}:
         state["chosen_tap"] = tap
         state.pop("pending_step", None)
-    if kind == "status" or goal == "ask":
+    live_sheet = bool(
+        state.get("last_shot")
+        or state.get("stuck_page")
+        or (isinstance(state.get("last_vision"), dict) and state["last_vision"].get("kind"))
+        or _mid_booking(state)
+    )
+    if (kind == "status" or goal == "ask") and live_sheet:
         if tap:
             arm_pending_step(state, str(state.get("stuck_page") or ""), str(turn.get("kind") or "other"), tap=tap)
         spoken = format_turn_reply(turn)
@@ -295,6 +301,8 @@ def handle_turn(
         _save(phone, state)
         db.add_message(phone, "assistant", spoken)
         return Reply.of(spoken, emoji="👀")
+    if kind in {"status", "chat", "select"} and not live_sheet and state.get("origin") and state.get("destination") and state.get("depart"):
+        kind = "search"
     if goal in {"skip", "forward"}:
         kind = "book"
         if tap:

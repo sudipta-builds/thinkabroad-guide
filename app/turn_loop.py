@@ -35,6 +35,8 @@ _TURN = (
     "Do not re-ask a field already listed as saved. Do not recommend Skip add-ons unless that sheet is on screen.\n"
     "tap must be a short label visible on the page/screenshot. auto true only for Skip add-ons, "
     "name-check Confirm, or Continue that does not spend money.\n"
+    "If NO screenshot is attached, never invent a fare list or say results are ready. "
+    "A new trip (from/to/date) is intent=search, goal=search.\n"
     "reply: one short sentence for WhatsApp. No emoji. Nothing paid."
 )
 
@@ -198,6 +200,7 @@ def _gemini_turn(text: str, page: str, image_path: str, state: dict[str, Any]) -
     missing = [key for key in ("name", "email", "phone", "dob", "gender") if not str(state.get(key) or "").strip()]
     user = (
         f"Traveller: {text}\nSeller: {seller or 'unknown'}. Chosen departure: {hint or 'unknown'}.\n"
+        f"Screenshot attached: {'yes' if image_path else 'NO — do not invent results'}.\n"
         f"Last step kind: {state.get('stuck_kind') or state.get('stage') or ''}.\n"
         f"Saved passenger: name={bool(state.get('name'))} email={bool(state.get('email'))} "
         f"phone={bool(state.get('phone'))} dob={bool(state.get('dob'))} gender={bool(state.get('gender'))}. "
@@ -242,6 +245,14 @@ def interpret_turn(
         tap = local.get("tap") if local.get("goal") == "forward" else ""
         if not tap and re.search(r"continue", page, re.I):
             tap = "Continue"
+    if not shot and not page:
+        trip_ready = bool(state.get("origin") and state.get("destination") and state.get("depart"))
+        if trip_ready and intent in {"status", "select", "book", "chat", ""}:
+            intent = "search"
+            goal = "search"
+            kind = ""
+            tap = ""
+            reply = ""
     return {
         "goal": goal or str(local.get("goal") or ""),
         "intent": intent or str(local.get("intent") or ""),

@@ -378,6 +378,25 @@ NOT_BOOKABLE = {"google", "kayak"}
 _BOOKABLE_CYCLE = ("cleartrip", "easemytrip", "ixigo")
 
 
+def seller_can_book(seller_id: str) -> bool:
+    """True when this site can finish a ticket. Google/Kayak lists cannot."""
+    return bool(seller_id) and str(seller_id).lower() not in NOT_BOOKABLE
+
+
+def default_bookable_seller() -> str:
+    """First site in the bookable cycle. Used when the open list cannot ticket."""
+    return _BOOKABLE_CYCLE[0]
+
+
+def fulfillment_seller(current: str, named: str = "") -> str:
+    """Seller that should take the next Book. A named bookable site wins."""
+    if named and seller_can_book(named):
+        return named.lower()
+    if seller_can_book(current):
+        return str(current).lower()
+    return default_bookable_seller()
+
+
 def next_bookable_seller(current: str) -> str:
     """The next site that can take a booking. Google and a failed Cleartrip move to EaseMyTrip."""
     current = (current or "").lower()

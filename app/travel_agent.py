@@ -313,9 +313,13 @@ def handle_turn(
         db.add_message(phone, "assistant", spoken)
         return Reply.of(spoken, emoji="👀")
     if do == "ask_trip":
-        reply = "Where are you flying from and to?"
-        db.add_message(phone, "assistant", reply)
-        return Reply.of(reply, emoji="🤔")
+        if state.get("origin") and state.get("destination") and state.get("depart"):
+            do = "search"
+            kind = "search"
+        else:
+            reply = "Where are you flying from and to?"
+            db.add_message(phone, "assistant", reply)
+            return Reply.of(reply, emoji="🤔")
     if do == "pay_self":
         reply = _pay_link_reply(state)
         db.add_message(phone, "assistant", reply)
@@ -437,6 +441,18 @@ def handle_turn(
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="✈️")
     if kind == "search":
+        if state.get("origin") and state.get("destination") and state.get("depart") and chromium_ready():
+            state["busy_at"] = f"{time.time():.3f}"
+            _save(phone, state)
+            threading.Thread(
+                target=_run_browse,
+                args=(phone, text, state.get("busy_at"), "search"),
+                name="guide-browse",
+                daemon=True,
+            ).start()
+            reply = _usable_reply(state, spoken, _search_ack(state, text))
+            db.add_message(phone, "assistant", reply)
+            return Reply.of(reply, emoji="✈️")
         reply = _usable_reply(state, spoken, "Where are you flying from and to?")
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="🤔")
@@ -915,20 +931,20 @@ def _pay_link_reply(state: dict[str, Any]) -> str:
 
 
 def _booking_seller_id(state: dict[str, Any], text: str = "") -> str:
-    """Google fare times book on Cleartrip. A named site in this message wins; don't keep a failed Ixigo preference."""
-    from app.search import NOT_BOOKABLE
+    """Fulfill a pick on a site that can ticket. A named bookable site wins."""
+    from app.search import default_bookable_seller, fulfillment_seller, seller_can_book
 
     named = named_seller_from(text)
-    if named and named not in NOT_BOOKABLE:
+    if named and seller_can_book(named):
         return named
     if str(state.get("seller") or "") == "ixigo" and str(state.get("kernel_logged_in") or "") == "ixigo":
         return "ixigo"
-    if _flight_hint(text):
-        return "cleartrip"
-    preferred = str(state.get("preferred_seller") or state.get("seller") or "cleartrip")
-    if preferred in NOT_BOOKABLE or preferred == "":
-        return "cleartrip"
-    return preferred
+    vision = state.get("last_vision") if isinstance(state.get("last_vision"), dict) else {}
+    sheet_seller = str(vision.get("seller") or state.get("seller") or "")
+    if not seller_can_book(sheet_seller):
+        return fulfillment_seller("", named)
+    preferred = str(state.get("preferred_seller") or sheet_seller or default_bookable_seller())
+    return fulfillment_seller(preferred, named)
 
 
 def _form_status_reply(state: dict[str, Any]) -> str:
@@ -1769,12 +1785,13 @@ def _options_reply(state: dict[str, Any], options: list[dict[str, Any]], seller:
         bits.append(f"₹{option['price']}")
         lines.append(", ".join(part for part in bits if part) + ".")
     best = _pick_best(options, str(state.get("preference") or ""))
-    from app.search import NOT_BOOKABLE
+    from app.search import default_bookable_seller, seller_can_book
 
-    if (seller or "") in NOT_BOOKABLE or label == "Google Flights":
+    if not seller_can_book(seller or ""):
+        book_on = _seller_label(default_bookable_seller())
         lines.append(
             f"I'd take {best['airline']} at {best['depart']}. "
-            "Google Flights can't take the booking. Say that time and I'll book it on Cleartrip, or name another site."
+            f"{label} can't take the booking. Say that time and I'll book it on {book_on}, or name another site."
         )
     else:
         lines.append(f"I'd take {best['airline']} at {best['depart']} on {label}. Say that time and I'll book it.")
@@ -1843,14 +1860,19 @@ def _publish_fares(
         if preferred and preferred not in NOT_BOOKABLE:
             saved["preferred_seller"] = preferred
         elif seller["id"] in NOT_BOOKABLE:
-            # Google/Kayak fares book on Cleartrip next — don't keep a leftover Ixigo preference.
-            saved["preferred_seller"] = "cleartrip"
+            from app.search import default_bookable_seller
+
+            saved["preferred_seller"] = default_bookable_seller()
         if options:
             saved["options"] = [
                 {k: item[k] for k in ("airline", "flight", "depart", "arrive", "price") if k in item}
                 for item in options
             ]
         saved["stage"] = "results"
+        shot = str(session.unsent[-1]) if session.unsent else ""
+        from app.turn_loop import remember_results_page
+
+        remember_results_page(saved, seller=seller["id"], options=options or [], shot=shot, page=str(result or ""))
         _save(phone, saved)
         if page_blocked(result) or not (options or prices):
             trip = _trip_line(saved) or "that trip"

@@ -975,10 +975,13 @@ class SellerChoiceAndProxy(unittest.TestCase):
         with_fares["stage"] = "results"
         self.assertEqual(_coerce_kind("EaseMyTrip", "chat", with_fares), "book")
         self.assertEqual(_coerce_kind("Ixigo", "book", with_fares), "book")
-        # A leftover Ixigo preference must not steal a bare "1:15" after Google fares.
+        # A leftover Ixigo preference must not steal a bare "1:15" after a list that cannot ticket.
         with_fares["preferred_seller"] = "ixigo"
-        with_fares["seller"] = "ixigo"
-        self.assertEqual(_booking_seller_id(with_fares, "1:15"), "cleartrip")
+        with_fares["seller"] = "google"
+        with_fares["last_vision"] = {"kind": "results", "seller": "google", "bookable": False}
+        from app.search import default_bookable_seller
+
+        self.assertEqual(_booking_seller_id(with_fares, "1:15"), default_bookable_seller())
         self.assertEqual(_booking_seller_id(with_fares, "Ixigo"), "ixigo")
         stuck = dict(trip)
         stuck["preferred_seller"] = "cleartrip"
@@ -1483,6 +1486,50 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("wants_fresh_search", src)
         self.assertEqual(align_action("let's start fresh", addons)["do"], "search")
         self.assertEqual(align_action("Skip add-ons", addons)["do"], "book")
+        google_list = {
+            **trip,
+            "seller": "google",
+            "stage": "results",
+            "options": [{"airline": "IndiGo", "depart": "10:45", "price": "9,812"}],
+        }
+        self.assertTrue(has_live_facts(google_list))
+        pick_google = align_action("10:45", google_list)
+        self.assertEqual(pick_google["do"], "book")
+        named = align_action("Cleartrip 10:45", google_list)
+        self.assertEqual(named["do"], "book")
+        from app.search import default_bookable_seller
+        from app.travel_agent import _booking_seller_id, handle_turn as _ht
+
+        self.assertEqual(_booking_seller_id(google_list, "10:45"), default_bookable_seller())
+        self.assertEqual(_booking_seller_id(google_list, "Cleartrip 10:45"), "cleartrip")
+        src = inspect.getsource(_ht)
+        self.assertIn("remember_results_page", inspect.getsource(__import__("app.travel_agent", fromlist=["_publish_fares"])._publish_fares))
+        fallback = inspect.getsource(_ht).split('if kind == "search":')[-1][:900]
+        self.assertIn("origin", fallback)
+        self.assertIn("_search_ack", fallback)
+
+    def test_fare_list_memory_connects_sites(self) -> None:
+        from app.search import default_bookable_seller, seller_can_book
+        from app.travel_agent import _booking_seller_id, _options_reply, _seller_label
+        from app.turn_loop import align_action, has_live_facts, remember_results_page
+
+        self.assertFalse(seller_can_book("google"))
+        self.assertTrue(seller_can_book("cleartrip"))
+        state: dict = {"origin": "Guwahati", "destination": "Delhi", "depart": "2026-12-04"}
+        remember_results_page(
+            state,
+            seller="google",
+            options=[{"airline": "IndiGo", "depart": "10:45", "price": "9,812"}],
+        )
+        self.assertTrue(has_live_facts(state))
+        self.assertEqual(state["last_vision"]["kind"], "results")
+        self.assertFalse(state["last_vision"]["bookable"])
+        self.assertEqual(align_action("10:45", state)["do"], "book")
+        self.assertEqual(_booking_seller_id(state, "10:45"), default_bookable_seller())
+        spoken = _options_reply(state, state["options"], seller="google")
+        self.assertIn("can't take the booking", spoken)
+        self.assertIn(_seller_label(default_bookable_seller()), spoken)
+        self.assertNotRegex(spoken.lower(), r"where are you flying")
 
     def test_dead_itinerary_opens_fresh_fares_not_login(self) -> None:
         import inspect

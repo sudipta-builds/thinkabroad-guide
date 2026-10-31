@@ -35,7 +35,8 @@ _TURN = (
     "Do not re-ask a field already listed as saved. Do not recommend Skip add-ons unless that sheet is on screen.\n"
     "tap must be a short label visible on the page/screenshot. auto true only for Skip add-ons, "
     "name-check Confirm, or Continue that does not spend money.\n"
-    "If NO screenshot is attached, never invent a fare list or say results are ready. "
+    "If NO screenshot is attached, never invent a fare list. Saved fare rows in Memory "
+    "are the current results sheet — a departure time is intent=select, not a new trip. "
     "A new trip (from/to/date) is intent=search, goal=search.\n"
     "If they say start fresh / start over / search again, intent=search, goal=search. "
     "Ignore a stale add-ons screenshot and do not recommend Skip add-ons.\n"
@@ -77,6 +78,56 @@ def remember_shot(state: dict[str, Any], path: str) -> None:
 
     if Path(path).is_file():
         state["last_shot"] = path
+
+
+def stored_fare_list(state: dict[str, Any]) -> bool:
+    """True when this turn already has a fare list, even if the JPEG is gone."""
+    options = state.get("options") if isinstance(state.get("options"), list) else []
+    if options:
+        return True
+    vision = state.get("last_vision") if isinstance(state.get("last_vision"), dict) else {}
+    return str(vision.get("kind") or "") in {"results", "loading"}
+
+
+def remember_results_page(
+    state: dict[str, Any],
+    *,
+    seller: str,
+    options: list[dict[str, Any]] | None = None,
+    shot: str = "",
+    page: str = "",
+) -> None:
+    """One memory for any site's fare list: kind, seller, bookable, rows, optional shot."""
+    from app.search import seller_can_book
+
+    rows = [item for item in (options or []) if isinstance(item, dict)]
+    facts = []
+    for item in rows[:6]:
+        bits = [str(item.get("airline") or ""), str(item.get("depart") or ""), str(item.get("price") or "")]
+        line = " ".join(part for part in bits if part).strip()
+        if line:
+            facts.append(line[:140])
+    if shot:
+        remember_shot(state, shot)
+    state["seller"] = seller
+    state["stage"] = "results"
+    state["stuck_kind"] = "results"
+    if page:
+        state["stuck_page"] = str(page)[:4000]
+    if rows:
+        state["options"] = [
+            {k: item[k] for k in ("airline", "flight", "depart", "arrive", "price") if k in item}
+            for item in rows
+        ]
+    state["last_vision"] = {
+        "kind": "results",
+        "seller": seller,
+        "bookable": seller_can_book(seller),
+        "what": "fare list",
+        "facts": facts,
+        "tap": "",
+        "shot": str(state.get("last_shot") or shot or ""),
+    }
 
 
 _FRESH = re.compile(
@@ -217,6 +268,22 @@ def _local_turn(text: str, page: str, state: dict[str, Any]) -> dict[str, Any]:
             "facts": [],
             "source": "local",
         }
+    if stored_fare_list(state) and re.search(r"\b\d{1,2}[:.]\d{2}\b", raw):
+        clock = re.search(r"\b\d{1,2}[:.]\d{2}\b", raw)
+        when = clock.group(0) if clock else ""
+        return {
+            "goal": "forward",
+            "intent": "select",
+            "kind": "results",
+            "what": "the saved fare list",
+            "why": "you named a departure time",
+            "recommend": f"book the {when} on a site that can ticket",
+            "tap": "",
+            "auto": "",
+            "reply": f"I'll book the {when} on a site that can take the ticket. Nothing paid.",
+            "facts": list(vision.get("facts") or []),
+            "source": "local",
+        }
     return {
         "goal": "",
         "intent": "",
@@ -242,9 +309,16 @@ def _gemini_turn(text: str, page: str, image_path: str, state: dict[str, Any]) -
     hint = str(state.get("selected_hint") or "")
     seller = str(state.get("seller") or state.get("preferred_seller") or "")
     missing = [key for key in ("name", "email", "phone", "dob", "gender") if not str(state.get(key) or "").strip()]
+    rows = state.get("options") if isinstance(state.get("options"), list) else []
+    fares = ", ".join(
+        f"{item.get('airline') or ''} {item.get('depart') or ''} ₹{item.get('price') or ''}".strip()
+        for item in rows[:6]
+        if isinstance(item, dict)
+    )
     user = (
         f"Traveller: {text}\nSeller: {seller or 'unknown'}. Chosen departure: {hint or 'unknown'}.\n"
         f"Screenshot attached: {'yes' if image_path else 'NO — do not invent results'}.\n"
+        f"Saved fare rows: {fares or 'none'}.\n"
         f"Last step kind: {state.get('stuck_kind') or state.get('stage') or ''}.\n"
         f"Saved passenger: name={bool(state.get('name'))} email={bool(state.get('email'))} "
         f"phone={bool(state.get('phone'))} dob={bool(state.get('dob'))} gender={bool(state.get('gender'))}. "
@@ -296,7 +370,7 @@ def interpret_turn(
         kind = ""
         tap = ""
         reply = ""
-    if not shot and not page:
+    if not shot and not page and not stored_fare_list(state):
         if trip_ready and intent in {"status", "select", "book", "chat", ""}:
             intent = "search"
             goal = "search"
@@ -332,11 +406,13 @@ def format_turn_reply(turn: dict[str, Any]) -> str:
 
 
 def has_live_facts(state: dict[str, Any]) -> bool:
-    """True when this booking has a screenshot or a vision read of that page."""
+    """True when this booking has a screenshot, a vision read, or a saved fare list."""
     if _shot_from(state):
         return True
     vision = state.get("last_vision") if isinstance(state.get("last_vision"), dict) else {}
-    return bool(vision.get("kind"))
+    if vision.get("kind"):
+        return True
+    return stored_fare_list(state)
 
 
 def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -344,6 +420,8 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
     turn = turn or interpret_turn(text, state)
     vision = state.get("last_vision") if isinstance(state.get("last_vision"), dict) else {}
     sheet = str(turn.get("kind") or vision.get("kind") or "")
+    if not sheet and stored_fare_list(state):
+        sheet = "results"
     intent = str(turn.get("intent") or "")
     goal = str(turn.get("goal") or "")
     tap = str(turn.get("tap") or "")

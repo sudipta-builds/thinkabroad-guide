@@ -57,8 +57,7 @@ def step_read_enabled() -> bool:
 
 
 _ADDONS_SHEET = re.compile(
-    r"choose add-ons|choose your seat|add seats|missed adding meal|skip add-?ons|"
-    r"no meal, additional|extra baggage",
+    r"choose add-ons|choose your seat|add seats|missed adding meal|skip add-?ons|seat map",
     re.I,
 )
 _AGREE_ONLY = re.compile(
@@ -68,8 +67,38 @@ _AGREE_ONLY = re.compile(
 
 
 def addons_sheet(page: str) -> bool:
-    """Choose add-ons / seats / bags. A later sentence cannot rename this sheet."""
+    """Choose add-ons / seat map. A fare line that says extra baggage is not this sheet."""
     return bool(_ADDONS_SHEET.search(page or ""))
+
+
+def visible_forward(page: str, requested: str = "") -> str:
+    """The control to press. A named Continue stays Continue. Skip is never invented."""
+    hay = page or ""
+    asked = re.sub(r"\s+", " ", requested or "").strip()
+    if re.search(r"\bcontinue\b", asked, re.I):
+        return "Continue"
+    if asked and re.fullmatch(r"skip|decline|no thanks|no, thanks", asked, re.I):
+        for label in (
+            "Skip add-ons",
+            "Skip add ons",
+            "Continue without add-ons",
+            "No, Thanks",
+            "No Thanks",
+        ):
+            if label.lower() in hay.lower():
+                return label
+    if asked:
+        hit = safe_tap(asked, hay)
+        if hit:
+            return hit
+    if addons_sheet(hay):
+        for label in ("Skip add-ons", "Skip add ons", "Continue without add-ons", "Continue"):
+            hit = safe_tap(label, hay)
+            if hit:
+                return hit
+    if re.search(r"pay to complete|enter card number|payment options", hay, re.I):
+        return ""
+    return forward_tap(hay) or decline_tap(hay)
 
 
 def decline_tap(page: str) -> str:
@@ -349,8 +378,9 @@ def decide_front(
             or safe_tap("Skip add-ons", hay)
             or safe_tap("Skip add ons", hay)
             or safe_tap("Continue without add-ons", hay)
+            or visible_forward(hay)
             or contract.get("tap")
-            or "Skip add-ons"
+            or ""
         )
         fact_bit = "; ".join(contract.get("facts") or []) or "optional seats/meals/bags"
         # If the traveller already chose a tap/yes, click; otherwise still auto-skip extras.

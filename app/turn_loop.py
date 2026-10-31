@@ -235,20 +235,19 @@ def _local_turn(text: str, page: str, state: dict[str, Any]) -> dict[str, Any]:
             "source": "local",
         }
     if re.search(r"\b(skip|decline)\b", raw, re.I):
-        from app.step_read import addons_sheet
+        from app.step_read import visible_forward
 
-        on_addons = kind == "addons" or addons_sheet(hay)
-        label = "Skip add-ons" if on_addons else (tap or "Continue")
+        label = visible_forward(hay, raw) or ("Continue" if re.search(r"\bcontinue\b", hay, re.I) else "")
         return {
             "goal": "skip",
             "intent": "book",
-            "kind": "addons" if on_addons else (kind or "other"),
-            "what": "skip extras",
-            "why": "you asked to skip",
-            "recommend": f"press {label}",
+            "kind": "addons" if label.lower().startswith("skip") else (kind or "review"),
+            "what": "the open page",
+            "why": "you asked to leave the extras",
+            "recommend": f"press {label}" if label else "the visible forward control",
             "tap": label,
             "auto": "1",
-            "reply": "Skipping extras and moving forward. Nothing paid.",
+            "reply": f"I'll press {label or 'the visible control'} on this page. Nothing paid.",
             "facts": [],
             "source": "local",
         }
@@ -256,11 +255,13 @@ def _local_turn(text: str, page: str, state: dict[str, Any]) -> dict[str, Any]:
         r"yes|yep|yeah|ok|okay", raw, re.I
     ):
         pending = state.get("pending_step") if isinstance(state.get("pending_step"), dict) else {}
-        from app.step_read import addons_sheet
+        from app.step_read import visible_forward
 
-        label = tap or str(pending.get("tap") or "") or "Continue"
-        if (kind == "addons" or addons_sheet(hay)) and re.fullmatch(r"yes|yep|yeah|ok|okay", raw, re.I):
-            label = "Skip add-ons"
+        label = visible_forward(hay, raw) or tap or str(pending.get("tap") or "")
+        if re.search(r"\bcontinue\b", raw, re.I) and re.search(r"\bcontinue\b", hay, re.I):
+            label = "Continue"
+        elif re.fullmatch(r"yes|yep|yeah|ok|okay", raw, re.I):
+            label = visible_forward(hay) or label
         return {
             "goal": "forward",
             "intent": "book",
@@ -460,8 +461,21 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
     if sheet in {"addons", "upsell", "review", "fare_sheet"}:
         if intent == "status" or goal == "ask":
             return {"do": "reply", "kind": "status", "tap": tap, "turn": turn, "reply": format_turn_reply(turn)}
-        if not tap:
-            tap = "Skip add-ons" if sheet == "addons" else "Continue"
+        from app.step_read import visible_forward
+
+        page = str(state.get("stuck_page") or "")
+        if re.search(r"\bcontinue\b", text or "", re.I):
+            tap = "Continue"
+        else:
+            grounded = visible_forward(page, text) or visible_forward(page, tap)
+            if grounded:
+                tap = grounded
+            elif re.search(r"skip add", tap, re.I) and not re.search(r"skip add", page, re.I):
+                tap = visible_forward(page) or ""
+            elif sheet == "addons" and not tap:
+                tap = ""
+            elif not tap:
+                tap = "Continue"
         return {"do": "book", "kind": "book", "tap": tap, "turn": turn, "reply": ""}
 
     if sheet in {"form", "passenger"} or intent == "details":

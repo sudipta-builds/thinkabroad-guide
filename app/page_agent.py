@@ -241,8 +241,8 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
     # Fare lists win over add-on marketing copy / stepper labels on Cleartrip/Ixigo results.
     if fare_list and not flight_unavailable(hay):
         return "results"
-    # Ixigo review also shows the "Add-ons" stepper label — require real add-on UI.
-    if re.search(r"choose your seat|add meal|skip add-?ons|extra baggage", hay, re.I):
+    # Ixigo review also shows the "Add-ons" stepper label — require the real add-on sheet.
+    if re.search(r"choose your seat|add meal|skip add-?ons", hay, re.I):
         return "addons"
     # A review sheet that already shows the traveller is not the empty name form.
     if re.search(r"review details", hay, re.I) and re.search(r"\bcontinue\b", hay, re.I) and not re.search(
@@ -2223,11 +2223,7 @@ def run_checkout_agent(
             return CheckoutOutcome(stage, text, url, log, facts=facts, checks=checks, handoff=handoff)
         # Add-ons skip is an outcome loop, not a 16-step vision tour. Reply within ~20s.
         skip_now = bool(
-            stage == "addons"
-            or re.search(r"choose add-ons|add seats|missed adding meal", text or "", re.I)
-        ) and (
-            stage == "addons"
-            or re.search(r"skip add", tap_pending or chosen_tap or "", re.I)
+            re.search(r"choose add-ons|skip add-?ons|add seats|missed adding meal", text or "", re.I)
         )
         if skip_now:
             log.append("addons_fast")
@@ -2242,14 +2238,14 @@ def run_checkout_agent(
             if left and stage != "addons":
                 log.append(f"addons_fast_left:{stage}")
             else:
-                if re.search(r"seat map|choose add-ons|add seats", text or "", re.I):
+                if re.search(r"choose add-ons|skip add-?ons|add seats", text or "", re.I):
                     handoff = (
-                        "Skip add-ons is on screen, but the click did not close that sheet. "
-                        "The seat map may still be showing. Nothing paid."
+                        "That click did not leave this sheet. "
+                        "Nothing paid."
                     )
                 else:
                     handoff = (
-                        "I could not open Review your itinerary from this extras page. "
+                        "Continue did not open Review your itinerary. "
                         "Nothing paid."
                     )
                 log.append("addons_fast_still")

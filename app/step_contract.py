@@ -87,13 +87,17 @@ def build_contract(
             success_when = "a seat is selected or you say skip"
         else:
             action = "skip_extras"
-            tap = "Skip add-ons"
+            from app.step_read import visible_forward
+
+            tap = visible_forward(page) or ("Skip add-ons" if re.search(r"skip add-?ons", page or "", re.I) else "")
+            if not tap and re.search(r"\bcontinue\b", page or "", re.I):
+                tap = "Continue"
             requires_user = False if wants_skip or not wants_seat else True
             # Default Instinct path: skip optional extras unless they asked for seats.
             if not wants_seat:
                 requires_user = False
             recommend = (
-                "Skip add-ons (and the missed meals/seats nag if it appears) — seats/meals stay off unless you ask"
+                f"press {tap}" if tap else "the visible forward control — seats and meals stay off unless you ask"
             )
             success_when = "left Choose add-ons / no seat map"
     elif shown == "unavailable":

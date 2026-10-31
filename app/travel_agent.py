@@ -567,6 +567,11 @@ def extract_user_ask(text: str, state: dict[str, Any]) -> dict[str, str]:
     if pending:
         page = str(pending.get("page") or "")
     page = page or str(state.get("stuck_page") or "")
+    if re.search(r"\bcontinue\b", raw, re.I) and str(state.get("stuck_kind") or "") != "addon_buy":
+        out["intent"] = "book"
+        out["goal"] = "forward"
+        out["tap"] = "Continue"
+        return out
     if re.fullmatch(
         r"yes|yep|yeah|ok|okay|sure|decline|skip|skip add-ons|skip addons|no thanks|no, thanks",
         raw,
@@ -2394,16 +2399,17 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         except Exception:
             controls = ""
     hay = f"{page or ''}\n{controls}"
-    from app.step_read import addons_sheet
+    from app.step_read import addons_sheet, visible_forward
 
     if shown == "addons" or addons_sheet(hay):
-        return _stuck_line(
-            state,
-            "addons",
-            f"Choose add-ons for the {which} on {trip}",
-            "seats and bags are optional",
-            "I'll press Skip add-ons",
-        )
+        tap = visible_forward(hay) or "Continue"
+        if addons_sheet(hay):
+            what = f"Choose add-ons for the {which} on {trip}"
+            why = "seats and bags are optional"
+        else:
+            what = f"the open {seller} page for the {which} on {trip}"
+            why = "the next control is the one written on this page"
+        return _stuck_line(state, "addons" if addons_sheet(hay) else (shown or "review"), what, why, f"I'll press {tap}")
     # Results / sold-out are owned above — never fall through to "exact button".
     if shown not in {"results", "loading", "unavailable", "home", "cookie", "pay", "otp", "login"} and (
         surface.get("overlay")
@@ -2522,12 +2528,12 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             rec,
         )
     if shown == "addons" or re.search(
-        r"choose your seat|add meal|skip add-?ons|extra baggage|missed adding meal|choose add-ons|add seats",
+        r"choose your seat|add meal|skip add-?ons|missed adding meal|choose add-ons|add seats",
         page,
         re.I,
     ):
         from app.step_contract import build_contract, format_contract_stuck
-        from app.step_read import decline_tap
+        from app.step_read import decline_tap, visible_forward
 
         vision = state.get("last_vision") if isinstance(state.get("last_vision"), dict) else None
         contract = build_contract(
@@ -2538,7 +2544,9 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             vision=vision,
             user_goal="skip",
         )
-        tap = decline_tap(page) or str(contract.get("tap") or "Skip add-ons")
+        tap = visible_forward(page) or decline_tap(page) or str(contract.get("tap") or "")
+        if re.search(r"skip add", tap, re.I) and not re.search(r"skip add", page, re.I):
+            tap = "Continue" if re.search(r"\bcontinue\b", page, re.I) else ""
         arm_pending_step(state, page, "addons", tap=tap)
         state["last_contract"] = contract
         # Prefer auto-skip wording when we will click without another yes.
@@ -2576,14 +2584,17 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             "send Gmail and Indian mobile, or a login if the site asks to sign in",
         )
     if re.search(r"\bcontinue\b", page, re.I) and re.search(
-        r"fare summary|review details|review & traveller", page, re.I
+        r"fare summary|review details|review & traveller|fully flexible|travel insurance", page, re.I
     ):
+        from app.step_read import visible_forward
+
+        tap = visible_forward(page) or "Continue"
         return _stuck_line(
             state,
             "review",
             f"{seller} review for the {which} on {trip}",
-            "the fare summary before travellers — Continue did not change the page",
-            "skip if a paid extra is open, otherwise go on and I'll try Continue once more",
+            "the next control is the one written on this page",
+            f"I'll press {tap}",
         )
     state["stuck_kind"] = shown or "other"
     spoken = (

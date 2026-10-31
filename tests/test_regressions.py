@@ -1472,6 +1472,66 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("Review your itinerary", text)
         self.assertEqual(stage, "review")
 
+    def test_continue_on_extras_is_not_rewritten_to_skip(self) -> None:
+        from app.page_agent import classify_page, run_checkout_agent
+        from app.step_read import addons_sheet, visible_forward
+        from app.travel_agent import _booking_page_reply
+        from app.turn_loop import align_action
+        from playwright.sync_api import sync_playwright
+
+        extras = (
+            "6E 2092 10:45 Fare summary Add ons ₹449 Extra baggage "
+            "Make your journey fully flexible Travel insurance Continue"
+        )
+        self.assertFalse(addons_sheet(extras))
+        self.assertNotEqual(
+            classify_page(extras, "https://www.cleartrip.com/flights/itinerary/1"),
+            "addons",
+        )
+        self.assertEqual(visible_forward(extras, "Continue (do not buy the extras)"), "Continue")
+        state = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "cleartrip",
+            "selected_hint": "10:45",
+            "stuck_page": "I'll press Skip add-ons. Choose add-ons",
+            "last_vision": {"kind": "addons", "tap": "Skip add-ons", "what": "Choose add-ons"},
+            "stuck_kind": "addons",
+        }
+        plan = align_action("Continue (do not buy the extras)", {**state, "stuck_page": extras})
+        self.assertEqual(plan["tap"], "Continue")
+        reply = _booking_page_reply(state, "10:45", extras, type("S", (), {"page": None})())
+        self.assertIn("Continue", reply)
+        self.assertNotIn("Skip add-ons", reply)
+        html = """<!doctype html><html><body>
+        <p>6E 2092 10:45 Fare summary Add ons ₹449 Extra baggage Make your journey fully flexible Travel insurance</p>
+        <button id="go" style="width:160px;height:44px">Continue</button>
+        <script>
+          document.getElementById('go').onclick = () => {
+            document.body.innerHTML = '<h1>Review your itinerary</h1><p>Fare summary 6E 2092 Total amount</p>';
+          };
+        </script></body></html>"""
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            page.set_content(html)
+            outcome = run_checkout_agent(
+                page,
+                hint="10:45",
+                seller="cleartrip",
+                origin="Guwahati",
+                destination="Delhi",
+                depart="2026-12-04",
+                max_steps=4,
+                chosen_tap="Continue",
+            )
+            text = page.inner_text("body")
+            browser.close()
+        self.assertIn("Review your itinerary", text)
+        self.assertTrue(any(line == "user_tap:Continue" for line in outcome.log), outcome.log)
+        self.assertFalse(any("skip add" in line.lower() for line in outcome.log), outcome.log)
+
     def test_one_gemini_turn_names_wish_not_pending_skip(self) -> None:
         import inspect
 

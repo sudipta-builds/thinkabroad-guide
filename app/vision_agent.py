@@ -139,13 +139,17 @@ def see_step(
         out["auto"] = "1"
     from app.step_read import addons_sheet
 
-    if addons_sheet(page_text):
+    if addons_sheet(page_text) and re.search(r"skip add-?ons|choose add-ons", page_text or "", re.I):
         out["kind"] = "addons"
-        out["seat_map"] = True
         out["what"] = "Choose add-ons"
         out["why"] = "seats and bags are optional"
         out["recommend"] = "press Skip add-ons"
         out["tap"] = "Skip add-ons"
+        out["auto"] = "1"
+    elif re.search(r"\bcontinue\b", page_text or "", re.I) and not re.search(r"skip add-?ons", page_text or "", re.I):
+        out["kind"] = "review" if out["kind"] == "addons" else out["kind"]
+        out["tap"] = "Continue"
+        out["recommend"] = "press Continue"
         out["auto"] = "1"
     return out
 
@@ -215,9 +219,12 @@ def classify_with_vision(
     mapped = stage_map.get(kind, dom_stage)
     from app.step_read import addons_sheet
 
-    if addons_sheet(page_text) or seen.get("kind") == "addons" or seen.get("seat_map"):
+    if addons_sheet(page_text) and re.search(r"skip add-?ons|choose add-ons|add seats", page_text or "", re.I):
         seen["kind"] = "addons"
-        seen["tap"] = "Skip add-ons"
+        if re.search(r"skip add-?ons", page_text or "", re.I):
+            seen["tap"] = "Skip add-ons"
+        elif re.search(r"\bcontinue\b", page_text or "", re.I):
+            seen["tap"] = "Continue"
         seen["auto"] = "1"
         return "addons", seen
     if seen.get("sold_out"):

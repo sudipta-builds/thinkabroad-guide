@@ -322,6 +322,17 @@ class DateAndMemory(unittest.TestCase):
         self.assertEqual(accept_choice("yes", {"tap": "Decline", "page": radio, "kind": "upsell"}), "I don't want Free Cancellation")
         self.assertEqual(accept_choice("Secure My Trip", {"tap": "No, Thanks", "page": "No, Thanks Secure My Trip", "kind": "upsell"}), "")
         self.assertEqual(accept_choice("pay now", {"tap": "No, Thanks", "page": "Pay now No, Thanks", "kind": "upsell"}), "")
+        self.assertEqual(
+            accept_choice("Click 'No thanks'", {"tap": "", "page": "Free Cancellation No Thanks Secure My Trip", "kind": "addon_buy"}),
+            "No Thanks",
+        )
+        from app.step_read import arm_pending_step, choice_phrase
+
+        self.assertEqual(choice_phrase("Click 'No thanks'"), "No thanks")
+        st: dict = {}
+        arm_pending_step(st, "Assured No Thanks Continue", "addon_buy", tap="No Thanks")
+        self.assertEqual(st["pending_step"]["tap"], "No Thanks")
+        self.assertIn("stuck_page", st)
 
     def test_control_digest_and_unknown_steps_wait(self) -> None:
         import inspect

@@ -87,6 +87,15 @@ def describe_step(heard: dict[str, str]) -> str:
     )
 
 
+def choice_phrase(text: str) -> str:
+    """Strip click / quotes so Click 'No thanks' becomes No thanks."""
+    raw = re.sub(r"\s+", " ", (text or "").strip())
+    match = re.match(r"^click\s+(?:the\s+)?(.+)$", raw, re.I)
+    if match:
+        raw = match.group(1).strip()
+    return raw.strip("'\"").strip()
+
+
 def accept_choice(text: str, pending: dict[str, str]) -> str:
     """The button the traveller just agreed to. Empty until they choose.
 
@@ -96,16 +105,32 @@ def accept_choice(text: str, pending: dict[str, str]) -> str:
     Pay controls are never accepted here.
     """
     page = pending.get("page") or ""
-    raw = re.sub(r"\s+", " ", (text or "").strip())
+    raw = choice_phrase(text)
     if not raw or not page:
         return ""
-    if re.search(r"\b(pay now|pay to complete|make payment)\b", raw, re.I):
+    if re.search(r"\b(pay now|pay to complete|make payment|secure my trip)\b", raw, re.I):
         return ""
     if _AGREE.fullmatch(raw):
         return safe_tap(str(pending.get("tap") or ""), page) or decline_tap(page) or RECOMMENDED
+    if re.search(r"no\s*,?\s*thanks", raw, re.I):
+        return safe_tap("No, Thanks", page) or safe_tap("No Thanks", page) or decline_tap(page)
+    if re.search(r"don.?t want", raw, re.I):
+        return decline_tap(page) or RECOMMENDED
     if 2 <= len(raw) <= 80 and raw.lower() in re.sub(r"\s+", " ", page).lower():
         return safe_tap(raw, page)
     return ""
+
+
+def arm_pending_step(state: dict, page: str, kind: str, *, tap: str = "") -> None:
+    """Remember this page so yes / No thanks can resume checkout."""
+    hay = (page or "")[:1500]
+    label = tap or decline_tap(hay)
+    state["stuck_page"] = hay
+    state["pending_step"] = {
+        "tap": label,
+        "page": hay,
+        "kind": kind,
+    }
 
 
 def read_step(page: str, *, seller: str = "", hint: str = "", controls: str = "") -> dict[str, str] | None:

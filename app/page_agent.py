@@ -866,6 +866,12 @@ def _ixigo_opt_out_cancellation(page) -> str:
         return "optout_text"
     except Exception:
         pass
+    for pattern in (r"^no,?\s*thanks$", r"^no thanks$"):
+        try:
+            page.get_by_text(re.compile(pattern, re.I)).first.click(timeout=2500)
+            return "optout_no_thanks"
+        except Exception:
+            pass
     try:
         clicked = page.evaluate(
             """() => {

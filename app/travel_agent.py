@@ -267,6 +267,14 @@ def handle_turn(
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="👀")
     pending = state.get("pending_step") if isinstance(state.get("pending_step"), dict) else None
+    if not pending and state.get("stuck_kind") in {"addon_buy", "upsell", "other"}:
+        stuck_page = str(state.get("stuck_page") or "")
+        if stuck_page:
+            pending = {
+                "tap": "",
+                "page": stuck_page,
+                "kind": str(state.get("stuck_kind") or "other"),
+            }
     if pending and kind not in {"details", "pay", "cancel", "search"}:
         from app.step_read import accept_choice
 
@@ -1941,7 +1949,17 @@ def passenger_details_reply(state: dict[str, Any]) -> str:
 
 def _mid_booking_ack(state: dict[str, Any], seller_id: str, chosen: str, text: str) -> str:
     """Do not promise Continue when the open page may be a different block."""
+    from app.step_read import RECOMMENDED
+
     seller = _seller_label(seller_id)
+    tap = str(state.get("chosen_tap") or "")
+    if tap == RECOMMENDED:
+        return (
+            f"Skipping extras and ticking your traveller on {seller} for {chosen}. "
+            "Nothing paid."
+        )
+    if tap and not tap.startswith("__"):
+        return f"Pressing {tap} on {seller} for {chosen}. Nothing paid."
     live = state.get("live") if isinstance(state.get("live"), dict) else {}
     stage = str(state.get("stage") or live.get("stage") or "")
     stuck = str(state.get("stuck_kind") or "")
@@ -2066,11 +2084,9 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     if heard and heard.get("kind") in {"upsell", "other"}:
         tap = heard.get("tap") or decline_tap(hay)
         heard["tap"] = tap
-        state["pending_step"] = {
-            "tap": tap,
-            "page": hay[:1500],
-            "kind": heard.get("kind") or "other",
-        }
+        from app.step_read import arm_pending_step
+
+        arm_pending_step(state, hay, heard.get("kind") or "other", tap=tap)
         state["stuck_kind"] = heard.get("kind") or "other"
         spoken = describe_step(heard)
         state["last_stuck"] = spoken
@@ -2119,12 +2135,20 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         )
     offer = _addon_upsell(page)
     if offer:
+        from app.step_read import arm_pending_step, decline_tap
+
         if offer == "radio":
             cta = "I don't want Free Cancellation vs Assured"
-            rec = "skip. I'll tick I don't want Free Cancellation and your saved traveller. I will not buy Assured"
+            rec = (
+                "skip — reply yes, or send No Thanks / I don't want Free Cancellation. "
+                "I'll tick that and your saved traveller, not Assured"
+            )
+            tap = decline_tap(page)
         else:
             cta = "No, Thanks vs Secure My Trip" if offer == "secure" else "No, Thanks vs the paid extra"
-            rec = "skip. I'll tap No, Thanks. I will not buy Assured"
+            rec = "skip — reply yes or send No Thanks and I'll tap that, not Assured"
+            tap = decline_tap(page) or "No Thanks"
+        arm_pending_step(state, page, "addon_buy", tap=tap)
         return _stuck_line(
             state,
             "addon_buy",

@@ -462,6 +462,7 @@ def begin_login(
     on_code_requested: Callable[[dict[str, str]], None] | None = None,
     otp_wait_sec: int = 300,
     resume_url: str = "",
+    chosen_tap: str = "",
 ) -> dict[str, str]:
     """Open the seller and request one OTP.
 
@@ -512,6 +513,7 @@ def begin_login(
                             pause_on_auth=True,
                             max_steps=16,
                             profile=passenger,
+                            chosen_tap=chosen_tap,
                         )
                         checkout_notes = "resume | " + " | ".join(checkout.log)[:1500]
                         page = _latest(page)
@@ -557,10 +559,11 @@ def begin_login(
                         pause_on_auth=True,
                         max_steps=16,
                         profile=passenger,
+                        chosen_tap=chosen_tap,
                     )
                     checkout_notes = " | ".join(checkout.log)[:1500]
                     page = _latest(page)
-                if hint and classify_page(*_read(page), book_count=_book_count(page)) not in {
+                if hint and checkout.stage != "ask" and classify_page(*_read(page), book_count=_book_count(page)) not in {
                     "passenger",
                     "review",
                     "addons",
@@ -702,6 +705,7 @@ def begin_login(
                             pause_on_auth=True,
                             max_steps=16,
                             profile=passenger,
+                            chosen_tap=chosen_tap,
                         )
                         checkout_notes = " | ".join(checkout.log)[:1500]
                         page = _latest(page)

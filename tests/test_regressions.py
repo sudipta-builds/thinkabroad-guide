@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+
+os.environ["GUIDE_STEP_READ"] = "0"
 from pathlib import Path
 
 from app.page_agent import (
@@ -211,6 +213,7 @@ class DateAndMemory(unittest.TestCase):
         )
         self.assertIn("Stuck:", spoken)
         self.assertIn("recommend", spoken.lower())
+        self.assertNotIn("look at the screenshot", spoken.lower())
         self.assertNotIn("http", spoken)
         self.assertNotIn("moved", spoken.lower())
         cancel = _booking_page_reply(
@@ -221,9 +224,23 @@ class DateAndMemory(unittest.TestCase):
         )
         self.assertIn("Stuck:", cancel)
         self.assertIn("Free Cancellation", cancel)
-        self.assertIn("Buy This", cancel)
+        self.assertIn("No, Thanks", cancel)
         self.assertIn("skip", cancel.lower())
+        self.assertNotIn("look at the screenshot", cancel.lower())
         self.assertNotIn("Continue is on the screenshot", cancel)
+        assured = _booking_page_reply(
+            {**booking, "selected_hint": "12:30"},
+            "12:30",
+            "Assured Free Cancellation only ₹1,599 With Assured Without Assured No, Thanks Secure My Trip",
+            _Session(),  # type: ignore[arg-type]
+        )
+        self.assertIn("Assured", assured)
+        self.assertIn("No, Thanks", assured)
+        self.assertIn("skip", assured.lower())
+        asking = {**booking, "stage": "booking", "stuck_kind": "addon_buy", "options": [{"depart": "12:30", "price": "9,722", "airline": "IndiGo"}]}
+        self.assertEqual(infer_intent(asking, "?"), "status")
+        self.assertEqual(_cached_fares_reply(asking, "?", "chat") or "", "")
+        self.assertEqual(_cached_fares_reply(asking, "?", "status") or "", "")
         again = _booking_page_reply(
             {**booking, "stuck_kind": "addon_buy", "selected_hint": "12:30"},
             "12:30",
@@ -237,7 +254,60 @@ class DateAndMemory(unittest.TestCase):
         self.assertIn("stuck", ack.lower())
         self.assertNotIn("Continuing the 12:30", ack)
 
+    def test_an_unknown_button_is_read_from_the_page(self) -> None:
+        from unittest.mock import patch
+
+        from app.step_read import safe_tap
+
+        page = "Trip Shield cover for this flight. Not this time. Add shield now."
+        self.assertEqual(safe_tap("Not this time", page), "Not this time")
+        self.assertEqual(safe_tap("Secure My Trip", "Assured Secure My Trip No, Thanks"), "")
+        self.assertEqual(safe_tap("A button we invented", page), "")
+        os.environ["GUIDE_STEP_READ"] = "1"
+        try:
+            with (
+                patch("app.step_read.step_read_enabled", return_value=True),
+                patch(
+                    "app.llm.converse",
+                    return_value={
+                        "kind": "upsell",
+                        "what": "Ixigo is selling Trip Shield on this fare",
+                        "why": "an optional extra, not the passenger form",
+                        "recommend": "skip it",
+                        "tap": "Not this time",
+                    },
+                ),
+            ):
+                spoken = _booking_page_reply(
+                    {
+                        "origin": "Guwahati",
+                        "destination": "Delhi",
+                        "depart": "2026-12-04",
+                        "seller": "ixigo",
+                        "selected_hint": "12:30",
+                    },
+                    "12:30",
+                    page,
+                    type("S", (), {"page": type("P", (), {"url": "https://www.ixigo.com/flight/booking/1"})()})(),
+                )
+        finally:
+            os.environ["GUIDE_STEP_READ"] = "0"
+        self.assertIn("Trip Shield", spoken)
+        self.assertIn("Not this time", spoken)
+        self.assertIn("haven't tapped", spoken.lower())
+        self.assertNotIn("Buy This", spoken)
+        from app.step_read import accept_choice
+
+        pending = {"tap": "Not this time", "page": page, "kind": "upsell"}
+        self.assertEqual(accept_choice("yes", pending), "Not this time")
+        self.assertEqual(accept_choice("continue", pending), "")
+        self.assertEqual(accept_choice("Secure My Trip", {"tap": "No, Thanks", "page": "No, Thanks Secure My Trip", "kind": "upsell"}), "Secure My Trip")
+        self.assertEqual(accept_choice("pay now", {"tap": "No, Thanks", "page": "Pay now No, Thanks", "kind": "upsell"}), "")
+
+    def test_checkout_links_stay_out_of_whatsapp(self) -> None:
         from app.travel_agent import _clean, _hide_checkout_link, _usable_reply
+
+        booking = {"origin": "Guwahati", "destination": "Delhi", "depart": "2026-12-04", "seller": "ixigo"}
 
         dumped = (
             "I moved Guwahati to Delhi on 2026-12-04 forward on Ixigo. Nothing paid. "
@@ -1393,9 +1463,10 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn('sum(1 for line in log if "review_continue" in line) < 3', review)
         self.assertNotIn('{"action": "done", "target": "review"', review)
         self.assertNotIn("_dismiss_overlays(page)", review.split("review_continue")[1][:700])
-        handler = review.split('if kind == "review_continue"')[1][:900]
+        handler = review.split('if kind == "review_continue"')[1][:1800]
         self.assertEqual(handler.count("_safe_continue(page)"), 1)
         self.assertIn("_ixigo_opt_out_cancellation", handler)
+        self.assertLess(handler.index('CheckoutOutcome(\n                        "ask"'), handler.index("_safe_continue(page)"))
 
 
 if __name__ == "__main__":

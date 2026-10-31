@@ -654,7 +654,7 @@ def _dismiss_overlays(page) -> None:
 
 
 def _ixigo_buy_this_visible(page) -> bool:
-    """Paid add-on sheet (Free Cancellation) sits on top of Continue."""
+    """Paid Assured / Free Cancellation sheet sits on top of Continue."""
     try:
         return bool(
             page.evaluate(
@@ -665,15 +665,32 @@ def _ixigo_buy_this_visible(page) -> bool:
                     return r.width > 8 && r.height > 8 && s.visibility !== 'hidden'
                       && s.display !== 'none' && r.bottom > 0 && r.top < innerHeight;
                   };
-                  return [...document.querySelectorAll('button,a,[role=button]')].some((el) => {
-                    const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-                    return vis(el) && /^buy this$/i.test(t);
+                  const label = (el) => (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                  const hits = [...document.querySelectorAll('button,a,[role=button],span,p,div')].filter(vis);
+                  return hits.some((el) => {
+                    const t = label(el);
+                    return /^(buy this|secure my trip|no,?\\s*thanks)$/i.test(t);
                   });
                 }"""
             )
         )
     except Exception:
         return False
+
+
+def _tap_step_decline(page) -> str:
+    """Click the decline label the model copied off this page. Empty when it names none."""
+    try:
+        text, _url = _read(page)
+    except Exception:
+        return ""
+    from app.step_read import read_step
+
+    heard = read_step(text, seller="ixigo", hint="")
+    tap = str((heard or {}).get("tap") or "")
+    if tap and _click_label(page, tap):
+        return f"step_tap:{tap}"
+    return ""
 
 
 def _ixigo_opt_out_cancellation(page) -> str:
@@ -702,7 +719,7 @@ def _ixigo_opt_out_cancellation(page) -> str:
               const skip = nodes.find((el) => {
                 const text = label(el);
                 if (!text || text.length > 90) return false;
-                if (/^buy this$/i.test(text) || /\\bpay\\b/i.test(text)) return false;
+                if (/^buy this$|^secure my trip$/i.test(text) || /\\bpay\\b/i.test(text)) return false;
                 return /don.?t want free cancellation|no,? thanks|i don.?t want|continue without|skip (add-?on|this)|not now|maybe later|^none$|^no$/i.test(text);
               });
               if (skip) { skip.click(); return 'skip'; }
@@ -1432,6 +1449,7 @@ def run_checkout_agent(
     expect_flight: str = "",
     allow_pay: bool = False,
     pause_on_auth: bool = False,
+    chosen_tap: str = "",
 ) -> CheckoutOutcome:
     """Walk one seller toward payment handoff. Never charges unless allow_pay is True.
 
@@ -1449,6 +1467,7 @@ def run_checkout_agent(
     handoff = ""
     origin_code = "GAU" if re.search(r"guwahati|gau", origin or "", re.I) else ""
     dest_code = "DEL" if re.search(r"delhi|del", destination or "", re.I) else ""
+    tap_pending = (chosen_tap or "").strip()
 
     def _snapshot() -> tuple[str, str, str, dict[str, str]]:
         t, u = _read(page)
@@ -1459,6 +1478,20 @@ def run_checkout_agent(
     for step in range(max_steps):
         page = _latest(page)
         text, url, stage, facts = _snapshot()
+        if tap_pending:
+            label = tap_pending
+            tap_pending = ""
+            if re.search(r"pay now|pay to complete|make payment", label, re.I) and not allow_pay:
+                log.append("user_tap_refused")
+            elif _click_label(page, label):
+                log.append(f"user_tap:{label}")
+                try:
+                    page.wait_for_timeout(800)
+                except Exception:
+                    pass
+                continue
+            else:
+                log.append("user_tap_miss")
         if pause_on_auth and stage in {"login", "otp"}:
             log.append(f"{step}:{stage}:auth_pause")
             handoff = (
@@ -1535,8 +1568,25 @@ def run_checkout_agent(
             continue
         if kind == "review_continue":
             # Escape closes the Ixigo review sheet, so the Continue control disappears.
+            # An upsell or an unknown step is explained and left untouched until the traveller answers.
+            if not chosen_tap:
+                from app.step_read import describe_step, read_step
+
+                heard = read_step(text, seller=seller, hint=hint)
+                if heard and heard.get("kind") in {"upsell", "other"}:
+                    facts["tap"] = heard.get("tap") or ""
+                    handoff = describe_step(heard)
+                    log.append(f"{step}:ask:{heard.get('kind')}:{facts['tap']}")
+                    return CheckoutOutcome(
+                        "ask",
+                        text,
+                        url,
+                        log,
+                        facts=facts,
+                        checks=checks,
+                        handoff=handoff,
+                    )
             # One accurate click per attempt. A miss can be retried; Pay is never clicked.
-            # Free Cancellation "Buy This" is an overlay; skip it, then Continue.
             log.append(_ixigo_opt_out_cancellation(page))
             try:
                 page.wait_for_timeout(400)

@@ -64,7 +64,7 @@ def smoke_conversation() -> None:
         (
             "addon_buy",
             TRIP,
-            "Fare Summary Total Amount ₹9280 Free Cancellation Buy This Continue",
+            "Assured Free Cancellation No, Thanks Secure My Trip Fare Summary ₹9280 Continue",
             ix,
         ),
         (
@@ -111,8 +111,10 @@ def smoke_conversation() -> None:
             _must("recommend" in spoken.lower(), f"{kind} missing recommend")
             _must("Nothing paid" in spoken, f"{kind} missing nothing paid")
         if kind == "addon_buy":
-            _must("Buy This" in spoken and "skip" in spoken.lower(), "addon")
+            _must("No, Thanks" in spoken and "skip" in spoken.lower(), "addon")
+            _must("look at the screenshot" not in spoken.lower(), "addon screenshot ask")
             _must("Continue is on the screenshot" not in spoken, "addon continue lie")
+    _must(infer_intent({**TRIP, "stage": "booking", "stuck_kind": "addon_buy"}, "?") == "status", "? status")
 
     booking = {**TRIP, "stage": "review", "stuck_kind": "addon_buy"}
     _must(infer_intent(booking, "continue") == "book", "continue intent")

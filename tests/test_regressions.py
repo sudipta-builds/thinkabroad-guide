@@ -1233,6 +1233,103 @@ class SellerChoiceAndProxy(unittest.TestCase):
     def test_priced_select_buttons_are_results(self) -> None:
         self.assertEqual(classify_page("SpiceJet 09:10 Select ₹8,190", "https://flight.easemytrip.com/"), "results")
 
+    def test_results_beat_addon_marketing_copy(self) -> None:
+        hay = (
+            "Add meal Extra baggage Non Stop IndiGo 18:25 21:05 Book ₹10,283 "
+            "IndiGo 09:15 12:00 Book ₹10,283"
+        )
+        self.assertEqual(classify_page(hay, "https://www.cleartrip.com/flights/results"), "results")
+        self.assertNotEqual(classify_page(hay, "https://www.cleartrip.com/flights/results"), "addons")
+
+    def test_sold_out_modal_is_unavailable_not_review(self) -> None:
+        from app.page_agent import flight_unavailable
+
+        hay = (
+            "Flight is no longer available. Please search again! Search Again "
+            "Fare Summary Base Fare ₹7,893 Total Amount ₹9,465 Review & Traveller Details"
+        )
+        self.assertTrue(flight_unavailable(hay))
+        self.assertEqual(classify_page(hay, "https://www.ixigo.com/flight/booking/1"), "unavailable")
+        self.assertEqual(
+            deterministic_action("unavailable", hint="12:30", recovers=0)["action"],
+            "stuck",
+        )
+
+    def test_toast_on_fare_list_does_not_replace_page(self) -> None:
+        from app.page_agent import apply_front_text, nearest_depart_hint
+
+        body = (
+            "IndiGo 6E 123 18:25 21:05 2h 40m Non-stop Book ₹10,283 "
+            "IndiGo 6E 456 09:15 12:00 2h 45m Non-stop Book ₹10,283"
+        )
+        front = apply_front_text(
+            body,
+            {"overlay": True, "text": "No flight data available.", "controls": ""},
+        )
+        self.assertIn("Book", front)
+        self.assertIn("₹10,283", front)
+        self.assertEqual(nearest_depart_hint(body, "18:20"), "18:25")
+
+    def test_results_reply_recommends_not_button_ask(self) -> None:
+        from app.travel_agent import _booking_page_reply
+
+        page = (
+            "Guwahati to New Delhi IndiGo 6E5342 18:25 2h 40m Non-stop 21:05 Book ₹10,283 "
+            "IndiGo 6E2114 09:15 2h 45m Non-stop 12:00 Book ₹10,283"
+        )
+        spoken = _booking_page_reply(
+            {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-11-15",
+                "seller": "cleartrip",
+                "selected_hint": "18:20",
+            },
+            "18:20",
+            page,
+            type("S", (), {"page": None})(),
+        )
+        self.assertNotIn("exact button", spoken.lower())
+        self.assertTrue("recommend" in spoken.lower() or "book the" in spoken.lower())
+
+    def test_filled_path_blocked_when_flight_unavailable(self) -> None:
+        from app.travel_agent import _booking_page_reply
+
+        page = "Flight is no longer available. Please search again! Search Again Fare Summary ₹9,465"
+        spoken = _booking_page_reply(
+            {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-11-04",
+                "seller": "ixigo",
+                "selected_hint": "12:30",
+                "form_filled": True,
+            },
+            "12:30",
+            page,
+            type("S", (), {"page": None})(),
+        )
+        self.assertIn("no longer available", spoken.lower())
+        self.assertNotIn("Filled your details", spoken)
+
+    def test_vision_agent_module_wires_checkout(self) -> None:
+        import inspect
+
+        from app import vision_agent
+        from app.page_agent import _clear_front_sheet, _pause_unknown, run_checkout_agent
+        from app.step_read import decide_front
+
+        self.assertTrue(callable(vision_agent.see_step))
+        self.assertTrue(callable(vision_agent.classify_with_vision))
+        src = inspect.getsource(run_checkout_agent)
+        self.assertIn("classify_with_vision", src)
+        self.assertIn("vision_enabled", src)
+        self.assertIn("vision_shot_miss", src)
+        self.assertIn("image_path", inspect.signature(decide_front).parameters)
+        self.assertIn("image_path", inspect.getsource(_clear_front_sheet))
+        self.assertIn("image_path", inspect.getsource(_pause_unknown))
+        self.assertTrue(Path("scripts/vision_step_smoke.py").is_file())
+
     def test_results_with_book_buttons_choose_the_time(self) -> None:
         action = deterministic_action("results", hint="1:15", recovers=0)
         self.assertEqual(action["action"], "click_time")

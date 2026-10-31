@@ -2114,11 +2114,43 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             surface = read_surface(session.page)
         except Exception:
             surface = {"overlay": False, "text": "", "controls": ""}
-    from app.page_agent import apply_front_text, classify_page
+    from app.page_agent import apply_front_text, classify_page, flight_unavailable, nearest_depart_hint
 
     page = apply_front_text(page, surface)
     shown = classify_page(page, url)
+    vision_seen = None
+    if session.page is not None:
+        try:
+            from app.vision_agent import capture_page_shot, classify_with_vision, vision_enabled
+
+            if vision_enabled():
+                shot = capture_page_shot(session.page)
+                if shot:
+                    shown, vision_seen = classify_with_vision(
+                        shown, shot, seller=seller, hint=hint, page_text=page
+                    )
+                    try:
+                        from pathlib import Path
+
+                        Path(shot).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        except Exception:
+            vision_seen = None
     which = hint or "that flight"
+    if vision_seen and vision_seen.get("sold_out"):
+        shown = "unavailable"
+    if vision_seen and vision_seen.get("fares_visible") and shown not in {"unavailable", "pay"}:
+        shown = "results"
+    if shown == "unavailable" or flight_unavailable(page):
+        state.pop("form_filled", None)
+        return _stuck_line(
+            state,
+            "unavailable",
+            f"{seller} saying the {which} for {trip} is no longer available",
+            "Search Again is on screen — travellers and payment are blocked",
+            "reply search again (or name EaseMyTrip / Cleartrip / Ixigo) and I'll re-search. I will not pretend details are filled",
+        )
     if shown in {"home", "cookie"}:
         return _stuck_line(
             state,
@@ -2128,12 +2160,59 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             "say go on and I'll open the fare list for that time",
         )
     if shown in {"results", "loading"}:
+        # Instinct: recommend / book a clock — never "send the exact button" on a fare list.
+        options = fare_options(page)
+        pick = nearest_depart_hint(page, hint) if hint else ""
+        matched = None
+        if pick and options:
+            needles = {pick}
+            try:
+                from app.page_agent import _clock_needles
+
+                needles.update(_clock_needles(pick))
+                if hint:
+                    needles.update(_clock_needles(hint))
+            except Exception:
+                pass
+            for opt in options:
+                if str(opt.get("depart") or "") in needles:
+                    matched = opt
+                    break
+        if matched:
+            label = (
+                f"{matched.get('airline') or 'that'} {matched.get('depart')} "
+                f"₹{matched.get('price')} ({matched.get('stops') or 'Non-stop'})"
+            )
+            state.pop("stuck_kind", None)
+            return (
+                f"On {seller} for {trip} I recommend {label}. "
+                f"Reply go on and I'll Book the {matched.get('depart')} — I won't ask which button. Nothing paid."
+            )
+        if options:
+            bits = [
+                f"{o.get('airline') or 'flight'} {o.get('depart')} ₹{o.get('price')}"
+                for o in options[:3]
+            ]
+            top = options[0]
+            state.pop("stuck_kind", None)
+            return (
+                f"On {seller} for {trip}: {'; '.join(bits)}. "
+                f"I recommend the {top.get('depart')}. Reply with a departure time and I'll Book that row. Nothing paid."
+            )
+        if pick or hint:
+            return _stuck_line(
+                state,
+                "results",
+                f"the {seller} fare list for {trip}",
+                f"Books and prices are on screen (ignore any 'No flight data' toast)",
+                f"reply go on and I'll Book the {pick or which} — not a random button",
+            )
         return _stuck_line(
             state,
             "results",
             f"the {seller} fare list for {trip}",
-            f"flights on screen, but I have not opened the {which} traveller form",
-            f"reply {which} (or go on) and I'll click that Book button",
+            "flights are loading or filters hid the cards",
+            "reply with a departure time (or go on) and I'll Book that fare",
         )
     if "itinerary/failure" in url or re.search(r"connection lost|been disconnected|server error", page, re.I):
         state["stuck_kind"] = "error"
@@ -2187,7 +2266,8 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         except Exception:
             controls = ""
     hay = f"{page or ''}\n{controls}"
-    if (
+    # Results / sold-out are owned above — never fall through to "exact button".
+    if shown not in {"results", "loading", "unavailable", "home", "cookie", "pay", "otp", "login"} and (
         surface.get("overlay")
         or step_read_enabled()
         or re.search(
@@ -2197,6 +2277,14 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         )
     ):
         decision = decide_front(page, controls, seller=seller, hint=which)
+        if decision.get("kind") == "results" or decision.get("action") == "none":
+            return _stuck_line(
+                state,
+                "results",
+                f"the {seller} fare list for {trip}",
+                "Books and prices are on screen",
+                f"reply {which} (or go on) and I'll Book that row — I won't ask which button",
+            )
         # Ask the traveller when conscience wants a yes (upsell / unknown). Safe auto-clicks run in checkout.
         if decision.get("kind") != "pay" and (
             decision.get("action") == "ask" or decision.get("kind") == "upsell"
@@ -2412,6 +2500,21 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
     from app.page_agent import classify_page
 
     shown = classify_page(text, page_url)
+    shot = str(result.get("screenshot") or "")
+    if shot:
+        try:
+            from app.vision_agent import classify_with_vision, vision_enabled
+
+            if vision_enabled():
+                shown, _seen = classify_with_vision(
+                    shown,
+                    shot,
+                    seller=seller,
+                    hint=str(state.get("selected_hint") or ""),
+                    page_text=text,
+                )
+        except Exception:
+            pass
     if str(result.get("status") or "") in {"already_logged_in", "held"}:
         if shown in {"home", "cookie"}:
             state.pop("kernel_logged_in", None)
@@ -2460,7 +2563,11 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
     state["form_filled"] = bool(filled)
     _save(phone, state)
     waiting = passenger_details_reply(state)
-    if shown in {"home", "cookie", "results", "loading"}:
+    from app.page_agent import flight_unavailable as _flight_gone
+
+    if shown == "unavailable" or _flight_gone(text):
+        spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), text, _Session())  # type: ignore[arg-type]
+    elif shown in {"home", "cookie", "results", "loading"}:
         spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), text, _Session())  # type: ignore[arg-type]
     elif waiting:
         spoken = waiting

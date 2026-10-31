@@ -174,8 +174,36 @@ def arm_pending_step(state: dict, page: str, kind: str, *, tap: str = "") -> Non
     }
 
 
-def read_step(page: str, *, seller: str = "", hint: str = "", controls: str = "") -> dict[str, str] | None:
-    """Ask the model what this page is. None when the model is off or the answer is empty."""
+def read_step(
+    page: str,
+    *,
+    seller: str = "",
+    hint: str = "",
+    controls: str = "",
+    image_path: str = "",
+) -> dict[str, str] | None:
+    """Ask the model what this page is. Vision screenshot wins when available."""
+    if image_path:
+        try:
+            from app.vision_agent import see_step, vision_enabled
+
+            if vision_enabled():
+                seen = see_step(image_path, seller=seller, hint=hint, page_text=page)
+                if seen:
+                    return {
+                        "kind": seen["kind"] if seen["kind"] in {
+                            "upsell", "form", "login", "otp", "review", "results", "pay", "other"
+                        } else ("other" if seen["kind"] == "unavailable" else seen["kind"]),
+                        "what": seen.get("what") or "",
+                        "why": seen.get("why") or "",
+                        "recommend": seen.get("recommend") or (
+                            "reply search again" if seen.get("sold_out") else "reply with a departure time"
+                        ),
+                        "tap": seen.get("tap") or ("Search Again" if seen.get("sold_out") else ""),
+                        "auto": seen.get("auto") or "",
+                    }
+        except Exception:
+            pass
     if not step_read_enabled():
         return None
     from app import llm
@@ -234,14 +262,56 @@ def decide_front(
     seller: str = "",
     hint: str = "",
     chosen_tap: str = "",
+    image_path: str = "",
 ) -> dict[str, str]:
     """Conscience for the covering sheet: click, ask, or none.
 
     Rails only: never pay; ask on upsell unless the traveller already chose a tap.
+    Vision screenshot (when present) names unknown sheets before text alone.
     """
     hay = _hay(page, controls)
     raw_choice = (chosen_tap or "").strip()
-    heard = read_step(page, seller=seller, hint=hint, controls=controls)
+    # Fare lists and sold-out modals are not "which button?" sheets — checkout owns them.
+    try:
+        from app.page_agent import classify_page, flight_unavailable
+
+        stage = "unavailable" if flight_unavailable(hay) else classify_page(hay, "")
+    except Exception:
+        stage = ""
+    if image_path:
+        try:
+            from app.vision_agent import classify_with_vision, vision_enabled
+
+            if vision_enabled():
+                stage, seen = classify_with_vision(
+                    stage or "other", image_path, seller=seller, hint=hint, page_text=hay
+                )
+                if seen and seen.get("sold_out"):
+                    stage = "unavailable"
+                if seen and seen.get("fares_visible") and stage not in {"unavailable", "pay"}:
+                    stage = "results"
+        except Exception:
+            pass
+    if stage == "unavailable":
+        return {
+            "action": "ask",
+            "tap": "Search Again",
+            "kind": "unavailable",
+            "what": "a sold-out fare",
+            "why": "that flight is no longer available on this site",
+            "recommend": "reply search again, or name another seller — I will not fill travellers on a dead fare",
+        }
+    if stage in {"results", "loading"}:
+        return {
+            "action": "none",
+            "tap": "",
+            "kind": "results",
+            "what": "the fare list",
+            "why": "Books and prices are on screen",
+            "recommend": f"reply with a departure time{(f' like {hint}' if hint else '')} and I'll Book that row",
+        }
+
+    heard = read_step(page, seller=seller, hint=hint, controls=controls, image_path=image_path)
 
     if raw_choice:
         if raw_choice == RECOMMENDED or raw_choice.startswith("__"):

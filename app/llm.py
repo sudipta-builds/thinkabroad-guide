@@ -198,6 +198,79 @@ def gemini_chat(prompt: str, *, timeout: float = 8.0, max_tokens: int = 220) -> 
         return ""
 
 
+def vision_chat(
+    prompt: str,
+    image_path: str,
+    *,
+    timeout: float = 25.0,
+    max_tokens: int = 400,
+) -> str:
+    """Gemini multimodal: one screenshot + text prompt. Empty when vision is off or the call fails."""
+    import base64
+    from pathlib import Path
+
+    settings = get_settings()
+    if not settings.vision_ready:
+        return ""
+    path = Path(image_path)
+    if not path.is_file():
+        return ""
+    raw = path.read_bytes()
+    if len(raw) < 40 or len(raw) > 6_000_000:
+        return ""
+    suffix = path.suffix.lower()
+    mime = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+    }.get(suffix, "image/jpeg")
+    model = (settings.gemini_model or "gemini-flash-lite-latest").strip()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    body: dict[str, Any] = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": mime, "data": base64.b64encode(raw).decode("ascii")}},
+                ],
+            }
+        ],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": max_tokens},
+    }
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.post(
+                url,
+                headers={
+                    "x-goog-api-key": settings.gemini_api_key.strip(),
+                    "Content-Type": "application/json",
+                },
+                json=body,
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        parts = data["candidates"][0]["content"]["parts"]
+        return "".join(p.get("text") or "" for p in parts).strip()
+    except Exception as exc:
+        logger.warning("Gemini vision failed: %s", type(exc).__name__)
+        return ""
+
+
+def vision_converse(
+    system: str,
+    user: str,
+    image_path: str,
+    *,
+    timeout: float = 25.0,
+) -> dict[str, Any]:
+    """JSON object from a screenshot. Falls back to {} when vision is unavailable."""
+    raw = vision_chat(f"{system}\n\n{user}", image_path, timeout=timeout, max_tokens=400)
+    return _parse_json_obj(raw)
+
+
 def converse(system: str, user: str, *, timeout: float = 6.0) -> dict[str, Any]:
     """One short turn from a single model, so WhatsApp is not left waiting on two calls."""
     if get_settings().llm_ready:

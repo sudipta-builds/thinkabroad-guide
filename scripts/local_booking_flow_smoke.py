@@ -106,6 +106,14 @@ def smoke_conversation() -> None:
         if kind == "pay":
             _must("Nothing charged yet" in spoken or "Ready to pay" in spoken, kind)
             _must("Stuck:" not in spoken, "pay must not look stuck")
+        elif kind == "results":
+            # Instinct-style: recommend a clock / Book that row — not "exact button".
+            _must("exact button" not in spoken.lower(), "results must not ask exact button")
+            _must(
+                "recommend" in spoken.lower() or "book" in spoken.lower() or "Stuck:" in spoken,
+                f"{kind} missing recommend/book",
+            )
+            _must("Nothing paid" in spoken, f"{kind} missing nothing paid")
         else:
             _must("Stuck:" in spoken, f"{kind} missing Stuck:")
             _must("recommend" in spoken.lower(), f"{kind} missing recommend")

@@ -41,6 +41,8 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("GEMINI_API_KEY", "Gemini_API_KEY"),
     )
     gemini_model: str = "gemini-flash-lite-latest"
+    # Vision on every booking step when Gemini is set. GUIDE_VISION=0 to disable.
+    guide_vision: bool = Field(default=True, validation_alias=AliasChoices("GUIDE_VISION"))
 
     vault_secret_key: str = ""
     log_level: str = "INFO"
@@ -98,6 +100,11 @@ class Settings(BaseSettings):
     @property
     def search_ready(self) -> bool:
         return bool(self.gemini_api_key)
+
+    @property
+    def vision_ready(self) -> bool:
+        """Screenshot → Gemini for every booking step (default on when key exists)."""
+        return bool(self.guide_vision and self.gemini_api_key)
 
     @property
     def vault_ready(self) -> bool:

@@ -13,6 +13,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +205,8 @@ def verify_trip_facts(
 def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
     """Name the booking step from visible text. A nav 'Book' link is not a fare list."""
     hay = f"{text or ''}\n{url or ''}"
+    if flight_unavailable(hay):
+        return "unavailable"
     if re.search(r"itinerary/failure|server error|connection lost|been disconnected", hay, re.I):
         return "error"
     if re.search(
@@ -223,6 +226,14 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         return "pay"
     if re.search(r"trip summary", hay, re.I) and re.search(r"\bpay\b|total fare", hay, re.I):
         return "pay"
+    priced = bool(re.search(r"₹\s*[0-9]", hay))
+    has_time = bool(re.search(r"\b\d{1,2}:\d{2}\b", hay))
+    fare_list = bool(
+        has_time and priced and (book_count >= 1 or re.search(r"\b(Book|Select|View fares)\b", hay))
+    )
+    # Fare lists win over add-on marketing copy / stepper labels on Cleartrip/Ixigo results.
+    if fare_list and not flight_unavailable(hay):
+        return "results"
     # Ixigo review also shows the "Add-ons" stepper label — require real add-on UI.
     if re.search(r"choose your seat|add meal|skip add-?ons|extra baggage", hay, re.I):
         return "addons"
@@ -247,12 +258,8 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         return "passenger"
     if re.search(r"select your fare", hay, re.I):
         return "fare_sheet"
-    priced = bool(re.search(r"₹\s*[0-9]", hay))
-    has_time = bool(re.search(r"\b\d{1,2}:\d{2}\b", hay))
     if re.search(r"we respect your privacy|accept all cookies|cookie policy", hay, re.I) and not (priced and has_time):
         return "cookie"
-    if has_time and priced and (book_count >= 1 or re.search(r"\b(Book|Select|View fares)\b", hay)):
-        return "results"
     if _results_url(url):
         return "loading"
     if re.search(r"one way|search flight|where from", hay, re.I):
@@ -312,6 +319,9 @@ def deterministic_action(stage: str, *, hint: str, recovers: int, url: str = "")
         return {"action": "fill_passenger", "target": "Continue", "value": ""}
     if stage == "addons":
         return {"action": "click", "target": "Continue", "value": ""}
+    if stage == "unavailable":
+        # Instinct reports sold-out honestly; Search Again restarts the fare list.
+        return {"action": "stuck", "target": "unavailable", "value": ""}
     if stage == "results" and hint:
         return {"action": "click_time", "target": hint, "value": ""}
     if stage == "loading":
@@ -348,9 +358,12 @@ _SURFACE_JS = """() => {
       const s = getComputedStyle(el);
       if (s.position !== 'fixed' && s.position !== 'absolute') return false;
       const r = el.getBoundingClientRect();
-      if (r.width < 200 || r.height < 80) return false;
+      if (r.width < 220 || r.height < 120) return false;
       if (r.width > innerWidth * 0.96 && r.height > innerHeight * 0.9) return false;
       if (!(r.left <= cx && r.right >= cx && r.top <= cy && r.bottom >= cy)) return false;
+      const copy = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+      // Ignore Cleartrip/Ixigo toast chips ("No flight data available") when fares are underneath.
+      if (copy.length < 48 && /no flight data|loading|pre-applied/i.test(copy)) return false;
       return [...el.querySelectorAll('button,a,[role=button],input')].some(vis);
     });
     const roots = [...marked, ...panels];
@@ -405,10 +418,65 @@ def read_surface(page) -> dict[str, str | bool]:
 
 
 def apply_front_text(page_text: str, surface: dict) -> str:
-    """Use the covering sheet's words when one is open."""
-    if surface.get("overlay") and str(surface.get("text") or "").strip():
-        return str(surface["text"])
-    return page_text or ""
+    """Use a real covering sheet. Ignore toast chips that sit on a full fare list."""
+    if not surface.get("overlay"):
+        return page_text or ""
+    front = str(surface.get("text") or "").strip()
+    if not front:
+        return page_text or ""
+    body = page_text or ""
+    toast = bool(re.search(r"no flight data available|filter is pre-applied", front, re.I))
+    has_fares = bool(re.search(r"\bBook\b", body, re.I) and re.search(r"₹\s*[0-9]", body))
+    if toast and has_fares and not re.search(r"no longer available|search again", front, re.I):
+        return body
+    if len(front) < 48 and not re.search(
+        r"confirm|search again|no longer available|no,?\s*thanks|secure my trip|assured",
+        front,
+        re.I,
+    ):
+        return body
+    return front
+
+
+def flight_unavailable(page: str) -> bool:
+    """Sold-out / expired fare modal. Not a toast on a live results list."""
+    hay = page or ""
+    return bool(
+        re.search(
+            r"no longer available|flight is no longer|please search again|sold out|"
+            r"fare (?:is )?no longer|itinerary (?:is )?unavailable",
+            hay,
+            re.I,
+        )
+    )
+
+
+def nearest_depart_hint(page: str, hint: str) -> str:
+    """Exact clock, else the closest departure within 45 minutes (18:20 → 18:25)."""
+    raw = (hint or "").strip()
+    if not raw:
+        return ""
+    if any(re.search(rf"(^|[^0-9]){re.escape(n)}([^0-9]|$)", page or "") for n in _clock_needles(raw)):
+        return raw
+    match = re.match(r"(\d{1,2}):(\d{2})", raw)
+    if not match:
+        return raw
+    want = int(match.group(1)) * 60 + int(match.group(2))
+    alts = {want}
+    if int(match.group(1)) < 12:
+        alts.add(want + 12 * 60)
+    elif int(match.group(1)) >= 13:
+        alts.add(want - 12 * 60)
+    best = ""
+    best_gap = 46
+    for clock in re.findall(r"\b(\d{1,2}):(\d{2})\b", page or ""):
+        mins = int(clock[0]) * 60 + int(clock[1])
+        for target in alts:
+            gap = abs(mins - target)
+            if gap < best_gap:
+                best_gap = gap
+                best = f"{int(clock[0])}:{clock[1]}"
+    return best or raw
 
 
 def control_digest(page) -> str:
@@ -475,13 +543,27 @@ def _clear_front_sheet(page, chosen_tap: str = "", *, seller: str = "", hint: st
     surface = read_surface(page)
     if not surface.get("overlay"):
         return ""
-    decision = decide_front(
-        str(surface.get("text") or ""),
-        str(surface.get("controls") or ""),
-        seller=seller,
-        hint=hint,
-        chosen_tap=chosen_tap,
-    )
+    shot = ""
+    decision: dict = {}
+    try:
+        from app.vision_agent import capture_page_shot, vision_enabled
+
+        if vision_enabled():
+            shot = capture_page_shot(page)
+        decision = decide_front(
+            str(surface.get("text") or ""),
+            str(surface.get("controls") or ""),
+            seller=seller,
+            hint=hint,
+            chosen_tap=chosen_tap,
+            image_path=shot,
+        )
+    finally:
+        if shot:
+            try:
+                Path(shot).unlink(missing_ok=True)
+            except Exception:
+                pass
     if decision.get("action") != "click":
         return "front_ask" if decision.get("action") == "ask" else "front_none"
     label = str(decision.get("tap") or "")
@@ -512,9 +594,26 @@ def _pause_unknown(
 
     surface = read_surface(page)
     if surface.get("overlay") and str(surface.get("text") or "").strip():
-        text = str(surface["text"])
+        text = apply_front_text(text, surface)
     digest = str(surface.get("controls") or "") or control_digest(page)
-    decision = decide_front(text, digest, seller=seller, hint=hint, chosen_tap=chosen_tap)
+    shot = ""
+    try:
+        from app.vision_agent import capture_page_shot, vision_enabled
+
+        if vision_enabled():
+            shot = capture_page_shot(page)
+    except Exception:
+        shot = ""
+    try:
+        decision = decide_front(
+            text, digest, seller=seller, hint=hint, chosen_tap=chosen_tap, image_path=shot
+        )
+    finally:
+        if shot:
+            try:
+                Path(shot).unlink(missing_ok=True)
+            except Exception:
+                pass
     heard = {
         "kind": decision.get("kind") or "other",
         "what": decision.get("what") or f"a {seller} step I don't treat as done",
@@ -1778,6 +1877,37 @@ def run_checkout_agent(
     for step in range(max_steps):
         page = _latest(page)
         text, url, stage, facts = _snapshot()
+        # Vision on every step: screenshot overrides a wrong DOM toast / sold-out miss.
+        try:
+            from app.vision_agent import capture_page_shot, classify_with_vision, vision_enabled
+
+            if vision_enabled():
+                shot = capture_page_shot(page)
+                if not shot:
+                    log.append(f"{step}:vision_shot_miss")
+                else:
+                    new_stage, vision_seen = classify_with_vision(
+                        stage, shot, seller=seller, hint=hint, page_text=text
+                    )
+                    if vision_seen:
+                        log.append(
+                            f"{step}:vision:{vision_seen.get('kind')}:"
+                            f"fares={int(bool(vision_seen.get('fares_visible')))}"
+                            f":sold={int(bool(vision_seen.get('sold_out')))}"
+                        )
+                    else:
+                        log.append(f"{step}:vision_empty")
+                    if new_stage and new_stage != stage:
+                        log.append(f"{step}:vision_override:{stage}->{new_stage}")
+                        stage = new_stage
+                    try:
+                        Path(shot).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            else:
+                log.append(f"{step}:vision_off")
+        except Exception as exc:
+            log.append(f"{step}:vision_err:{type(exc).__name__}")
         if tap_pending:
             label = tap_pending
             tap_pending = ""
@@ -1878,6 +2008,11 @@ def run_checkout_agent(
                 )
             break
         if kind == "stuck":
+            if stage == "unavailable" or action.get("target") == "unavailable":
+                handoff = (
+                    f"Flight no longer available for {hint or 'that departure'} on {seller}. "
+                    "Search Again is on screen. Nothing paid."
+                )
             break
         if kind == "wait":
             page.wait_for_timeout(1200 if stage == "loading" else 600)
@@ -2061,6 +2196,10 @@ def run_checkout_agent(
         if kind == "click_time":
             card = ""
             try:
+                pick = nearest_depart_hint(text, hint) if hint else hint
+                if pick and pick != hint:
+                    log.append(f"nearest:{hint}->{pick}")
+                    hint = pick
                 _prepare_ixigo_results(page, hint)
                 card = str(page.evaluate(_CLICK_TIME, hint) or "")
                 if not card and "ixigo.com" in (url or ""):
@@ -2071,9 +2210,11 @@ def run_checkout_agent(
             log.append(f"card:{card[:120]}")
             after, after_url, after_stage, _af = _poll_ready(
                 page,
-                {"fare_sheet", "review", "passenger", "login", "otp", "pay", "error"},
+                {"fare_sheet", "review", "passenger", "login", "otp", "pay", "error", "unavailable"},
                 budget_ms=4000,
             )
+            if after_stage == "unavailable":
+                return CheckoutOutcome("unavailable", after, after_url, log, checks=checks)
             if after_stage == "fare_sheet":
                 if hint and not (
                     card_matches_depart_hint(card, hint)

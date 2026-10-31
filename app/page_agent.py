@@ -228,6 +228,8 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         return "pay"
     priced = bool(re.search(r"₹\s*[0-9]", hay))
     has_time = bool(re.search(r"\b\d{1,2}:\d{2}\b", hay))
+    if re.search(r"review your itinerary", hay, re.I):
+        return "review"
     if re.search(r"choose add-ons|missed adding|add seats|skip add-?ons", hay, re.I):
         return "addons"
     # Fare picker drawer can sit on top of a still-visible results list — detect it first.
@@ -1258,6 +1260,15 @@ def _leave_addons(page, log: list[str], *, rounds: int = 3) -> bool:
             return True
         hit = _skip_addons(page)
         log.append(f"addons_skip:{hit or 'miss'}:{i}")
+        text, url = _read(page)
+        stage = classify_page(text, url, book_count=_book_count(page))
+        if re.search(r"review your itinerary", text or "", re.I) or left_addons(text, stage):
+            log.append(f"addons_left:{stage}")
+            return True
+        # Skip is absent or did not move this sheet. Continue is the control that opens review.
+        if stage != "pay" and not re.search(r"pay to complete|enter card number|payment options", text or "", re.I):
+            moved = _safe_continue(page)
+            log.append(f"review_continue:{int(bool(moved))}:{i}")
         _poll_ready(
             page,
             {"review", "passenger", "pay", "login", "otp", "error", "unavailable"},
@@ -2231,10 +2242,16 @@ def run_checkout_agent(
             if left and stage != "addons":
                 log.append(f"addons_fast_left:{stage}")
             else:
-                handoff = (
-                    "Skip add-ons is on screen, but the click did not close that sheet. "
-                    "The seat map may still be showing. Nothing paid."
-                )
+                if re.search(r"seat map|choose add-ons|add seats", text or "", re.I):
+                    handoff = (
+                        "Skip add-ons is on screen, but the click did not close that sheet. "
+                        "The seat map may still be showing. Nothing paid."
+                    )
+                else:
+                    handoff = (
+                        "I could not open Review your itinerary from this extras page. "
+                        "Nothing paid."
+                    )
                 log.append("addons_fast_still")
                 return CheckoutOutcome("addons", text, url, log, facts=facts, checks=checks, handoff=handoff)
         # Vision on every step: screenshot overrides a wrong DOM toast / sold-out miss.

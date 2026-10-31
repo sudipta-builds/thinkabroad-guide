@@ -1442,6 +1442,36 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("Review", text)
         self.assertNotEqual(stage, "addons")
 
+    def test_continue_opens_review_when_skip_does_not_move(self) -> None:
+        """Extras stay put on Skip. Continue is what opens Review your itinerary."""
+        from playwright.sync_api import sync_playwright
+
+        from app.page_agent import _leave_addons, classify_page
+
+        html = """<!doctype html><html><body>
+        <p>6E 2092 GAU DEL 10:45 Fare summary Add ons ₹449 Extra baggage</p>
+        <p>Make your journey fully flexible. Travel insurance.</p>
+        <button id="skip" style="width:160px;height:40px">Skip add-ons</button>
+        <button id="go" style="width:160px;height:44px">Continue</button>
+        <script>
+          document.getElementById('go').onclick = () => {
+            document.body.innerHTML = '<h1>Review your itinerary</h1><p>Fare summary 6E 2092 Total amount</p>';
+          };
+        </script></body></html>"""
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            page.set_content(html)
+            log: list[str] = []
+            ok = _leave_addons(page, log, rounds=3)
+            text = page.inner_text("body")
+            stage = classify_page(text, "https://www.cleartrip.com/flights/itinerary/1")
+            browser.close()
+        self.assertTrue(ok, log)
+        self.assertIn("review_continue:1", " ".join(log))
+        self.assertIn("Review your itinerary", text)
+        self.assertEqual(stage, "review")
+
     def test_one_gemini_turn_names_wish_not_pending_skip(self) -> None:
         import inspect
 

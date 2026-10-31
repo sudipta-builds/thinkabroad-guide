@@ -154,6 +154,8 @@ def left_addons(page: str, stage: str = "") -> bool:
     Page text wins over a stage name. Vision calling this sheet review does not mean it closed.
     """
     hay = page or ""
+    if re.search(r"review your itinerary", hay, re.I):
+        return True
     if re.search(r"choose add-ons|add seats|seat map|missed adding meal", hay, re.I):
         return False
     if re.search(r"skip add-?ons", hay, re.I) and re.search(r"add meal|extra baggage|choose add-ons", hay, re.I):

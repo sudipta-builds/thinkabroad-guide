@@ -228,9 +228,7 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         return "pay"
     priced = bool(re.search(r"₹\s*[0-9]", hay))
     has_time = bool(re.search(r"\b\d{1,2}:\d{2}\b", hay))
-    # A real add-ons sheet still shows the flight time and a fare. That is not a results list.
-    # "Add meal" marketing on the fare list is handled later, after the Book+₹ check.
-    if re.search(r"skip add-?ons|choose add-ons|missed adding", hay, re.I):
+    if re.search(r"choose add-ons|missed adding|add seats|skip add-?ons", hay, re.I):
         return "addons"
     # Fare picker drawer can sit on top of a still-visible results list — detect it first.
     if _looks_like_fare_sheet(hay):
@@ -2181,6 +2179,27 @@ def run_checkout_agent(
             left = _leave_addons(page, log, rounds=3)
             text, url, stage, facts = _snapshot()
             tap_pending = ""
+            if not left or stage == "addons":
+                try:
+                    from app.vision_agent import capture_page_shot, classify_with_vision, vision_enabled
+
+                    if vision_enabled():
+                        shot = capture_page_shot(page)
+                        if shot:
+                            new_stage, vision_seen = classify_with_vision(
+                                stage, shot, seller=seller, hint=hint, page_text=text
+                            )
+                            kind = (vision_seen or {}).get("kind") or ""
+                            log.append(f"addons_fast_vision:{kind}:{new_stage}")
+                            if new_stage and new_stage != "addons":
+                                stage = new_stage
+                                left = True
+                            try:
+                                Path(shot).unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                except Exception:
+                    log.append("addons_fast_vision_err")
             if left and stage != "addons":
                 log.append(f"addons_fast_left:{stage}")
             else:

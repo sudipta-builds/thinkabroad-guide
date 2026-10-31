@@ -35,9 +35,8 @@ _VISION_READ = (
     "Never invent a seat purchase.\n"
     "- kind=results: recommend a departure time (best_depart) and price if readable; tap stays empty "
     "(the bot clicks Book by time, not a button label). auto=false.\n"
-    "- kind=upsell: optional paid Assured / Free Cancellation / insurance sheet; tap the decline "
-    "label you can read (No, Thanks / No Thanks / Not this time / I don't want Free Cancellation). "
-    "Never tap Assure My Trip, Secure My Trip, Insure My Trip, or Buy.\n"
+    "- kind=upsell: any optional paid extra (cancellation, insurance, flexibility, protect). "
+    "Tap Continue or the decline label. Never tap Buy / Book now on that extra.\n"
     "- kind=review: Review Details name check with Confirm/Edit — tap Confirm, auto=true. "
     "Or review/traveller page with Continue and filled name — tap Continue, auto=true only if Continue is safe.\n"
     "- kind=form: empty or partial traveller fields (title/name/mobile/email) needing fill — tap empty or Continue.\n"
@@ -108,9 +107,7 @@ def see_step(
             facts.append(line[:140])
     seat_map = bool(data.get("seat_map"))
     meals = bool(data.get("meals_offered"))
-    if kind in {"addons"} or seat_map or meals or re.search(
-        r"choose add-ons|seat map|add seats|skip add-?ons|missed adding", what + recommend, re.I
-    ):
+    if seat_map or re.search(r"choose add-ons|missed adding|add seats", what, re.I):
         kind = "addons"
     if seat_map and not any(re.search(r"seat", f, re.I) for f in facts):
         facts.append("seat map is visible")
@@ -192,7 +189,7 @@ def classify_with_vision(
         "otp": "otp",
         "review": "review",
         "form": "passenger",
-        "upsell": dom_stage if dom_stage in {"review", "passenger", "addons"} else "review",
+        "upsell": "review",
         "addons": "addons",
         "loading": "loading",
         "home": "home",
@@ -205,9 +202,11 @@ def classify_with_vision(
     if seen.get("fares_visible") and mapped == "results":
         return "results", seen
     # Toast-only false empty: keep results if vision says so over DOM "other"/loading.
-    if mapped in {"unavailable", "results", "pay", "login", "otp", "addons"} and mapped != dom_stage:
+    if mapped in {"unavailable", "results", "pay", "login", "otp", "addons", "review"} and mapped != dom_stage:
         return mapped, seen
-    if seen.get("seat_map") or seen.get("meals_offered"):
+    if seen.get("kind") == "upsell":
+        return mapped, seen
+    if seen.get("seat_map") or (seen.get("meals_offered") and mapped == "addons"):
         return "addons", seen
     if dom_stage in {"other", "loading"} and mapped != "other":
         return mapped, seen

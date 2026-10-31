@@ -143,6 +143,14 @@ def accept_choice(text: str, pending: dict[str, str]) -> str:
         return ""
     if re.search(r"\b(pay now|pay to complete|make payment|secure my trip)\b", raw, re.I):
         return ""
+    if re.search(r"confirm(?: the)? fl", raw, re.I):
+        return (
+            safe_tap("Continue", page)
+            or safe_tap("Confirm", page)
+            or forward_tap(page)
+            or safe_tap(str(pending.get("tap") or ""), page)
+            or RECOMMENDED
+        )
     if _AGREE.fullmatch(raw) or re.search(r"\bskip\b", raw, re.I):
         if re.fullmatch(r"confirm", raw, re.I):
             return (
@@ -272,6 +280,7 @@ def decide_front(
     hay = _hay(page, controls)
     raw_choice = (chosen_tap or "").strip()
     # Fare lists and sold-out modals are not "which button?" sheets — checkout owns them.
+    vision_kind = ""
     try:
         from app.page_agent import classify_page, flight_unavailable
 
@@ -286,12 +295,13 @@ def decide_front(
                 stage, seen = classify_with_vision(
                     stage or "other", image_path, seller=seller, hint=hint, page_text=hay
                 )
+                vision_kind = str((seen or {}).get("kind") or "")
                 if seen and seen.get("sold_out"):
                     stage = "unavailable"
                 if seen and seen.get("fares_visible") and stage not in {"unavailable", "pay"}:
                     stage = "results"
         except Exception:
-            pass
+            vision_kind = ""
     if stage == "unavailable":
         return {
             "action": "ask",
@@ -310,15 +320,19 @@ def decide_front(
             "why": "Books and prices are on screen",
             "recommend": f"reply with a departure time{(f' like {hint}' if hint else '')} and I'll Book that row",
         }
-    # Cleartrip/Ixigo optional seats/meals — skip without asking every loop.
-    if (
+    # Vision already named a non-addons sheet — do not keep Skip from leftover DOM copy.
+    skip_addons_regex = (
         stage == "addons"
-        or re.search(
-            r"skip add-?ons|missed adding meal|choose add-ons|choose your seat|add meal|extra baggage|add seats",
-            hay,
-            re.I,
+        or (
+            vision_kind in {"", "addons"}
+            and re.search(
+                r"skip add-?ons|missed adding meal|choose add-ons|choose your seat|add meal|extra baggage|add seats",
+                hay,
+                re.I,
+            )
         )
-    ) and not re.search(r"secure my trip|assure my trip|buy this", hay, re.I):
+    ) and not re.search(r"secure my trip|assure my trip|buy this", hay, re.I)
+    if skip_addons_regex and vision_kind not in {"upsell", "review", "form", "pay", "results", "unavailable"}:
         from app.step_contract import build_contract
 
         contract = build_contract(hay, stage="addons", seller=seller, hint=hint, user_goal="skip")

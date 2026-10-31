@@ -272,26 +272,12 @@ def vision_converse(
 
 
 def converse(system: str, user: str, *, timeout: float = 6.0) -> dict[str, Any]:
-    """One short turn from a single model, so WhatsApp is not left waiting on two calls."""
-    if get_settings().llm_ready:
-        raw = chat(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.4,
-            max_tokens=220,
-            timeout=timeout,
-        )
-        data = _parse_json_obj(raw)
-        if data:
-            return data
-        # DeepSeek spoke in plain text. Use it instead of starting Gemini.
-        if raw:
-            return {"reply": raw[:500]}
-        return {}
+    """Guide booking brain is Gemini only. Empty when the Gemini key is missing."""
     raw = gemini_chat(system + "\n\n" + user, timeout=timeout, max_tokens=220)
-    return _parse_json_obj(raw) or ({"reply": raw[:500]} if raw else {})
+    data = _parse_json_obj(raw)
+    if data:
+        return data
+    return {"reply": raw[:500]} if raw else {}
 
 
 def _parse_json_obj(raw: str) -> dict[str, Any]:

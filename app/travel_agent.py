@@ -221,8 +221,8 @@ def handle_turn(
         reply = "The login page closed. Say the trip again and I'll request a new code. Nothing paid."
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="🔐")
-    if not get_settings().llm_ready:
-        reply = saved_secret or "DeepSeek isn't configured on the server, so I can't look or book yet."
+    if not get_settings().gemini_api_key and not get_settings().llm_ready:
+        reply = saved_secret or "Gemini isn't configured on the server, so I can't look or book yet."
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="🔐" if saved_secret else "⚠️")
     if saved_secret and _secret_only(text) and not _paying_now(state, kind, previous_stage):
@@ -273,24 +273,32 @@ def handle_turn(
         reply = _live_hold_reply(state, text)
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="👀")
-    pending = state.get("pending_step") if isinstance(state.get("pending_step"), dict) else None
-    if not pending and state.get("stuck_kind") in {
-        "addon_buy",
-        "upsell",
-        "other",
-        "name_confirm",
-        "addons",
-    }:
-        stuck_page = str(state.get("stuck_page") or "")
-        if stuck_page:
-            from app.step_read import decline_tap
+    if _mid_booking(state) and kind not in {"details", "pay", "cancel", "pay_self"} and not _asks_for_filled_form(text):
+        from app.step_read import arm_pending_step
+        from app.turn_loop import format_turn_reply, interpret_turn
 
-            pending = {
-                "tap": decline_tap(stuck_page) or "Skip add-ons",
-                "page": stuck_page,
-                "kind": str(state.get("stuck_kind") or "other"),
-            }
-    if pending and kind not in {"details", "pay", "cancel", "search"}:
+        turn = interpret_turn(text, state)
+        state["last_turn"] = {k: turn.get(k) for k in ("goal", "intent", "kind", "tap", "source")}
+        goal = str(turn.get("goal") or "")
+        tap = str(turn.get("tap") or "")
+        page = str(state.get("stuck_page") or "")
+        if turn.get("intent") == "status" or goal == "ask":
+            if tap:
+                arm_pending_step(state, page, str(turn.get("kind") or "other"), tap=tap)
+            spoken = format_turn_reply(turn)
+            state["last_stuck"] = spoken
+            state["stuck_kind"] = str(turn.get("kind") or state.get("stuck_kind") or "")
+            _save(phone, state)
+            db.add_message(phone, "assistant", spoken)
+            return Reply.of(spoken, emoji="👀")
+        if goal in {"skip", "forward"} or turn.get("intent") == "book":
+            if tap:
+                state["chosen_tap"] = tap
+            state.pop("pending_step", None)
+            _save(phone, state)
+            kind = "book"
+    pending = state.get("pending_step") if isinstance(state.get("pending_step"), dict) else None
+    if pending and kind not in {"details", "pay", "cancel", "search", "status", "book"}:
         from app.step_read import accept_choice
 
         picked = accept_choice(text, pending)
@@ -299,29 +307,11 @@ def handle_turn(
             state.pop("pending_step", None)
             _save(phone, state)
             kind = "book"
-        elif kind != "status":
-            tap = str(pending.get("tap") or "the button I recommended")
-            reply = (
-                f"I haven't tapped anything. Reply yes and I'll press {tap}. "
-                "Or send the exact button name you want. Nothing paid."
-            )
-            db.add_message(phone, "assistant", reply)
-            return Reply.of(reply, emoji="👀")
     if kind == "status" and not _asks_for_filled_form(text):
-        reply = str(state.get("last_stuck") or "").strip()
-        if not reply and (state.get("stuck_kind") or state.get("selected_hint") or str(state.get("stage") or "") in {
-            "booking",
-            "review",
-            "passenger",
-            "login",
-            "addons",
-        }):
-            which = str(state.get("selected_hint") or "that flight")
-            step = str(state.get("stuck_kind") or state.get("stage") or "booking")
-            reply = (
-                f"Still on the {step} step for {which}. "
-                "I recommend skip if Ixigo is selling an extra, otherwise go on. Nothing paid."
-            )
+        from app.turn_loop import format_turn_reply, interpret_turn
+
+        turn = interpret_turn(text, state)
+        reply = format_turn_reply(turn) if turn.get("reply") or turn.get("what") else str(state.get("last_stuck") or "").strip()
         if reply:
             db.add_message(phone, "assistant", reply)
             return Reply.of(reply, emoji="👀")
@@ -523,7 +513,12 @@ def extract_user_ask(text: str, state: dict[str, Any]) -> dict[str, str]:
     out: dict[str, str] = {"intent": "", "tap": "", "goal": ""}
     if not raw:
         return out
-    if re.search(r"\b(why (?:stuck|blocked)|what(?:'s| is) (?:wrong|happening)|where are you)\b", raw, re.I):
+    if re.search(
+        r"\b(why (?:stuck|blocked)|what(?:'s| is) (?:wrong|happening)|where are you|"
+        r"which step|what (?:to do |should i do )?next|check and tell|tell me what to do)\b",
+        raw,
+        re.I,
+    ):
         out["intent"] = "status"
         return out
     if re.search(r"\b(add-?ons?|next step|go (?:to |on to )?payment|move (?:on|forward|ahead))\b", raw, re.I):
@@ -559,6 +554,10 @@ def infer_intent(state: dict[str, Any], text: str) -> str:
     asked = extract_user_ask(text, state)
     if asked.get("intent") in {"status", "book"} and _mid_booking(state):
         return asked["intent"]
+    if _mid_booking(state) and re.search(r"\b(check|show|what next)\b", raw, re.I) and not re.search(
+        r"\b(fly|search fares|show flights)\b", raw, re.I
+    ):
+        return "status"
     if re.search(r"\b(stop|cancel|never mind)\b", raw, re.I) and not re.search(r"\bbook\b", raw, re.I):
         return "cancel"
     if re.search(r"\b(status|what did i book|my booking)\b", raw, re.I):
@@ -628,7 +627,7 @@ def infer_intent(state: dict[str, Any], text: str) -> str:
 
 
 def _merge_intent(local: str, model: str, text: str, state: dict[str, Any]) -> str:
-    """DeepSeek first. Rules keep payment, cancellation, and a passenger form from being restarted."""
+    """Gemini names the wish. Rules keep payment, cancellation, and a passenger form from being restarted."""
     if re.fullmatch(r"[?？]+", (text or "").strip()) and (
         str(state.get("stage") or "") in {"booking", "review", "passenger", "login", "addons", "payment"}
         or state.get("stuck_kind")
@@ -699,12 +698,26 @@ def _usable_reply(state: dict[str, Any], spoken: str, fallback: str) -> str:
 
 
 def resolve_intent(text: str, state: dict[str, Any], prior: list[dict[str, Any]]) -> tuple[str, str]:
-    """Ask DeepSeek first, then check the rules, and keep both."""
+    """Gemini (via converse / turn loop) names the wish. Local rails keep pay/details safe."""
     local = infer_intent(state, text)
     asked = extract_user_ask(text, state)
     if asked.get("tap") and _mid_booking(state):
         state["chosen_tap"] = asked["tap"]
-    if not get_settings().llm_ready:
+    if _mid_booking(state) and local not in {"details", "pay", "pay_self", "cancel"}:
+        spoken = ""
+        if asked.get("tap"):
+            spoken = f"I'll press {asked['tap']} on the open page. Nothing paid."
+        elif asked.get("goal") == "skip":
+            spoken = "I'll skip the paid extra and keep your traveller selected. Nothing paid."
+            if not state.get("chosen_tap"):
+                from app.step_read import decline_tap
+
+                page = str(state.get("stuck_page") or "")
+                state["chosen_tap"] = decline_tap(page) or "Skip add-ons"
+        elif asked.get("goal") == "forward":
+            spoken = "I'll move the booking forward and stop before payment."
+        return local, spoken
+    if not get_settings().gemini_api_key and not get_settings().llm_ready:
         spoken = ""
         if asked.get("tap"):
             spoken = f"I'll press {asked['tap']} on the open page. Nothing paid."
@@ -2156,12 +2169,9 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
                     shown, vision_seen = classify_with_vision(
                         shown, shot, seller=seller, hint=hint, page_text=page
                     )
-                    try:
-                        from pathlib import Path
+                    from app.turn_loop import remember_shot
 
-                        Path(shot).unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                    remember_shot(state, shot)
         except Exception:
             vision_seen = None
     which = hint or "that flight"
@@ -2173,6 +2183,8 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             "meals_offered": bool(vision_seen.get("meals_offered")),
             "what": vision_seen.get("what") or "",
             "tap": vision_seen.get("tap") or "",
+            "recommend": vision_seen.get("recommend") or "",
+            "shot": str(state.get("last_shot") or ""),
         }
     if vision_seen and vision_seen.get("sold_out"):
         shown = "unavailable"
@@ -2626,7 +2638,11 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         page = _Open()
 
     notes = str(result.get("notes") or "")
-    if notes.startswith("Skip add-ons is on screen"):
+    if shot:
+        from app.turn_loop import remember_shot
+
+        remember_shot(state, shot)
+    if notes.startswith("Skip add-ons is on screen") and shown in {"addons", ""}:
         spoken = notes.split(" | ")[0][:500]
         state["stuck_kind"] = "addons"
         state["last_stuck"] = spoken

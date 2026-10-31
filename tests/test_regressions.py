@@ -1358,6 +1358,45 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertRegex(reply.lower(), r"skip add-ons")
         self.assertNotIn("exact button", reply.lower())
 
+    def test_one_gemini_turn_names_wish_not_pending_skip(self) -> None:
+        import inspect
+
+        from app.llm import converse
+        from app.travel_agent import extract_user_ask, handle_turn
+        from app.turn_loop import interpret_turn
+
+        booking = {
+            "stage": "booking",
+            "stuck_kind": "addons",
+            "stuck_page": "Choose add-ons Skip add-ons",
+            "selected_hint": "18:20",
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "cleartrip",
+            "last_vision": {
+                "kind": "upsell",
+                "what": "optional Flexi extras with Continue",
+                "recommend": "press Continue without buying extras",
+                "tap": "Continue",
+                "facts": ["Continue visible"],
+            },
+        }
+        self.assertEqual(extract_user_ask("check and tell me what to do next?", booking).get("intent"), "status")
+        turn = interpret_turn("check and tell me what to do next?", booking)
+        self.assertEqual(turn["goal"], "ask")
+        self.assertEqual(turn["intent"], "status")
+        self.assertNotRegex(turn.get("reply") or "", r"Skip add-ons is on screen")
+        go = interpret_turn("confirm the fligt", booking)
+        self.assertEqual(go["intent"], "book")
+        self.assertEqual(go["goal"], "forward")
+        src = inspect.getsource(handle_turn)
+        self.assertIn("interpret_turn", src)
+        self.assertNotIn('Reply yes and I\'ll press {tap}', src)
+        brain = inspect.getsource(converse)
+        self.assertIn("gemini_chat", brain)
+        self.assertNotIn("deepseek", brain.lower())
+
     def test_addons_yes_arms_skip_and_checkout_leaves(self) -> None:
         import inspect
         import re as _re

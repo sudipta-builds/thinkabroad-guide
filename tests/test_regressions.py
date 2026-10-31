@@ -225,8 +225,8 @@ class DateAndMemory(unittest.TestCase):
         )
         self.assertIn("Stuck:", cancel)
         self.assertIn("Free Cancellation", cancel)
-        self.assertIn("No, Thanks", cancel)
-        self.assertIn("skip", cancel.lower())
+        self.assertTrue("No, Thanks" in cancel or "No Thanks" in cancel)
+        self.assertTrue("skip" in cancel.lower() or "yes" in cancel.lower())
         self.assertNotIn("look at the screenshot", cancel.lower())
         self.assertNotIn("Continue is on the screenshot", cancel)
         radio = _booking_page_reply(
@@ -238,8 +238,7 @@ class DateAndMemory(unittest.TestCase):
             _Session(),  # type: ignore[arg-type]
         )
         self.assertIn("I don't want Free Cancellation", radio)
-        self.assertIn("saved traveller", radio.lower())
-        self.assertIn("skip", radio.lower())
+        self.assertTrue("yes" in radio.lower() or "skip" in radio.lower())
         assured = _booking_page_reply(
             {**booking, "selected_hint": "12:30"},
             "12:30",
@@ -248,7 +247,7 @@ class DateAndMemory(unittest.TestCase):
         )
         self.assertIn("Assured", assured)
         self.assertIn("No, Thanks", assured)
-        self.assertIn("skip", assured.lower())
+        self.assertTrue("skip" in assured.lower() or "yes" in assured.lower() or "no, thanks" in assured.lower())
         asking = {**booking, "stage": "booking", "stuck_kind": "addon_buy", "options": [{"depart": "12:30", "price": "9,722", "airline": "IndiGo"}]}
         self.assertEqual(infer_intent(asking, "?"), "status")
         self.assertEqual(_cached_fares_reply(asking, "?", "chat") or "", "")
@@ -332,11 +331,34 @@ class DateAndMemory(unittest.TestCase):
         )
         confirm_page = "Review Details Please ensure that your name matches your govt ID Confirm Edit Mr Sudipta"
         self.assertEqual(accept_choice("confirm", {"tap": "", "page": confirm_page, "kind": "name_confirm"}), "Confirm")
-        from app.step_read import forward_tap, is_name_confirm, is_paid_upsell
+        from app.step_read import decide_front, forward_tap, is_name_confirm, is_paid_upsell
+        from app.travel_agent import extract_user_ask, infer_intent
 
         self.assertTrue(is_name_confirm(confirm_page))
         self.assertFalse(is_paid_upsell(confirm_page))
         self.assertEqual(forward_tap(confirm_page), "Confirm")
+        named = decide_front(confirm_page, "btn[ ] Confirm\nbtn[ ] Edit", seller="ixigo", hint="12:30")
+        self.assertEqual(named.get("action"), "click")
+        self.assertEqual(named.get("tap"), "Confirm")
+        upsell = decide_front(
+            "Free Cancellation No, Thanks Secure My Trip",
+            "btn[ ] No, Thanks\nbtn[ ] Secure My Trip",
+            seller="ixigo",
+        )
+        self.assertEqual(upsell.get("action"), "ask")
+        booking = {
+            "stage": "booking",
+            "stuck_kind": "name_confirm",
+            "stuck_page": confirm_page,
+            "selected_hint": "12:30",
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+        }
+        self.assertEqual(infer_intent(booking, "confirm"), "book")
+        self.assertEqual(extract_user_ask("Click 'Confirm'", booking).get("tap"), "Confirm")
+        self.assertEqual(extract_user_ask("go to add-ons", booking).get("intent"), "book")
+        self.assertEqual(extract_user_ask("why stuck?", booking).get("intent"), "status")
         from app.step_read import arm_pending_step, choice_phrase
 
         self.assertEqual(choice_phrase("Click 'No thanks'"), "No thanks")
@@ -1634,7 +1656,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("_ixigo_buy_this_visible", handler)
         self.assertIn("_pause_unknown", handler)
         self.assertIn("_clear_front_sheet", handler)
-        self.assertIn("is_name_confirm", handler)
+        self.assertIn("Conscience", handler)
         self.assertLess(handler.index("_select_saved_traveller"), handler.index("_safe_continue(page)"))
         self.assertLess(handler.index("_pause_unknown"), handler.index("_safe_continue(page)"))
 

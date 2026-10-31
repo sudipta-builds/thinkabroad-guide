@@ -61,16 +61,23 @@ _PLANNER = (
 
 _UNDERSTAND = (
     "You read one WhatsApp message for a travel desk. The usual trip is Guwahati (GAU) to Delhi (DEL).\n"
-    'Return JSON only: {"intent":"search|select|book|login|details|pay|pay_self|cancel|status|chat","flight_hint":"","reply":""}\n'
-    "search: they want fares, or they named a route, including casual wording like fly, want to fly, show flights.\n"
-    "select: they picked a fare already discussed, such as a time, an airline, that one, or done.\n"
-    "book: they want you to continue into booking, in any wording (book the flight, go ahead, take it, buy it).\n"
-    "login: a site sign-in, or they are giving a password.\n"
-    "details: name, email, phone, date of birth, or gender. A birth date next to an email or male/female is not a new flight date.\n"
+    'Return JSON only: {"intent":"search|select|book|login|details|pay|pay_self|cancel|status|chat",'
+    '"flight_hint":"","wanted_tap":"","reply":""}\n'
+    "Understand what they want you to DO next, not only keywords.\n"
+    "search: they want fares or named a route (fly, want to fly, show flights).\n"
+    "select: they picked a fare already discussed (a time, airline, that one, done).\n"
+    "book: act on the open booking — go ahead, continue, confirm, skip the extra, click a named button, "
+    "go to add-ons, next step, tick the traveller, or keep booking.\n"
+    "status: they only ask what is wrong, why stuck, what you see, or ? — do not restart the trip.\n"
+    "login: site sign-in or they are giving a password.\n"
+    "details: name, email, phone, date of birth, or gender. A birth date with email/gender is not a new flight date.\n"
     "pay: they want you to pay with UPI, card, or OTP, or they just sent those.\n"
     "pay_self: they want the payment link and will pay themselves.\n"
-    "Do not change a saved trip because a date of birth arrived. flight_hint is a departure time or airline they named, else empty.\n"
-    "reply is one or two short sentences you would actually text. No emoji. Do not invent fares or say anything was paid."
+    "cancel: stop booking.\n"
+    "wanted_tap: exact button they named (Confirm, No Thanks, Continue), else empty.\n"
+    "flight_hint: departure time or airline they named, else empty. Do not change a saved trip for a DOB.\n"
+    "reply: one short sentence that mirrors their ask (I'll press Confirm; I'll skip that extra). "
+    "No emoji. Do not invent fares or say anything was paid."
 )
 
 _BROWSER = (
@@ -373,7 +380,7 @@ def handle_turn(
                 signed_in = str(state.get("kernel_logged_in") or "") == book_seller
                 trip = _spoken_trip(state)
                 if chosen and resume_booking_url(state, text):
-                    canned = _mid_booking_ack(state, book_seller, chosen, text)
+                    canned = _usable_reply(state, spoken, _mid_booking_ack(state, book_seller, chosen, text))
                 elif chosen and signed_in:
                     canned = f"Opening the {chosen} on {_seller_label(book_seller)}. I'll stop before payment."
                 elif chosen:
@@ -483,11 +490,60 @@ _PAY_SELF = re.compile(
 )
 
 
+def _mid_booking(state: dict[str, Any]) -> bool:
+    stage = str(state.get("stage") or "")
+    return bool(
+        state.get("stuck_kind")
+        or state.get("pending_step")
+        or (state.get("selected_hint") and stage in {"booking", "review", "passenger", "login", "addons", "payment"})
+        or stage in {"booking", "review", "passenger", "login", "addons"}
+    )
+
+
+def extract_user_ask(text: str, state: dict[str, Any]) -> dict[str, str]:
+    """What the traveller wants pressed or asked, from plain wording."""
+    from app.step_read import choice_phrase, safe_tap
+
+    raw = (text or "").strip()
+    out: dict[str, str] = {"intent": "", "tap": "", "goal": ""}
+    if not raw:
+        return out
+    if re.search(r"\b(why (?:stuck|blocked)|what(?:'s| is) (?:wrong|happening)|where are you)\b", raw, re.I):
+        out["intent"] = "status"
+        return out
+    if re.search(r"\b(add-?ons?|next step|go (?:to |on to )?payment|move (?:on|forward|ahead))\b", raw, re.I):
+        out["intent"] = "book"
+        out["goal"] = "forward"
+    page = ""
+    pending = state.get("pending_step") if isinstance(state.get("pending_step"), dict) else None
+    if pending:
+        page = str(pending.get("page") or "")
+    page = page or str(state.get("stuck_page") or "")
+    phrase = choice_phrase(raw)
+    if re.match(r"^(?:click|press|tap|hit)\b", raw, re.I) or (
+        2 <= len(phrase) <= 40 and page and phrase.lower() in re.sub(r"\s+", " ", page).lower()
+    ):
+        tap = safe_tap(phrase, page) if page else re.sub(r"\s+", " ", phrase)[:40]
+        if tap:
+            out["tap"] = tap
+            out["intent"] = out["intent"] or "book"
+    if re.fullmatch(r"confirm", raw, re.I):
+        out["tap"] = safe_tap("Confirm", page) or "Confirm"
+        out["intent"] = "book"
+    if re.search(r"\bno,?\s*thanks\b|\bskip(?:\s+it)?\b|\bdon'?t want\b", raw, re.I):
+        out["intent"] = "book"
+        out["goal"] = "skip"
+    return out
+
+
 def infer_intent(state: dict[str, Any], text: str) -> str:
     """Open-vocabulary local read. The model only breaks ties this cannot see."""
     raw = (text or "").strip()
     if not raw:
         return "chat"
+    asked = extract_user_ask(text, state)
+    if asked.get("intent") in {"status", "book"} and _mid_booking(state):
+        return asked["intent"]
     if re.search(r"\b(stop|cancel|never mind)\b", raw, re.I) and not re.search(r"\bbook\b", raw, re.I):
         return "cancel"
     if re.search(r"\b(status|what did i book|my booking)\b", raw, re.I):
@@ -524,16 +580,22 @@ def infer_intent(state: dict[str, Any], text: str) -> str:
         return "book"
     if state.get("options") and re.search(r"\b(go ahead|book it|take it|do it)\b", raw, re.I):
         return "book"
-    if re.search(r"\b(go ahead|go on|confirm|book it|take it|do it|skip|skip it)\b", raw, re.I):
+    if re.search(
+        r"\b(go ahead|go on|confirm|book it|take it|do it|skip|skip it|next(?: step)?|add-?ons?)\b",
+        raw,
+        re.I,
+    ):
         stage = str(state.get("stage") or "")
         if stage == "payment":
             return "pay"
-        if stage in {"booking", "review", "passenger", "login", "addons"}:
+        if stage in {"booking", "review", "passenger", "login", "addons"} or _mid_booking(state):
             return "book"
     if re.search(r"\b(book|buy|reserve)\b", raw, re.I):
         return "book"
-    if re.search(r"\bclick\s+continue\b", raw, re.I) or re.fullmatch(r"continue", raw, re.I):
-        if str(state.get("stage") or "") in {"booking", "passenger", "results", "payment", "login", "review"}:
+    if re.search(r"\b(?:click|press|tap)\b", raw, re.I) or re.fullmatch(r"continue", raw, re.I):
+        if str(state.get("stage") or "") in {"booking", "passenger", "results", "payment", "login", "review"} or _mid_booking(
+            state
+        ):
             return "book"
     if _TIME.search(raw) or re.search(r"\b(that one|this one|spicejet|indigo|done|take it)\b", raw, re.I):
         if state.get("stage") in {"results", "booking", "payment", "login", "passenger", "review"} or _TIME.search(raw):
@@ -542,7 +604,7 @@ def infer_intent(state: dict[str, Any], text: str) -> str:
         stage = str(state.get("stage") or "")
         if stage == "payment":
             return "pay"
-        if stage in {"results", "booking", "login", "passenger", "review"}:
+        if stage in {"results", "booking", "login", "passenger", "review"} or _mid_booking(state):
             return "book"
         return "search"
     if re.search(r"\b(fly|flying|flight|flights|fare|fares|search|check|show|want to fly|wanna fly)\b", raw, re.I):
@@ -559,10 +621,14 @@ def _merge_intent(local: str, model: str, text: str, state: dict[str, Any]) -> s
         return "status"
     if _asks_for_filled_form(text):
         return "status"
-    if re.search(r"\bclick\s+continue\b", text or "", re.I) or re.fullmatch(r"continue", (text or "").strip(), re.I):
-        if str(state.get("stage") or "") in {"booking", "passenger", "results", "payment", "login", "review"}:
+    if re.search(r"\b(?:click|press|tap)\b", text or "", re.I) or re.fullmatch(
+        r"continue|confirm|next(?: step)?", (text or "").strip(), re.I
+    ):
+        if str(state.get("stage") or "") in {"booking", "passenger", "results", "payment", "login", "review"} or _mid_booking(
+            state
+        ):
             return "book"
-    if local == "book" and resume_booking_url(state, text):
+    if local == "book" and (resume_booking_url(state, text) or _mid_booking(state)):
         return "book"
     model = (model or "").lower()
     if model not in _INTENTS:
@@ -620,15 +686,40 @@ def _usable_reply(state: dict[str, Any], spoken: str, fallback: str) -> str:
 def resolve_intent(text: str, state: dict[str, Any], prior: list[dict[str, Any]]) -> tuple[str, str]:
     """Ask DeepSeek first, then check the rules, and keep both."""
     local = infer_intent(state, text)
+    asked = extract_user_ask(text, state)
+    if asked.get("tap") and _mid_booking(state):
+        state["chosen_tap"] = asked["tap"]
     if not get_settings().llm_ready:
-        return local, ""
+        spoken = ""
+        if asked.get("tap"):
+            spoken = f"I'll press {asked['tap']} on the open page. Nothing paid."
+        elif asked.get("goal") == "forward":
+            spoken = "I'll move the booking forward and stop before payment."
+        elif asked.get("goal") == "skip":
+            spoken = "I'll skip the paid extra and keep your traveller selected. Nothing paid."
+        return local, spoken
     data = llm.converse(_UNDERSTAND, _planner_payload(phone="", text=text, state=state, prior=prior, busy=False), timeout=8)
     model = str(data.get("intent") or "")
     spoken = str(data.get("reply") or "")
     kind = _merge_intent(local, model, text, state)
+    if asked.get("intent") == "book" and _mid_booking(state) and kind in {"chat", "search", "status"}:
+        kind = "book"
+    if asked.get("intent") == "status" and _mid_booking(state):
+        kind = "status"
     hint = str(data.get("flight_hint") or "").strip()
     if hint and kind != "details":
         state["selected_hint"] = hint[:40]
+    wanted = str(data.get("wanted_tap") or "").strip()
+    if wanted and _mid_booking(state) and kind == "book":
+        page = str((state.get("pending_step") or {}).get("page") if isinstance(state.get("pending_step"), dict) else "")
+        page = page or str(state.get("stuck_page") or "")
+        from app.step_read import safe_tap
+
+        tap = safe_tap(wanted, page) if page else wanted[:40]
+        if tap:
+            state["chosen_tap"] = tap
+    if not spoken and asked.get("tap"):
+        spoken = f"I'll press {asked['tap']} on the open page. Nothing paid."
     return kind, spoken
 
 
@@ -1948,26 +2039,30 @@ def passenger_details_reply(state: dict[str, Any]) -> str:
 
 
 def _mid_booking_ack(state: dict[str, Any], seller_id: str, chosen: str, text: str) -> str:
-    """Do not promise Continue when the open page may be a different block."""
+    """Mirror what they asked; do not promise a button that may not be the real step."""
     from app.step_read import RECOMMENDED
 
     seller = _seller_label(seller_id)
     tap = str(state.get("chosen_tap") or "")
-    if tap == RECOMMENDED:
+    ask = extract_user_ask(text, state)
+    if tap == RECOMMENDED or ask.get("goal") == "skip":
         return (
             f"Skipping extras and ticking your traveller on {seller} for {chosen}. "
             "Nothing paid."
         )
     if tap and not tap.startswith("__"):
         return f"Pressing {tap} on {seller} for {chosen}. Nothing paid."
+    if ask.get("goal") == "forward":
+        return (
+            f"Moving the {chosen} forward on {seller} toward add-ons, then I'll stop before payment."
+        )
     live = state.get("live") if isinstance(state.get("live"), dict) else {}
     stage = str(state.get("stage") or live.get("stage") or "")
     stuck = str(state.get("stuck_kind") or "")
     if stuck or stage in {"review", "addons", "passenger", "login", "booking"}:
-        asked = "continue" if re.search(r"\bcontinue\b", text or "", re.I) else "that"
         return (
-            f"Looking at the open {seller} page for {chosen}. "
-            f"If {asked} is not the real step, I'll say what I'm stuck on and what I recommend. "
+            f"Acting on your message on the open {seller} page for {chosen}. "
+            "If that step is still blocked, I'll say what I'm stuck on and what I recommend. "
             "I stop before payment."
         )
     return f"Continuing the {chosen} on {seller}. I'll stop before payment."
@@ -1975,7 +2070,11 @@ def _mid_booking_ack(state: dict[str, Any], seller_id: str, chosen: str, text: s
 
 def _stuck_line(state: dict[str, Any], kind: str, what: str, why: str, recommend: str) -> str:
     """Name the block, what it is, and the next move. Same block twice is called out."""
-    again = "Still the same block. " if kind and str(state.get("stuck_kind") or "") == kind else ""
+    prev = str(state.get("stuck_kind") or "")
+    same = bool(kind) and (
+        prev == kind or {prev, kind} <= {"upsell", "addon_buy"} or (prev and prev == kind)
+    )
+    again = "Still the same block. " if same else ""
     if kind:
         state["stuck_kind"] = kind
     spoken = f"{again}Stuck: {what}. That's {why}. I recommend {recommend}. Nothing paid."
@@ -2077,7 +2176,7 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             "I can't tap UPI or net banking myself. Approve that amount and say pay with card "
             "(or send a card to the vault), or say you'll pay yourself and I'll send the link."
         )
-    from app.step_read import arm_pending_step, decline_tap, describe_step, forward_tap, is_name_confirm, read_step
+    from app.step_read import arm_pending_step, decide_front, describe_step, step_read_enabled
 
     controls = str(surface.get("controls") or "")
     if not controls and session.page is not None and not surface.get("overlay"):
@@ -2088,24 +2187,51 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         except Exception:
             controls = ""
     hay = f"{page or ''}\n{controls}"
-    if is_name_confirm(hay):
-        arm_pending_step(state, hay, "name_confirm", tap=forward_tap(hay) or "Confirm")
-        return _stuck_line(
-            state,
-            "name_confirm",
-            f"{seller} name check for the {which}",
-            "Review Details wants Confirm — that is not payment",
-            "reply yes or confirm and I'll press Confirm, then move toward add-ons",
+    if (
+        surface.get("overlay")
+        or step_read_enabled()
+        or re.search(
+            r"\bconfirm\b|no,?\s*thanks|secure my trip|free cancellation|not this time|\bassured\b",
+            hay,
+            re.I,
         )
-    heard = read_step(page, seller=seller, hint=which, controls=controls)
-    if heard and heard.get("kind") in {"upsell", "other"}:
-        tap = heard.get("tap") or decline_tap(hay) or forward_tap(hay)
-        heard["tap"] = tap
-        arm_pending_step(state, hay, heard.get("kind") or "other", tap=tap)
-        state["stuck_kind"] = heard.get("kind") or "other"
-        spoken = describe_step(heard)
-        state["last_stuck"] = spoken
-        return spoken
+    ):
+        decision = decide_front(page, controls, seller=seller, hint=which)
+        # Ask the traveller when conscience wants a yes (upsell / unknown). Safe auto-clicks run in checkout.
+        if decision.get("kind") != "pay" and (
+            decision.get("action") == "ask" or decision.get("kind") == "upsell"
+        ):
+            kind = decision.get("kind") or "other"
+            what = decision.get("what") or f"a {seller} step for {which}"
+            why = decision.get("why") or "the page has not moved on"
+            recommend = decision.get("recommend") or "tell me what to press"
+            tap = decision.get("tap") or ""
+            arm_pending_step(state, hay, kind, tap=tap)
+            # Keep Stuck / Still the same block, then how to answer.
+            spoken = _stuck_line(state, kind if kind != "other" else "upsell" if "extra" in what.lower() or "assured" in what.lower() else kind, what, why, recommend)
+            if tap:
+                spoken = spoken.replace(
+                    "Nothing paid.",
+                    f"Reply yes and I'll press {tap}. Or send the exact button you want. I haven't tapped anything. Nothing paid.",
+                )
+            else:
+                spoken = spoken.replace(
+                    "Nothing paid.",
+                    "Send the exact button you want pressed. I haven't tapped anything. Nothing paid.",
+                )
+            state["last_stuck"] = spoken
+            return spoken
+        from app.step_read import is_name_confirm
+
+        if decision.get("action") == "click" and decision.get("tap") and is_name_confirm(hay):
+            arm_pending_step(state, hay, "name_confirm", tap=decision["tap"])
+            return _stuck_line(
+                state,
+                "name_confirm",
+                f"{seller} name check for the {which}",
+                "Review Details wants Confirm — that is not payment",
+                f"reply yes or confirm and I'll press {decision['tap']}, then move toward add-ons",
+            )
     missing: list[str] = []
     if needs_email and not state.get("email"):
         missing.append("Gmail")

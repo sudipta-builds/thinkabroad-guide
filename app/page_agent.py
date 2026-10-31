@@ -468,24 +468,23 @@ def _surface_hay(surface: dict) -> str:
     return f"{surface.get('text') or ''}\n{surface.get('controls') or ''}"
 
 
-def _clear_front_sheet(page, chosen_tap: str = "") -> str:
-    """Click the safe control on the covering sheet. Empty when nothing usable.
-
-    Name Confirm and Continue/Proceed are pressed without waiting. Paid Assured
-    sheets only clear when the traveller already chose a decline label.
-    """
-    from app.step_read import decline_tap, forward_tap, is_name_confirm, is_paid_upsell
+def _clear_front_sheet(page, chosen_tap: str = "", *, seller: str = "", hint: str = "") -> str:
+    """Conscience decides; rails click only a safe on-page label. Empty when none."""
+    from app.step_read import decide_front
 
     surface = read_surface(page)
     if not surface.get("overlay"):
         return ""
-    hay = _surface_hay(surface)
-    label = "" if str(chosen_tap or "").startswith("__") else (chosen_tap or "").strip()
-    if not label:
-        if is_name_confirm(hay) or not is_paid_upsell(hay):
-            label = forward_tap(hay) or decline_tap(hay)
-        else:
-            label = decline_tap(hay)
+    decision = decide_front(
+        str(surface.get("text") or ""),
+        str(surface.get("controls") or ""),
+        seller=seller,
+        hint=hint,
+        chosen_tap=chosen_tap,
+    )
+    if decision.get("action") != "click":
+        return "front_ask" if decision.get("action") == "ask" else "front_none"
+    label = str(decision.get("tap") or "")
     if label and _click_label(page, label):
         try:
             page.wait_for_timeout(500)
@@ -506,30 +505,27 @@ def _pause_unknown(
     facts: dict[str, str],
     checks: list[str],
     step: int,
+    chosen_tap: str = "",
 ) -> CheckoutOutcome:
-    """Stop before a guessed click. WhatsApp gets the front sheet, not the page behind it."""
-    from app.step_read import decline_tap, describe_step, forward_tap, read_step
+    """Stop before a guessed click. Conscience names the front sheet for WhatsApp."""
+    from app.step_read import decide_front, describe_step
 
     surface = read_surface(page)
     if surface.get("overlay") and str(surface.get("text") or "").strip():
         text = str(surface["text"])
     digest = str(surface.get("controls") or "") or control_digest(page)
-    hay = f"{text or ''}\n{digest}"
-    heard = read_step(text, seller=seller, hint=hint, controls=digest)
-    if not heard:
-        heard = {
-            "kind": "other",
-            "what": f"a {seller} step I don't treat as a known booking screen",
-            "why": "there is no fixed click for this layout",
-            "recommend": "send the exact button you want, or reply yes to skip extras and continue",
-            "tap": decline_tap(hay) or forward_tap(hay),
-        }
-    elif not heard.get("tap"):
-        heard["tap"] = decline_tap(hay) or forward_tap(hay)
-    facts["tap"] = heard.get("tap") or ""
+    decision = decide_front(text, digest, seller=seller, hint=hint, chosen_tap=chosen_tap)
+    heard = {
+        "kind": decision.get("kind") or "other",
+        "what": decision.get("what") or f"a {seller} step I don't treat as done",
+        "why": decision.get("why") or "the page has not moved on",
+        "recommend": decision.get("recommend") or "send the exact button you want",
+        "tap": decision.get("tap") or "",
+    }
+    facts["tap"] = heard["tap"]
     facts["controls"] = digest[:800]
     handoff = describe_step(heard)
-    log.append(f"{step}:ask:{heard.get('kind')}:{facts['tap']}")
+    log.append(f"{step}:ask:{heard['kind']}:{heard['tap']}")
     return CheckoutOutcome(
         "ask",
         text,
@@ -1888,55 +1884,26 @@ def run_checkout_agent(
             continue
         if kind == "review_continue":
             # Escape closes the Ixigo review sheet, so the Continue control disappears.
-            # Covering sheets: Confirm name checks automatically; pause only for paid extras.
-            from app.step_read import is_name_confirm, is_paid_upsell
-
+            # Conscience reads the covering sheet; rails never pay.
             surface = read_surface(page)
-            hay = _surface_hay(surface)
             if surface.get("overlay") or _ixigo_buy_this_visible(page):
-                paid = is_paid_upsell(hay) or _ixigo_buy_this_visible(page)
-                if paid and not chosen_tap and not is_name_confirm(hay):
-                    return _pause_unknown(
-                        page,
-                        seller=seller,
-                        hint=hint,
-                        text=text,
-                        url=url,
-                        log=log,
-                        facts=facts,
-                        checks=checks,
-                        step=step,
-                    )
-                note = _clear_front_sheet(page, chosen_tap)
+                note = _clear_front_sheet(page, chosen_tap, seller=seller, hint=hint)
                 log.append(note or "front_clear_miss")
                 if note.startswith("front_tap:"):
                     continue
-                if paid and not chosen_tap:
-                    return _pause_unknown(
-                        page,
-                        seller=seller,
-                        hint=hint,
-                        text=text,
-                        url=url,
-                        log=log,
-                        facts=facts,
-                        checks=checks,
-                        step=step,
-                    )
-                if not note.startswith("front_tap:") and not chosen_tap:
-                    return _pause_unknown(
-                        page,
-                        seller=seller,
-                        hint=hint,
-                        text=text,
-                        url=url,
-                        log=log,
-                        facts=facts,
-                        checks=checks,
-                        step=step,
-                    )
-                continue
-            # Decline paid extras and tick one saved person before Continue. Do not add another.
+                return _pause_unknown(
+                    page,
+                    seller=seller,
+                    hint=hint,
+                    text=text,
+                    url=url,
+                    log=log,
+                    facts=facts,
+                    checks=checks,
+                    step=step,
+                    chosen_tap=chosen_tap,
+                )
+            # Tick one saved person and leave extras off before Continue. Do not add another.
             log.append(_ixigo_opt_out_cancellation(page))
             log.append(_select_saved_traveller(page, str(profile.get("name") or "")))
             try:
@@ -1950,10 +1917,22 @@ def run_checkout_agent(
                 {"login", "otp", "passenger", "addons", "pay", "error"},
                 budget_ms=6000,
             )
-            # Continue often opens a name Confirm sheet — clear it before leaving review.
-            after = _clear_front_sheet(page)
-            if after:
+            # Continue often opens a name Confirm sheet — conscience clears it.
+            after = _clear_front_sheet(page, seller=seller, hint=hint)
+            if after and after.startswith("front_tap:"):
                 log.append(after)
+            elif after == "front_ask":
+                return _pause_unknown(
+                    page,
+                    seller=seller,
+                    hint=hint,
+                    text=text,
+                    url=url,
+                    log=log,
+                    facts=facts,
+                    checks=checks,
+                    step=step,
+                )
             continue
         if kind == "login_phone":
             # Do not press Escape here — it closes the Ixigo login drawer.

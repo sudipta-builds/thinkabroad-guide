@@ -653,6 +653,29 @@ def _dismiss_overlays(page) -> None:
             pass
 
 
+def _ixigo_buy_this_visible(page) -> bool:
+    """Paid add-on sheet (Free Cancellation) sits on top of Continue."""
+    try:
+        return bool(
+            page.evaluate(
+                """() => {
+                  const vis = (el) => {
+                    const r = el.getBoundingClientRect();
+                    const s = getComputedStyle(el);
+                    return r.width > 8 && r.height > 8 && s.visibility !== 'hidden'
+                      && s.display !== 'none' && r.bottom > 0 && r.top < innerHeight;
+                  };
+                  return [...document.querySelectorAll('button,a,[role=button]')].some((el) => {
+                    const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                    return vis(el) && /^buy this$/i.test(t);
+                  });
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
 def _ixigo_opt_out_cancellation(page) -> str:
     try:
         page.locator("#standalone-none-fareType").check(timeout=2500)
@@ -667,19 +690,35 @@ def _ixigo_opt_out_cancellation(page) -> str:
     try:
         clicked = page.evaluate(
             """() => {
-              const nodes = [...document.querySelectorAll('label, div, span, button, p')];
-              const hit = nodes.find(el => {
-                const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-                return text.length > 0 && text.length < 90
-                  && /don.?t want free cancellation|no,? thanks|i don.?t want/i.test(text);
+              const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 8 && r.height > 8 && s.visibility !== 'hidden'
+                  && s.display !== 'none' && r.bottom > 0 && r.top < innerHeight;
+              };
+              const label = (el) => (el.innerText || el.getAttribute('aria-label') || '')
+                .replace(/\\s+/g, ' ').trim();
+              const nodes = [...document.querySelectorAll('label, div, span, button, a, p, [role=button]')].filter(vis);
+              const skip = nodes.find((el) => {
+                const text = label(el);
+                if (!text || text.length > 90) return false;
+                if (/^buy this$/i.test(text) || /\\bpay\\b/i.test(text)) return false;
+                return /don.?t want free cancellation|no,? thanks|i don.?t want|continue without|skip (add-?on|this)|not now|maybe later|^none$|^no$/i.test(text);
               });
-              if (!hit) return false;
-              hit.click();
-              return true;
+              if (skip) { skip.click(); return 'skip'; }
+              const none = document.querySelector('#standalone-none-fareType');
+              if (none) { none.click(); return 'radio'; }
+              const close = nodes.find((el) => {
+                const aria = (el.getAttribute('aria-label') || '');
+                const r = el.getBoundingClientRect();
+                return /close|dismiss/i.test(aria) && r.y > 60 && r.width < 64 && r.height < 64;
+              });
+              if (close) { close.click(); return 'close'; }
+              return '';
             }"""
         )
         if clicked:
-            return "optout_js"
+            return f"optout_js:{clicked}"
     except Exception:
         pass
     return "optout_miss"
@@ -691,7 +730,10 @@ def _safe_continue(page) -> bool:
     The target is the smallest on-screen control with that exact label, never a
     Pay button and never a parent that merely contains the word. The center is
     checked with elementFromPoint so the click lands on that control.
+    Buy This is an add-on purchase, not Continue, and it covers the real button.
     """
+    if _ixigo_buy_this_visible(page):
+        return False
     try:
         point = page.evaluate(
             """() => {
@@ -1494,7 +1536,12 @@ def run_checkout_agent(
         if kind == "review_continue":
             # Escape closes the Ixigo review sheet, so the Continue control disappears.
             # One accurate click per attempt. A miss can be retried; Pay is never clicked.
+            # Free Cancellation "Buy This" is an overlay; skip it, then Continue.
             log.append(_ixigo_opt_out_cancellation(page))
+            try:
+                page.wait_for_timeout(400)
+            except Exception:
+                pass
             log.append(f"continue_click:{_safe_continue(page)}")
             _poll_ready(
                 page,

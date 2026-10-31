@@ -209,9 +209,33 @@ class DateAndMemory(unittest.TestCase):
             "Fare Summary Review Details Sudipta Saikia Continue",
             _Session(),  # type: ignore[arg-type]
         )
-        self.assertIn("Still on the review step", spoken)
+        self.assertIn("Stuck:", spoken)
+        self.assertIn("recommend", spoken.lower())
         self.assertNotIn("http", spoken)
         self.assertNotIn("moved", spoken.lower())
+        cancel = _booking_page_reply(
+            {**booking, "selected_hint": "12:30"},
+            "12:30",
+            "Fare Summary Total Amount ₹9,280 Free Cancellation Buy This Continue",
+            _Session(),  # type: ignore[arg-type]
+        )
+        self.assertIn("Stuck:", cancel)
+        self.assertIn("Free Cancellation", cancel)
+        self.assertIn("Buy This", cancel)
+        self.assertIn("skip", cancel.lower())
+        self.assertNotIn("Continue is on the screenshot", cancel)
+        again = _booking_page_reply(
+            {**booking, "stuck_kind": "addon_buy", "selected_hint": "12:30"},
+            "12:30",
+            "Fare Summary Total Amount ₹9,280 Free Cancellation Buy This Continue",
+            _Session(),  # type: ignore[arg-type]
+        )
+        self.assertIn("Still the same block", again)
+        from app.travel_agent import _mid_booking_ack
+
+        ack = _mid_booking_ack({**booking, "stage": "review", "stuck_kind": "addon_buy"}, "ixigo", "12:30", "continue")
+        self.assertIn("stuck", ack.lower())
+        self.assertNotIn("Continuing the 12:30", ack)
 
         from app.travel_agent import _clean, _hide_checkout_link, _usable_reply
 
@@ -812,7 +836,9 @@ class SellerChoiceAndProxy(unittest.TestCase):
             home,
             FakeSession(),  # type: ignore[arg-type]
         )
+        self.assertIn("Stuck:", spoken)
         self.assertIn("search page", spoken.lower())
+        self.assertIn("recommend", spoken.lower())
         self.assertNotIn("I'm on the 10:45 step", spoken)
         self.assertNotIn("Indian mobile", spoken)
         booking = {
@@ -824,6 +850,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
             "selected_hint": "10:45",
         }
         self.assertEqual(infer_intent(booking, "Go on"), "book")
+        self.assertEqual(infer_intent({**booking, "stage": "review"}, "skip"), "book")
 
     def test_payment_step_refuses_upi_self_tap(self) -> None:
         class FakeSession:
@@ -1315,7 +1342,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
         import inspect
 
         from app.kernel_otp import begin_login, is_resume_booking_url
-        from app.page_agent import _safe_continue, run_checkout_agent
+        from app.page_agent import _ixigo_opt_out_cancellation, _safe_continue, run_checkout_agent
         from app.travel_agent import infer_intent, remember_booking_page, resume_booking_url
 
         url = "https://www.ixigo.com/flight/booking/1044/abc?fareKey=GAU-DEL-6E5342-04122026"
@@ -1355,15 +1382,20 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("mouse.click", click)
         self.assertIn("elementFromPoint", click)
         self.assertIn("continue|confirm|proceed", click)
+        self.assertIn("_ixigo_buy_this_visible", click)
         self.assertNotIn("pay now", click.lower())
+        opt = inspect.getsource(_ixigo_opt_out_cancellation)
+        self.assertIn("buy this", opt.lower())
+        self.assertIn("continue without", opt.lower())
         review = inspect.getsource(run_checkout_agent)
         self.assertIn("Escape closes the Ixigo review sheet", review)
         self.assertIn("One accurate click per attempt", review)
         self.assertIn('sum(1 for line in log if "review_continue" in line) < 3', review)
         self.assertNotIn('{"action": "done", "target": "review"', review)
         self.assertNotIn("_dismiss_overlays(page)", review.split("review_continue")[1][:700])
-        handler = review.split('if kind == "review_continue"')[1][:800]
+        handler = review.split('if kind == "review_continue"')[1][:900]
         self.assertEqual(handler.count("_safe_continue(page)"), 1)
+        self.assertIn("_ixigo_opt_out_cancellation", handler)
 
 
 if __name__ == "__main__":

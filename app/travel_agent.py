@@ -329,7 +329,7 @@ def handle_turn(
                 signed_in = str(state.get("kernel_logged_in") or "") == book_seller
                 trip = _spoken_trip(state)
                 if chosen and resume_booking_url(state, text):
-                    canned = f"Continuing the {chosen} on {_seller_label(book_seller)}. I'll stop before payment."
+                    canned = _mid_booking_ack(state, book_seller, chosen, text)
                 elif chosen and signed_in:
                     canned = f"Opening the {chosen} on {_seller_label(book_seller)}. I'll stop before payment."
                 elif chosen:
@@ -475,11 +475,11 @@ def infer_intent(state: dict[str, Any], text: str) -> str:
         return "book"
     if state.get("options") and re.search(r"\b(go ahead|book it|take it|do it)\b", raw, re.I):
         return "book"
-    if re.search(r"\b(go ahead|go on|confirm|book it|take it|do it)\b", raw, re.I):
+    if re.search(r"\b(go ahead|go on|confirm|book it|take it|do it|skip|skip it)\b", raw, re.I):
         stage = str(state.get("stage") or "")
         if stage == "payment":
             return "pay"
-        if stage in {"booking", "review", "passenger", "login"}:
+        if stage in {"booking", "review", "passenger", "login", "addons"}:
             return "book"
     if re.search(r"\b(book|buy|reserve)\b", raw, re.I):
         return "book"
@@ -1714,7 +1714,10 @@ def _book_on_seller(
         if state.get("pay_authorized") and re.search(r"\bupi\b|card number|pay now", page, re.I):
             pay = _try_fill_payment(phone, session, secrets)
             page = pay or page
-        _deliver(phone, _booking_page_reply(_load(phone), hint, page, session), session, secrets)
+        held = _load(phone)
+        spoken = _booking_page_reply(held, hint, page, session)
+        _save(phone, held)
+        _deliver(phone, spoken, session, secrets)
         return ""
 
     from app.search import NOT_BOOKABLE
@@ -1795,7 +1798,10 @@ def _book_on_seller(
     _fill_what_we_can(phone, session, secrets)
     page = session.read_page() or outcome.text
     _note_live(phone, page)
-    _deliver(phone, _booking_page_reply(_load(phone), hint, page, session), session, secrets)
+    held = _load(phone)
+    spoken = _booking_page_reply(held, hint, page, session)
+    _save(phone, held)
+    _deliver(phone, spoken, session, secrets)
     return ""
 
 
@@ -1877,6 +1883,30 @@ def passenger_details_reply(state: dict[str, Any]) -> str:
     return f"{got}I still need your {', '.join(gaps)} before I fill the form. Nothing paid."
 
 
+def _mid_booking_ack(state: dict[str, Any], seller_id: str, chosen: str, text: str) -> str:
+    """Do not promise Continue when the open page may be a different block."""
+    seller = _seller_label(seller_id)
+    live = state.get("live") if isinstance(state.get("live"), dict) else {}
+    stage = str(state.get("stage") or live.get("stage") or "")
+    stuck = str(state.get("stuck_kind") or "")
+    if stuck or stage in {"review", "addons", "passenger", "login", "booking"}:
+        asked = "continue" if re.search(r"\bcontinue\b", text or "", re.I) else "that"
+        return (
+            f"Looking at the open {seller} page for {chosen}. "
+            f"If {asked} is not the real step, I'll say what I'm stuck on and what I recommend. "
+            "I stop before payment."
+        )
+    return f"Continuing the {chosen} on {seller}. I'll stop before payment."
+
+
+def _stuck_line(state: dict[str, Any], kind: str, what: str, why: str, recommend: str) -> str:
+    """Name the block, what it is, and the next move. Same block twice is called out."""
+    again = "Still the same block. " if kind and str(state.get("stuck_kind") or "") == kind else ""
+    if kind:
+        state["stuck_kind"] = kind
+    return f"{again}Stuck: {what}. That's {why}. I recommend {recommend}. Nothing paid."
+
+
 def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: BrowserSession) -> str:
     trip = _window_phrase(state)
     seller = _seller_label(str(state.get("seller") or "cleartrip"))
@@ -1886,23 +1916,29 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     from app.page_agent import classify_page
 
     shown = classify_page(page, url)
+    which = hint or "that flight"
     if shown in {"home", "cookie"}:
-        which = hint or "chosen"
-        return (
-            f"{seller} opened the search page, not the {which} traveller form for {trip}. "
-            "Nothing paid. Say go on and I'll open the fare list for that time."
+        return _stuck_line(
+            state,
+            "home",
+            f"{seller} search page, not the {which} traveller form for {trip}",
+            "the Where from / Search flights screen (or a cookie banner on it)",
+            "say go on and I'll open the fare list for that time",
         )
     if shown in {"results", "loading"}:
-        which = hint or "that time"
-        return (
-            f"The {seller} fare list is on screen for {trip}. I have not opened the {which} traveller form yet. "
-            "Nothing paid. Say go on and I'll click that time."
+        return _stuck_line(
+            state,
+            "results",
+            f"the {seller} fare list for {trip}",
+            f"flights on screen, but I have not opened the {which} traveller form",
+            f"reply {which} (or go on) and I'll click that Book button",
         )
     if "itinerary/failure" in url or re.search(r"connection lost|been disconnected|server error", page, re.I):
+        state["stuck_kind"] = "error"
         return (
-            f"{seller} opened the {hint or 'selected'} fare for {trip}, then the itinerary page failed "
-            "(Connection lost after waiting). Nothing paid. The screenshot is that error. "
-            "Say EaseMyTrip or Ixigo if you want another site."
+            f"Stuck: {seller} itinerary failed after the {which} for {trip} (connection lost). "
+            "That's a site error, not a missing detail. "
+            "I recommend EaseMyTrip or Ixigo. Nothing paid."
         )
     needs_login = bool(re.search(r"\bpassword\b", page, re.I) and re.search(r"log ?in|sign in|sign up", page, re.I))
     contact = bool(re.search(r"add contact|contact details|traveller details|passenger details", page, re.I))
@@ -1910,19 +1946,31 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     needs_phone = bool(re.search(r"mobile|phone", page, re.I) and contact)
     needs_dob = bool(re.search(r"date of birth|\bdob\b", page, re.I) and contact)
     payment = bool(re.search(r"\bupi\b|pay now|card number|pay to complete|net banking", page, re.I))
-    if needs_login:
-        site = str(state.get("seller") or "cleartrip")
-        return (
-            f"{seller} is asking you to sign in. Send the email and password, "
-            f"for example SAVE {site} you@gmail.com yourpassword, and I'll log in. "
-            "Nothing paid."
+    if shown == "otp" or re.search(r"enter otp|otp sent|verify your mobile", page, re.I):
+        need = "4" if str(state.get("seller") or "") == "cleartrip" else "6"
+        return _stuck_line(
+            state,
+            "otp",
+            f"{seller} login code screen",
+            f"an SMS one-time password, not the flight form",
+            f"reply with only the {need} digits",
         )
-    if payment:
+    if needs_login or shown == "login":
+        site = str(state.get("seller") or "cleartrip")
+        return _stuck_line(
+            state,
+            "login",
+            f"{seller} sign-in",
+            "the site wants an account before the traveller form",
+            f"send the email and password, for example SAVE {site} you@gmail.com yourpassword",
+        )
+    if payment or shown == "pay":
+        state.pop("stuck_kind", None)
         totals = [n for n in prices_in(page) if n >= 3000]
         total = f"₹{totals[0]:,}" if totals else "the total on the screenshot"
         return (
             f"Ready to pay for {trip}. Nothing charged yet. Final total is {total} on {seller}. "
-            f"{hint or 'Your flight'} is on the screenshot. "
+            f"{which} is on the screenshot. "
             "I can't tap UPI or net banking myself. Approve that amount and say pay with card "
             "(or send a card to the vault), or say you'll pay yourself and I'll send the link."
         )
@@ -1932,11 +1980,12 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     if needs_phone and not state.get("phone"):
         missing.append("an Indian mobile (+91)")
     elif needs_phone and state.get("phone") and not _indian_mobile(str(state.get("phone"))):
-        return (
-            f"Stuck at one step. Nothing paid. {seller}'s contact phone field only accepts +91 numbers, "
-            f"so {state.get('phone')} won't go in. Do you have an Indian mobile I can use "
-            "(family's is fine, it's only for flight updates)? "
-            "In the next step I'll also need your date of birth and gender."
+        return _stuck_line(
+            state,
+            "phone_in",
+            f"{seller} contact phone only accepts +91, and {state.get('phone')} will not go in",
+            "the airline wants an Indian mobile for flight updates",
+            "send a 10-digit Indian mobile (family's is fine)",
         )
     if needs_dob:
         if not state.get("dob"):
@@ -1948,30 +1997,73 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     if re.search(r"traveller details|first\s*&\s*middle", page, re.I):
         waiting = passenger_details_reply(state)
         if waiting:
-            return waiting
+            gaps = passenger_gaps(state)
+            return _stuck_line(
+                state,
+                "passenger",
+                f"the {seller} traveller form for {which}",
+                "the page is waiting for passenger fields, not Continue",
+                f"send your {', '.join(gaps)} and I'll fill them",
+            )
     if missing:
-        ahead = ""
-        if needs_email or needs_phone:
-            ahead = " In the next step I'll also need your date of birth and gender." if not needs_dob else ""
-        return (
-            f"Stuck at one step. Nothing paid. This {seller} step needs your {', '.join(missing)}. "
-            f"Send them and I'll fill the form.{ahead} The screenshot is the page."
+        return _stuck_line(
+            state,
+            "contact",
+            f"the {seller} contact step for {which}",
+            f"this step needs {', '.join(missing)} before I can type",
+            f"send {', '.join(missing)} (I still stop before payment)",
         )
-    if "Review your itinerary" in page or "Select your fare" in page:
-        which = hint or "that flight"
-        return (
-            f"{which} is open for {trip} on {seller}. The total is on the screenshot. "
-            "Send your Gmail and Indian mobile for the contact step, or a login if you want me to sign in. Nothing paid."
+    if re.search(r"buy this", page, re.I) and re.search(
+        r"free cancellation|add-?on|seat|meal|extra baggage", page, re.I
+    ):
+        extra = "Free Cancellation" if re.search(r"free cancellation", page, re.I) else "an add-on"
+        return _stuck_line(
+            state,
+            "addon_buy",
+            f"{seller}'s paid {extra} card (orange Buy This) on the {which}",
+            "an extra they want to sell — Continue is greyed behind it, so saying continue does not move the booking",
+            "reply skip. I will not buy the add-on",
+        )
+    if shown == "addons" or re.search(r"choose your seat|add meal|skip add-?ons|extra baggage", page, re.I):
+        return _stuck_line(
+            state,
+            "addons",
+            f"{seller} add-ons (seats, meals, or bags) for the {which}",
+            "optional extras before payment, not a required traveller field",
+            "reply skip and I'll leave extras off",
+        )
+    if shown == "fare_sheet" or "Select your fare" in page:
+        return _stuck_line(
+            state,
+            "fare_sheet",
+            f"{seller} fare-type sheet for the {which}",
+            "VALUE vs a pricier bundle, not payment yet",
+            "reply continue and I'll take the cheaper fare on screen",
+        )
+    if "Review your itinerary" in page:
+        return _stuck_line(
+            state,
+            "itinerary",
+            f"{seller} itinerary for the {which} on {trip}",
+            "the fare is open; next is contact or login",
+            "send Gmail and Indian mobile, or a login if the site asks to sign in",
         )
     if re.search(r"\bcontinue\b", page, re.I) and re.search(
         r"fare summary|review details|review & traveller", page, re.I
     ):
-        which = hint or "that flight"
-        return (
-            f"Still on the review step for {which} on {seller}. "
-            "Continue is on the screenshot. Nothing paid."
+        return _stuck_line(
+            state,
+            "review",
+            f"{seller} review for the {which} on {trip}",
+            "the fare summary before travellers — Continue did not change the page",
+            "look at the screenshot: if you see Buy This or an extra, reply skip; otherwise reply go on and I'll try Continue once more",
         )
-    return f"I'm on the {hint or 'selected'} step for {trip} on {seller}. Nothing paid. The screenshot is the page."
+    state["stuck_kind"] = shown or "other"
+    return (
+        f"Stuck: a {seller} step for {which} on {trip} that I don't treat as done. "
+        f"That's stage {shown or 'unknown'} on the screenshot. "
+        "I recommend saying what you see (login, form, extra, pay) or naming another site. Nothing paid."
+    )
 
 
 def _open_booking(phone: str, text: str, session: BrowserSession, secrets: list[str], started_at: float | None, loaded: dict[str, Any]) -> str:
@@ -2100,12 +2192,15 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
     elif waiting:
         spoken = waiting
     elif filled:
+        state.pop("stuck_kind", None)
         spoken = f"Filled your details for {str(state.get('selected_hint') or 'that flight')} on {label}. I stopped before payment."
     else:
         spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), text, _Session())  # type: ignore[arg-type]
     if re.search(r"\bupi\b|pay now|card number|pay to complete|net banking", text, re.I):
+        state.pop("stuck_kind", None)
         trip = _window_phrase(state)
         spoken = f"I stopped before payment for {trip} on {label}. Nothing paid. The screenshot is that page."
+    _save(phone, state)
     _deliver(phone, spoken, None, secrets, shot_paths=shots)
 
 
@@ -2507,6 +2602,7 @@ def _dispatch(phone: str, session: BrowserSession, call: dict[str, Any], secrets
                     session.last_text or "",
                     session,
                 )
+                _save(phone, state)
             else:
                 spoken = _clean(raw, secrets).strip()
             if not spoken:

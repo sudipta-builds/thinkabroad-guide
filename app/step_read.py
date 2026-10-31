@@ -21,6 +21,7 @@ _READ = (
     "If a required radio or traveller checkbox is [ ], tap that label so it becomes selected.\n"
     "If the page is selling an optional extra, tap the decline control that is actually written there, "
     "whatever its words are.\n"
+    "If the page is a name check with Confirm and Edit, tap Confirm — that is not payment.\n"
     "Never set tap to Pay, Pay now, Secure My Trip, Buy This, Buy, Purchase, or any control that spends money.\n"
     "If this is the payment page, kind is pay and tap is empty.\n"
     "If you do not recognize the layout, kind is other.\n"
@@ -39,9 +40,10 @@ _DECLINE = re.compile(
     re.I,
 )
 _AGREE = re.compile(
-    r"(yes|yep|yeah|ok|okay|sure|skip|skip it|do that|do it|go on|go ahead|continue|no thanks|no, thanks)",
+    r"(yes|yep|yeah|ok|okay|sure|skip|skip it|do that|do it|go on|go ahead|continue|confirm|no thanks|no, thanks)",
     re.I,
 )
+_FORWARD = re.compile(r"^(Confirm|Continue|Proceed)$", re.I)
 
 
 def step_read_enabled() -> bool:
@@ -56,6 +58,33 @@ def decline_tap(page: str) -> str:
     if not match:
         return ""
     return safe_tap(match.group(1), page)
+
+
+def is_paid_upsell(page: str) -> bool:
+    """Paid Assured / Secure My Trip sheet. True only when that buy path is on screen."""
+    hay = page or ""
+    if not re.search(r"free cancellation|\bassured\b|assure my trip", hay, re.I):
+        return False
+    return bool(re.search(r"secure my trip|buy this|assure my trip|no,?\s*thanks", hay, re.I))
+
+
+def is_name_confirm(page: str) -> bool:
+    """Name check sheet (Review Details + Confirm). Not payment."""
+    hay = page or ""
+    if not re.search(r"\bconfirm\b", hay, re.I):
+        return False
+    return bool(
+        re.search(r"review details|govt\.?\s*id|aadhaar|matches your (govt|name)|driver.?s license", hay, re.I)
+    )
+
+
+def forward_tap(page: str) -> str:
+    """Confirm / Continue / Proceed when that label is on this sheet."""
+    for label in ("Confirm", "Continue", "Proceed"):
+        hit = safe_tap(label, page)
+        if hit:
+            return hit
+    return ""
 
 
 def safe_tap(tap: str, page: str) -> str:
@@ -111,7 +140,15 @@ def accept_choice(text: str, pending: dict[str, str]) -> str:
     if re.search(r"\b(pay now|pay to complete|make payment|secure my trip)\b", raw, re.I):
         return ""
     if _AGREE.fullmatch(raw):
-        return safe_tap(str(pending.get("tap") or ""), page) or decline_tap(page) or RECOMMENDED
+        if re.fullmatch(r"confirm", raw, re.I):
+            return (
+                safe_tap("Confirm", page)
+                or safe_tap(str(pending.get("tap") or ""), page)
+                or forward_tap(page)
+                or decline_tap(page)
+                or RECOMMENDED
+            )
+        return safe_tap(str(pending.get("tap") or ""), page) or decline_tap(page) or forward_tap(page) or RECOMMENDED
     if re.search(r"no\s*,?\s*thanks", raw, re.I):
         return safe_tap("No, Thanks", page) or safe_tap("No Thanks", page) or decline_tap(page)
     if re.search(r"don.?t want", raw, re.I):
@@ -160,8 +197,10 @@ def read_step(page: str, *, seller: str = "", hint: str = "", controls: str = ""
         return {"kind": "pay", "what": what, "why": why, "recommend": recommend, "tap": ""}
     hay = _hay(page, controls)
     tap = safe_tap(str(data.get("tap") or ""), hay)
+    if not tap and is_name_confirm(hay):
+        tap = forward_tap(hay)
     if kind in {"upsell", "other"} and not tap:
-        tap = decline_tap(hay)
+        tap = decline_tap(hay) or forward_tap(hay)
     return {
         "kind": kind,
         "what": what[:220],

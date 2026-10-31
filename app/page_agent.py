@@ -464,6 +464,37 @@ def control_digest(page) -> str:
     return str(raw or "").strip()
 
 
+def _surface_hay(surface: dict) -> str:
+    return f"{surface.get('text') or ''}\n{surface.get('controls') or ''}"
+
+
+def _clear_front_sheet(page, chosen_tap: str = "") -> str:
+    """Click the safe control on the covering sheet. Empty when nothing usable.
+
+    Name Confirm and Continue/Proceed are pressed without waiting. Paid Assured
+    sheets only clear when the traveller already chose a decline label.
+    """
+    from app.step_read import decline_tap, forward_tap, is_name_confirm, is_paid_upsell
+
+    surface = read_surface(page)
+    if not surface.get("overlay"):
+        return ""
+    hay = _surface_hay(surface)
+    label = "" if str(chosen_tap or "").startswith("__") else (chosen_tap or "").strip()
+    if not label:
+        if is_name_confirm(hay) or not is_paid_upsell(hay):
+            label = forward_tap(hay) or decline_tap(hay)
+        else:
+            label = decline_tap(hay)
+    if label and _click_label(page, label):
+        try:
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
+        return f"front_tap:{label}"
+    return "front_tap_miss"
+
+
 def _pause_unknown(
     page,
     *,
@@ -477,24 +508,24 @@ def _pause_unknown(
     step: int,
 ) -> CheckoutOutcome:
     """Stop before a guessed click. WhatsApp gets the front sheet, not the page behind it."""
+    from app.step_read import decline_tap, describe_step, forward_tap, read_step
+
     surface = read_surface(page)
     if surface.get("overlay") and str(surface.get("text") or "").strip():
         text = str(surface["text"])
     digest = str(surface.get("controls") or "") or control_digest(page)
-    from app.step_read import decline_tap, describe_step, read_step
-
-    heard = read_step(text, seller=seller, hint=hint, controls=digest)
     hay = f"{text or ''}\n{digest}"
+    heard = read_step(text, seller=seller, hint=hint, controls=digest)
     if not heard:
         heard = {
             "kind": "other",
             "what": f"a {seller} step I don't treat as a known booking screen",
             "why": "there is no fixed click for this layout",
             "recommend": "send the exact button you want, or reply yes to skip extras and continue",
-            "tap": decline_tap(hay),
+            "tap": decline_tap(hay) or forward_tap(hay),
         }
     elif not heard.get("tap"):
-        heard["tap"] = decline_tap(hay)
+        heard["tap"] = decline_tap(hay) or forward_tap(hay)
     facts["tap"] = heard.get("tap") or ""
     facts["controls"] = digest[:800]
     handoff = describe_step(heard)
@@ -929,12 +960,17 @@ def _select_saved_traveller(page, name: str = "") -> str:
                 'input[type=checkbox],[role=checkbox],input[type=radio]'
               )].filter(vis);
               const adults = boxes.filter((el) => isPerson(rowText(el)));
-              const match = (want && adults.find((el) => rowText(el).includes(want))) || (!want ? adults[0] : null);
+              const named = want
+                ? adults.filter((el) => rowText(el).includes(want))
+                : adults;
+              const pool = named.length ? named : adults;
+              const alreadyOn = pool.find((el) => el.checked || el.getAttribute('aria-checked') === 'true');
+              if (alreadyOn) return 'already';
+              const match = pool[0];
               if (!match && adults.length) return 'unticked';
               if (match) {
-                const already = match.checked || match.getAttribute('aria-checked') === 'true';
-                if (!already) match.click();
-                return already ? 'already' : 'clicked';
+                match.click();
+                return 'clicked';
               }
               const cards = [...document.querySelectorAll('label,button,div,li')].filter(vis);
               const card = cards.find((el) => {
@@ -1638,7 +1674,8 @@ def _fill_passenger_fields(page, profile: dict[str, str]) -> list[str]:
         phone = phone[2:]
     dob = (profile.get("dob") or "").strip()
     gender = (profile.get("gender") or "").strip()
-    title = {"male": "Mr", "female": "Ms"}.get(gender.lower(), "")
+    # Ixigo leaves Title blank when we skip it; the Review Details sheet then blocks Continue.
+    title = {"male": "Mr", "female": "Ms", "m": "Mr", "f": "Ms"}.get(gender.lower(), "Mr" if name else "")
     title_status, title_menu = _choose_title(page, title)
     notes = [
         f"title:{title_status}",
@@ -1851,33 +1888,53 @@ def run_checkout_agent(
             continue
         if kind == "review_continue":
             # Escape closes the Ixigo review sheet, so the Continue control disappears.
-            # A covering sheet is the step. Do not click or add a traveller behind it.
-            surface = read_surface(page)
-            if not chosen_tap and (surface.get("overlay") or _ixigo_buy_this_visible(page)):
-                return _pause_unknown(
-                    page,
-                    seller=seller,
-                    hint=hint,
-                    text=text,
-                    url=url,
-                    log=log,
-                    facts=facts,
-                    checks=checks,
-                    step=step,
-                )
-            if surface.get("overlay"):
-                from app.step_read import decline_tap
+            # Covering sheets: Confirm name checks automatically; pause only for paid extras.
+            from app.step_read import is_name_confirm, is_paid_upsell
 
-                label = "" if str(chosen_tap).startswith("__") else chosen_tap
-                if not label:
-                    label = decline_tap(f"{surface.get('text') or ''}\n{surface.get('controls') or ''}")
-                log.append(
-                    f"front_tap:{label}" if label and _click_label(page, label) else "front_tap_miss"
-                )
-                try:
-                    page.wait_for_timeout(400)
-                except Exception:
-                    pass
+            surface = read_surface(page)
+            hay = _surface_hay(surface)
+            if surface.get("overlay") or _ixigo_buy_this_visible(page):
+                paid = is_paid_upsell(hay) or _ixigo_buy_this_visible(page)
+                if paid and not chosen_tap and not is_name_confirm(hay):
+                    return _pause_unknown(
+                        page,
+                        seller=seller,
+                        hint=hint,
+                        text=text,
+                        url=url,
+                        log=log,
+                        facts=facts,
+                        checks=checks,
+                        step=step,
+                    )
+                note = _clear_front_sheet(page, chosen_tap)
+                log.append(note or "front_clear_miss")
+                if note.startswith("front_tap:"):
+                    continue
+                if paid and not chosen_tap:
+                    return _pause_unknown(
+                        page,
+                        seller=seller,
+                        hint=hint,
+                        text=text,
+                        url=url,
+                        log=log,
+                        facts=facts,
+                        checks=checks,
+                        step=step,
+                    )
+                if not note.startswith("front_tap:") and not chosen_tap:
+                    return _pause_unknown(
+                        page,
+                        seller=seller,
+                        hint=hint,
+                        text=text,
+                        url=url,
+                        log=log,
+                        facts=facts,
+                        checks=checks,
+                        step=step,
+                    )
                 continue
             # Decline paid extras and tick one saved person before Continue. Do not add another.
             log.append(_ixigo_opt_out_cancellation(page))
@@ -1893,6 +1950,10 @@ def run_checkout_agent(
                 {"login", "otp", "passenger", "addons", "pay", "error"},
                 budget_ms=6000,
             )
+            # Continue often opens a name Confirm sheet — clear it before leaving review.
+            after = _clear_front_sheet(page)
+            if after:
+                log.append(after)
             continue
         if kind == "login_phone":
             # Do not press Escape here — it closes the Ixigo login drawer.
@@ -1930,9 +1991,37 @@ def run_checkout_agent(
                 return CheckoutOutcome("otp", text, url, log, facts=facts, checks=checks, handoff=handoff)
             continue
         if kind == "fill_passenger":
+            front = _clear_front_sheet(page, chosen_tap)
+            if front.startswith("front_tap:"):
+                log.append(front)
+                continue
             saved = _select_saved_traveller(page, str(profile.get("name") or ""))
-            if saved == "behind_sheet" or saved == "traveller_unticked":
-                log.append(saved or "traveller_unticked")
+            if saved == "behind_sheet":
+                log.append(saved)
+                from app.step_read import is_name_confirm, is_paid_upsell
+
+                hay = _surface_hay(read_surface(page))
+                if is_name_confirm(hay):
+                    note = _clear_front_sheet(page)
+                    log.append(note or "name_confirm_miss")
+                    continue
+                if is_paid_upsell(hay) and not chosen_tap:
+                    return _pause_unknown(
+                        page,
+                        seller=seller,
+                        hint=hint,
+                        text=text,
+                        url=url,
+                        log=log,
+                        facts=facts,
+                        checks=checks,
+                        step=step,
+                    )
+                note = _clear_front_sheet(page, chosen_tap)
+                log.append(note or "behind_sheet_miss")
+                continue
+            if saved == "traveller_unticked":
+                log.append(saved)
                 return _pause_unknown(
                     page,
                     seller=seller,
@@ -1950,6 +2039,9 @@ def run_checkout_agent(
                 if not _safe_continue(page):
                     log.append("passenger_continue_miss")
                 _poll_ready(page, {"addons", "review", "pay", "passenger", "error"}, budget_ms=3000)
+                after = _clear_front_sheet(page)
+                if after:
+                    log.append(after)
                 continue
             notes = _fill_passenger_fields(page, profile)
             log.extend(notes)
@@ -1964,6 +2056,9 @@ def run_checkout_agent(
                     if not _safe_continue(page):
                         log.append("passenger_continue_miss")
                     _poll_ready(page, {"passenger", "addons", "pay", "review", "error"}, budget_ms=4000)
+                    after = _clear_front_sheet(page)
+                    if after:
+                        log.append(after)
                     continue
                 log.append("passenger_unfilled")
                 handoff = "Passenger form is open, but the name did not go into the fields. Nothing paid."
@@ -1980,6 +2075,9 @@ def run_checkout_agent(
             if not _safe_continue(page):
                 log.append("passenger_continue_miss")
             _poll_ready(page, {"addons", "review", "pay", "passenger", "error"}, budget_ms=3000)
+            after = _clear_front_sheet(page)
+            if after:
+                log.append(after)
             continue
         if kind == "click_time":
             card = ""

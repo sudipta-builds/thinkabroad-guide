@@ -267,7 +267,7 @@ def handle_turn(
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="👀")
     pending = state.get("pending_step") if isinstance(state.get("pending_step"), dict) else None
-    if not pending and state.get("stuck_kind") in {"addon_buy", "upsell", "other"}:
+    if not pending and state.get("stuck_kind") in {"addon_buy", "upsell", "other", "name_confirm"}:
         stuck_page = str(state.get("stuck_page") or "")
         if stuck_page:
             pending = {
@@ -2077,7 +2077,7 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             "I can't tap UPI or net banking myself. Approve that amount and say pay with card "
             "(or send a card to the vault), or say you'll pay yourself and I'll send the link."
         )
-    from app.step_read import decline_tap, describe_step, read_step
+    from app.step_read import arm_pending_step, decline_tap, describe_step, forward_tap, is_name_confirm, read_step
 
     controls = str(surface.get("controls") or "")
     if not controls and session.page is not None and not surface.get("overlay"):
@@ -2087,13 +2087,20 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             controls = control_digest(session.page)
         except Exception:
             controls = ""
-    heard = read_step(page, seller=seller, hint=which, controls=controls)
     hay = f"{page or ''}\n{controls}"
+    if is_name_confirm(hay):
+        arm_pending_step(state, hay, "name_confirm", tap=forward_tap(hay) or "Confirm")
+        return _stuck_line(
+            state,
+            "name_confirm",
+            f"{seller} name check for the {which}",
+            "Review Details wants Confirm — that is not payment",
+            "reply yes or confirm and I'll press Confirm, then move toward add-ons",
+        )
+    heard = read_step(page, seller=seller, hint=which, controls=controls)
     if heard and heard.get("kind") in {"upsell", "other"}:
-        tap = heard.get("tap") or decline_tap(hay)
+        tap = heard.get("tap") or decline_tap(hay) or forward_tap(hay)
         heard["tap"] = tap
-        from app.step_read import arm_pending_step
-
         arm_pending_step(state, hay, heard.get("kind") or "other", tap=tap)
         state["stuck_kind"] = heard.get("kind") or "other"
         spoken = describe_step(heard)
@@ -2143,8 +2150,6 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         )
     offer = _addon_upsell(page)
     if offer:
-        from app.step_read import arm_pending_step, decline_tap
-
         if offer == "radio":
             cta = "I don't want Free Cancellation vs Assured"
             rec = (
@@ -2333,9 +2338,23 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), text, _Session())  # type: ignore[arg-type]
     elif waiting:
         spoken = waiting
+    elif filled and re.search(r"review details", text or "", re.I) and re.search(r"\bconfirm\b", text or "", re.I):
+        from app.step_read import arm_pending_step
+
+        arm_pending_step(state, text, "name_confirm", tap="Confirm")
+        spoken = _stuck_line(
+            state,
+            "name_confirm",
+            f"{label} name check for {str(state.get('selected_hint') or 'that flight')}",
+            "Review Details is open — Confirm is not payment",
+            "reply yes or confirm and I'll press Confirm, then continue to add-ons",
+        )
     elif filled:
         state.pop("stuck_kind", None)
-        spoken = f"Filled your details for {str(state.get('selected_hint') or 'that flight')} on {label}. I stopped before payment."
+        spoken = (
+            f"Filled your details for {str(state.get('selected_hint') or 'that flight')} on {label}. "
+            "Say go on if the page is still on travellers, or wait for the add-ons / payment screenshot. Nothing paid."
+        )
     else:
         spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), text, _Session())  # type: ignore[arg-type]
     if re.search(r"\bupi\b|pay now|card number|pay to complete|net banking", text, re.I):

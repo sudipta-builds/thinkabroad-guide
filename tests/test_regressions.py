@@ -316,6 +316,10 @@ class DateAndMemory(unittest.TestCase):
         self.assertEqual(accept_choice("yes", {"tap": "", "page": page, "kind": "upsell"}), "Not this time")
         self.assertEqual(
             accept_choice("yes", {"tap": "", "page": "Fare Summary Continue Traveller Details", "kind": "upsell"}),
+            "Continue",
+        )
+        self.assertEqual(
+            accept_choice("yes", {"tap": "", "page": "Fare Summary Traveller Details", "kind": "upsell"}),
             "__recommended__",
         )
         radio = "Add Free Cancellation I don't want Free Cancellation Assured Continue Mr Sudipta Saikia"
@@ -326,6 +330,13 @@ class DateAndMemory(unittest.TestCase):
             accept_choice("Click 'No thanks'", {"tap": "", "page": "Free Cancellation No Thanks Secure My Trip", "kind": "addon_buy"}),
             "No Thanks",
         )
+        confirm_page = "Review Details Please ensure that your name matches your govt ID Confirm Edit Mr Sudipta"
+        self.assertEqual(accept_choice("confirm", {"tap": "", "page": confirm_page, "kind": "name_confirm"}), "Confirm")
+        from app.step_read import forward_tap, is_name_confirm, is_paid_upsell
+
+        self.assertTrue(is_name_confirm(confirm_page))
+        self.assertFalse(is_paid_upsell(confirm_page))
+        self.assertEqual(forward_tap(confirm_page), "Confirm")
         from app.step_read import arm_pending_step, choice_phrase
 
         self.assertEqual(choice_phrase("Click 'No thanks'"), "No thanks")
@@ -442,9 +453,12 @@ class DateAndMemory(unittest.TestCase):
         )
         self.assertIn("No, Thanks", spoken)
         self.assertNotIn("I don't want Free Cancellation vs", spoken)
-        fill = inspect.getsource(run_checkout_agent).split('if kind == "fill_passenger"')[1][:1600]
+        fill = inspect.getsource(run_checkout_agent).split('if kind == "fill_passenger"')[1][:2800]
+        self.assertIn("kept_saved_traveller", fill)
+        self.assertIn("_fill_passenger_fields", fill)
         self.assertLess(fill.index("kept_saved_traveller"), fill.index("_fill_passenger_fields"))
         self.assertIn("behind_sheet", fill)
+        self.assertIn("_clear_front_sheet", fill)
 
     def test_checkout_links_stay_out_of_whatsapp(self) -> None:
         from app.travel_agent import _clean, _hide_checkout_link, _usable_reply
@@ -1613,12 +1627,14 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn('sum(1 for line in log if "review_continue" in line) < 3', review)
         self.assertNotIn('{"action": "done", "target": "review"', review)
         self.assertNotIn("_dismiss_overlays(page)", review.split("review_continue")[1][:700])
-        handler = review.split('if kind == "review_continue"')[1][:2200]
-        self.assertEqual(handler.count("_safe_continue(page)"), 1)
+        handler = review.split('if kind == "review_continue"')[1][:3500]
+        self.assertGreaterEqual(handler.count("_safe_continue(page)"), 1)
         self.assertIn("_ixigo_opt_out_cancellation", handler)
         self.assertIn("_select_saved_traveller", handler)
         self.assertIn("_ixigo_buy_this_visible", handler)
         self.assertIn("_pause_unknown", handler)
+        self.assertIn("_clear_front_sheet", handler)
+        self.assertIn("is_name_confirm", handler)
         self.assertLess(handler.index("_select_saved_traveller"), handler.index("_safe_continue(page)"))
         self.assertLess(handler.index("_pause_unknown"), handler.index("_safe_continue(page)"))
 

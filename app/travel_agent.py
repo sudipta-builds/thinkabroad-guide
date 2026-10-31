@@ -245,6 +245,10 @@ def handle_turn(
     changed = _trip_changed(before, state)
     if changed:
         state.pop("options", None)
+        state.pop("last_shot", None)
+        state.pop("last_vision", None)
+        state.pop("stuck_page", None)
+        state.pop("pending_step", None)
         if not named_seller_from(text):
             state.pop("seller", None)
         _save(phone, state)
@@ -274,66 +278,69 @@ def handle_turn(
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="👀")
     from app.step_read import arm_pending_step
-    from app.turn_loop import format_turn_reply, interpret_turn
+    from app.turn_loop import align_action, format_turn_reply
 
-    turn = interpret_turn(text, state)
-    state["last_turn"] = {k: turn.get(k) for k in ("goal", "intent", "kind", "tap", "source")}
-    goal = str(turn.get("goal") or "")
-    tap = str(turn.get("tap") or "")
-    if turn.get("intent"):
-        kind = str(turn["intent"])
+    plan = align_action(text, state)
+    turn = plan.get("turn") if isinstance(plan.get("turn"), dict) else {}
+    state["last_turn"] = {
+        "do": plan.get("do"),
+        "kind": plan.get("kind"),
+        "tap": plan.get("tap"),
+        "intent": turn.get("intent"),
+        "sheet": turn.get("kind"),
+        "source": turn.get("source"),
+    }
     if turn.get("kind"):
         state["stuck_kind"] = str(turn["kind"])
-    if tap and kind in {"book", "select"}:
+    do = str(plan.get("do") or "")
+    tap = str(plan.get("tap") or "")
+    kind = str(plan.get("kind") or kind)
+    if tap:
         state["chosen_tap"] = tap
         state.pop("pending_step", None)
-    live_sheet = bool(
-        state.get("last_shot")
-        or state.get("stuck_page")
-        or (isinstance(state.get("last_vision"), dict) and state["last_vision"].get("kind"))
-        or _mid_booking(state)
-    )
-    if (kind == "status" or goal == "ask") and live_sheet:
+    if do == "reply":
         if tap:
             arm_pending_step(state, str(state.get("stuck_page") or ""), str(turn.get("kind") or "other"), tap=tap)
-        spoken = format_turn_reply(turn)
+        spoken = str(plan.get("reply") or format_turn_reply(turn))
         state["last_stuck"] = spoken
         _save(phone, state)
         db.add_message(phone, "assistant", spoken)
         return Reply.of(spoken, emoji="👀")
-    if kind in {"status", "chat", "select"} and not live_sheet and state.get("origin") and state.get("destination") and state.get("depart"):
-        kind = "search"
-    if goal in {"skip", "forward"}:
-        kind = "book"
-        if tap:
-            state["chosen_tap"] = tap
-        state.pop("pending_step", None)
-        _save(phone, state)
-    pending = state.get("pending_step") if isinstance(state.get("pending_step"), dict) else None
-    if pending and kind not in {"details", "pay", "cancel", "search", "status", "book"}:
-        from app.step_read import accept_choice
-
-        picked = accept_choice(text, pending)
-        if picked:
-            state["chosen_tap"] = picked
-            state.pop("pending_step", None)
-            _save(phone, state)
-            kind = "book"
-    cached = _cached_fares_reply(state, text, kind)
-    if cached:
-        db.add_message(phone, "assistant", cached)
-        return Reply.of(cached, emoji="✈️")
-    if kind == "details":
+    if do == "ask_trip":
+        reply = "Where are you flying from and to?"
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply, emoji="🤔")
+    if do == "pay_self":
+        reply = _pay_link_reply(state)
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply, emoji="💳")
+    if do == "pay_stop":
+        reply = "I stop before payment. Say pay with card if you want me to fill the card, or say you'll pay yourself. Nothing paid."
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply, emoji="💳")
+    if do == "details":
         waiting = _form_ask_if_needed(state)
         if waiting:
             state.pop("busy_at", None)
             _save(phone, state)
             db.add_message(phone, "assistant", waiting)
             return Reply.of(waiting, emoji="📝")
-        if _sheet_kind(state) in {"addons", "upsell", "review", "fare_sheet"}:
-            kind = "book"
-            state["chosen_tap"] = str(state.get("chosen_tap") or tap or "Skip add-ons")
-            _save(phone, state)
+        kind = "book"
+        state["chosen_tap"] = tap or str(state.get("chosen_tap") or "Skip add-ons")
+        _save(phone, state)
+    if do == "search":
+        kind = "search"
+        _save(phone, state)
+    if do == "book":
+        kind = str(plan.get("kind") or "book")
+        if tap:
+            state["chosen_tap"] = tap
+        state.pop("pending_step", None)
+        _save(phone, state)
+    cached = _cached_fares_reply(state, text, kind)
+    if cached and do not in {"search", "book"}:
+        db.add_message(phone, "assistant", cached)
+        return Reply.of(cached, emoji="✈️")
     if kind in _BOOKING and _should_browse(state, text, busy=busy, changed=changed):
         from app.kernel_otp import kernel_configured
 

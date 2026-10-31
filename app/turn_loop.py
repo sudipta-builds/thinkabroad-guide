@@ -279,3 +279,73 @@ def format_turn_reply(turn: dict[str, Any]) -> str:
     tap = turn.get("tap") or ""
     nxt = f" Reply yes and I'll press {tap}." if tap else ""
     return f"On screen: {what}. I recommend {rec}.{nxt} Nothing paid."
+
+
+def has_live_facts(state: dict[str, Any]) -> bool:
+    """True when this booking has a screenshot or a vision read of that page."""
+    if _shot_from(state):
+        return True
+    vision = state.get("last_vision") if isinstance(state.get("last_vision"), dict) else {}
+    return bool(vision.get("kind"))
+
+
+def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Bind intent + page facts to one action. Empty facts cannot mean 'results are ready'."""
+    turn = turn or interpret_turn(text, state)
+    vision = state.get("last_vision") if isinstance(state.get("last_vision"), dict) else {}
+    sheet = str(turn.get("kind") or vision.get("kind") or "")
+    intent = str(turn.get("intent") or "")
+    goal = str(turn.get("goal") or "")
+    tap = str(turn.get("tap") or "")
+    live = has_live_facts(state)
+    trip = bool(state.get("origin") and state.get("destination") and state.get("depart"))
+    clock = bool(re.search(r"\b\d{1,2}[:.]\d{2}\b", text or ""))
+
+    if intent == "cancel" or goal == "stop":
+        return {"do": "reply", "kind": "cancel", "tap": "", "turn": turn, "reply": turn.get("reply") or ""}
+    if intent == "pay_self":
+        return {"do": "pay_self", "kind": "pay_self", "tap": "", "turn": turn, "reply": ""}
+    if intent == "pay":
+        return {"do": "pay_stop", "kind": "pay", "tap": "", "turn": turn, "reply": ""}
+
+    if not live:
+        if trip:
+            return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
+        return {"do": "ask_trip", "kind": "search", "tap": "", "turn": turn, "reply": turn.get("reply") or ""}
+
+    if sheet in {"results", "loading"}:
+        if clock or intent in {"select", "book"} or goal == "forward":
+            return {"do": "book", "kind": "select" if clock else "book", "tap": tap, "turn": turn, "reply": ""}
+        if intent == "status" or goal == "ask":
+            return {"do": "reply", "kind": "status", "tap": tap, "turn": turn, "reply": format_turn_reply(turn)}
+        return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
+
+    if sheet in {"addons", "upsell", "review", "fare_sheet"}:
+        if intent == "status" or goal == "ask":
+            return {"do": "reply", "kind": "status", "tap": tap, "turn": turn, "reply": format_turn_reply(turn)}
+        if not tap:
+            tap = "Skip add-ons" if sheet == "addons" else "Continue"
+        return {"do": "book", "kind": "book", "tap": tap, "turn": turn, "reply": ""}
+
+    if sheet in {"form", "passenger"} or intent == "details":
+        if sheet in {"addons", "upsell", "review", "fare_sheet"}:
+            return {
+                "do": "book",
+                "kind": "book",
+                "tap": tap or "Skip add-ons",
+                "turn": turn,
+                "reply": "",
+            }
+        return {"do": "details", "kind": "details", "tap": tap, "turn": turn, "reply": ""}
+
+    if sheet == "pay":
+        return {"do": "pay_stop", "kind": "pay", "tap": "", "turn": turn, "reply": ""}
+
+    if intent in {"book", "select"} or goal in {"skip", "forward"}:
+        return {"do": "book", "kind": "book", "tap": tap, "turn": turn, "reply": ""}
+    if trip and intent in {"search", ""}:
+        return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
+    if intent == "status" or goal == "ask":
+        return {"do": "reply", "kind": "status", "tap": tap, "turn": turn, "reply": format_turn_reply(turn)}
+    return {"do": "reply", "kind": intent or "chat", "tap": tap, "turn": turn, "reply": format_turn_reply(turn)}
+

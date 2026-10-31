@@ -1411,25 +1411,69 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("Skip add-ons", saved.get("tap") or "")
         self.assertEqual(extract_user_ask("18:20", addons).get("tap"), "")
         src = inspect.getsource(handle_turn)
-        self.assertIn("interpret_turn", src)
+        self.assertIn("align_action", src)
         self.assertIn("_form_ask_if_needed", src)
-        self.assertLess(src.index("interpret_turn"), src.index("_form_ask_if_needed"))
+        self.assertLess(src.index("align_action"), src.index("_form_ask_if_needed"))
         self.assertNotIn('kind not in {"details", "pay", "cancel", "pay_self"}', src)
         self.assertNotIn('Reply yes and I\'ll press {tap}', src)
         deliver = inspect.getsource(__import__("app.travel_agent", fromlist=["_deliver_signed_in_page"])._deliver_signed_in_page)
         self.assertIn("_form_ask_if_needed", deliver)
         self.assertIn('"addons"', deliver)
+        from app.turn_loop import align_action
+
         fresh = interpret_turn(
             "Ghy to Delhi 4th December",
             {"origin": "Guwahati", "destination": "Delhi", "depart": "2026-12-04"},
         )
         self.assertEqual(fresh.get("intent") or "search", "search")
         self.assertNotRegex((fresh.get("reply") or "").lower(), r"select your preferred")
+        opened = align_action(
+            "Ghy to Delhi 4th December",
+            {"origin": "Guwahati", "destination": "Delhi", "depart": "2026-12-04"},
+        )
+        self.assertEqual(opened["do"], "search")
+        skip = align_action("Sudipta Saikia, Male", addons)
+        self.assertEqual(skip["do"], "book")
+        self.assertIn("Skip add-ons", skip.get("tap") or "")
         src = inspect.getsource(handle_turn)
-        self.assertIn("live_sheet", src)
+        self.assertIn("align_action", src)
         brain = inspect.getsource(converse)
         self.assertIn("gemini_chat", brain)
         self.assertNotIn("deepseek", brain.lower())
+
+    def test_intent_facts_action_stay_aligned(self) -> None:
+        import inspect
+
+        from app.travel_agent import handle_turn
+        from app.turn_loop import align_action, has_live_facts
+
+        trip = {"origin": "Guwahati", "destination": "Delhi", "depart": "2026-12-04"}
+        self.assertFalse(has_live_facts(trip))
+        self.assertEqual(align_action("Ghy to Delhi 4th December", trip)["do"], "search")
+        self.assertEqual(align_action("Hii", {})["do"], "ask_trip")
+        results = {
+            **trip,
+            "last_vision": {"kind": "results", "what": "fare list", "tap": "", "facts": ["12:30"]},
+            "selected_hint": "",
+        }
+        self.assertTrue(has_live_facts(results))
+        pick = align_action("12:30", results)
+        self.assertEqual(pick["do"], "book")
+        addons = {
+            **trip,
+            "last_vision": {"kind": "addons", "what": "seat map", "tap": "Skip add-ons", "facts": []},
+            "stuck_page": "Choose add-ons Skip add-ons",
+        }
+        skip = align_action("skip", addons)
+        self.assertEqual(skip["do"], "book")
+        self.assertIn("Skip add-ons", skip.get("tap") or "")
+        nxt = align_action("what to do next?", addons)
+        self.assertEqual(nxt["do"], "reply")
+        src = inspect.getsource(handle_turn)
+        self.assertIn("align_action", src)
+        self.assertIn('do == "search"', src)
+        self.assertIn('do == "book"', src)
+        self.assertIn("last_vision", inspect.getsource(handle_turn).split("if changed:")[1][:400])
 
     def test_addons_yes_arms_skip_and_checkout_leaves(self) -> None:
         import inspect

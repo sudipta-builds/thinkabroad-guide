@@ -149,12 +149,15 @@ def format_contract_stuck(contract: dict[str, Any], *, which: str = "that flight
 
 
 def left_addons(page: str, stage: str = "") -> bool:
-    """True when Choose add-ons / seat map is no longer the step."""
-    if (stage or "") in {"review", "passenger", "pay", "login", "otp", "error", "unavailable"}:
-        return True
+    """True when Choose add-ons / seat map is no longer the step.
+
+    Page text wins over a stage name. Vision calling this sheet review does not mean it closed.
+    """
     hay = page or ""
     if re.search(r"choose add-ons|add seats|seat map|missed adding meal", hay, re.I):
         return False
-    if re.search(r"skip add-?ons", hay, re.I) and re.search(r"add meal|extra baggage", hay, re.I):
+    if re.search(r"skip add-?ons", hay, re.I) and re.search(r"add meal|extra baggage|choose add-ons", hay, re.I):
         return False
-    return True
+    if (stage or "") in {"review", "passenger", "pay", "login", "otp", "error", "unavailable"}:
+        return True
+    return (stage or "") not in {"addons", ""}

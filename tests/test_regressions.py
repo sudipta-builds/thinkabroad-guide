@@ -1375,6 +1375,72 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertRegex(reply.lower(), r"seat")
         self.assertRegex(reply.lower(), r"skip add-ons")
         self.assertNotIn("exact button", reply.lower())
+        self.assertNotIn("haven't tapped", reply.lower())
+        self.assertNotIn("trip protect", reply.lower())
+        self.assertFalse(left_addons(page, "review"))
+
+    def test_yes_and_decline_press_skip_on_addons(self) -> None:
+        from app.step_read import addons_sheet, decide_front
+        from app.travel_agent import extract_user_ask
+        from app.turn_loop import align_action
+
+        page = "Choose add-ons No meal, additional check-in baggage and seats selected Skip add-ons"
+        self.assertTrue(addons_sheet(page))
+        decision = decide_front(page, "", seller="cleartrip", hint="10:45")
+        self.assertEqual(decision["kind"], "addons")
+        self.assertEqual(decision["action"], "click")
+        self.assertIn("Skip add-ons", decision.get("tap") or "")
+        state = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "stuck_page": "Reply yes and I'll press No, I will continue without Trip Protect. " + page,
+            "last_vision": {"kind": "upsell", "what": "Trip Protect", "tap": "Continue"},
+            "stuck_kind": "upsell",
+        }
+        asked = extract_user_ask("yes", state)
+        self.assertEqual(asked.get("goal"), "skip")
+        self.assertEqual(asked.get("tap"), "")
+        self.assertEqual(extract_user_ask("Decline", state).get("goal"), "skip")
+        yes = align_action("yes", {**state, "last_vision": {"kind": "addons", "tap": "Skip add-ons"}, "stuck_page": page})
+        decline = align_action("Decline", {**state, "stuck_page": page, "last_vision": {"kind": "addons", "tap": ""}})
+        self.assertEqual(yes["do"], "book")
+        self.assertIn("Skip add-ons", yes.get("tap") or "")
+        self.assertEqual(decline["do"], "book")
+        self.assertIn("Skip add-ons", decline.get("tap") or "")
+
+    def test_skip_click_leaves_addons_for_the_next_step(self) -> None:
+        """Smoke: a late-painted Skip is clicked and the sheet actually changes."""
+        from playwright.sync_api import sync_playwright
+
+        from app.page_agent import _leave_addons, classify_page
+
+        html = """<!doctype html><html><body>
+        <h1>Choose add-ons</h1>
+        <div id="box" style="background:#ddd;width:420px;height:240px"></div>
+        <script>
+          setTimeout(() => {
+            document.getElementById('box').outerHTML =
+              '<p>No meal, additional check-in baggage and seats selected</p>' +
+              '<button id="skip" style="width:180px;height:44px">Skip add-ons</button>';
+            document.getElementById('skip').onclick = () => {
+              document.body.innerHTML = '<h1>Review your itinerary</h1><p>Fare summary Total Amount Continue</p>';
+            };
+          }, 900);
+        </script></body></html>"""
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            page.set_content(html)
+            log: list[str] = []
+            ok = _leave_addons(page, log, rounds=3)
+            text = page.inner_text("body")
+            stage = classify_page(text, "https://www.cleartrip.com/flights/itinerary/addons")
+            browser.close()
+        self.assertTrue(ok, log)
+        self.assertNotIn("Choose add-ons", text)
+        self.assertIn("Review", text)
+        self.assertNotEqual(stage, "addons")
 
     def test_one_gemini_turn_names_wish_not_pending_skip(self) -> None:
         import inspect

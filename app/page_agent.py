@@ -1197,10 +1197,54 @@ def _skip_addons(page) -> str:
     return clicked
 
 
+def settle_visible_sheet(page, budget_ms: int = 8000) -> None:
+    """Wait until Choose add-ons has painted Skip, and scroll that control into view.
+
+    A gray skeleton is not a screenshot. Header and fare rail can be ready while Skip is still missing.
+    """
+    from app.step_read import addons_sheet
+
+    deadline = time.monotonic() + max(0.5, budget_ms / 1000)
+    while time.monotonic() < deadline:
+        try:
+            text, _url = _read(page)
+        except Exception:
+            return
+        if not addons_sheet(text):
+            return
+        try:
+            found = page.evaluate(
+                """() => {
+                  const nodes = [...document.querySelectorAll('button, a, [role="button"], span, div')];
+                  const hit = nodes.find(n => /skip add-?ons|continue without add-?ons/i.test((n.innerText || '').trim())
+                    && (n.innerText || '').trim().length < 40);
+                  if (!hit) return false;
+                  hit.scrollIntoView({block: 'center', inline: 'nearest'});
+                  return true;
+                }"""
+            )
+        except Exception:
+            return
+        if found:
+            try:
+                page.wait_for_timeout(350)
+            except Exception:
+                pass
+            return
+        try:
+            page.wait_for_timeout(400)
+        except Exception:
+            return
+
+
 def _leave_addons(page, log: list[str], *, rounds: int = 3) -> bool:
     """Outcome loop: skip extras until Choose add-ons is gone."""
     from app.step_contract import left_addons
 
+    try:
+        settle_visible_sheet(page)
+    except Exception:
+        log.append("addons_settle_err")
     for i in range(rounds):
         text, url = _read(page)
         try:
@@ -2180,26 +2224,10 @@ def run_checkout_agent(
             text, url, stage, facts = _snapshot()
             tap_pending = ""
             if not left or stage == "addons":
-                try:
-                    from app.vision_agent import capture_page_shot, classify_with_vision, vision_enabled
-
-                    if vision_enabled():
-                        shot = capture_page_shot(page)
-                        if shot:
-                            new_stage, vision_seen = classify_with_vision(
-                                stage, shot, seller=seller, hint=hint, page_text=text
-                            )
-                            kind = (vision_seen or {}).get("kind") or ""
-                            log.append(f"addons_fast_vision:{kind}:{new_stage}")
-                            if new_stage and new_stage != "addons":
-                                stage = new_stage
-                                left = True
-                            try:
-                                Path(shot).unlink(missing_ok=True)
-                            except Exception:
-                                pass
-                except Exception:
-                    log.append("addons_fast_vision_err")
+                # Vision must not report success while Choose add-ons is still the DOM step.
+                text, url, stage, facts = _snapshot()
+                left = stage != "addons" and not re.search(r"choose add-ons|add seats|missed adding meal", text or "", re.I)
+                log.append(f"addons_fast_dom:{stage}")
             if left and stage != "addons":
                 log.append(f"addons_fast_left:{stage}")
             else:

@@ -56,6 +56,22 @@ def step_read_enabled() -> bool:
     return bool(get_settings().llm_ready)
 
 
+_ADDONS_SHEET = re.compile(
+    r"choose add-ons|choose your seat|add seats|missed adding meal|skip add-?ons|"
+    r"no meal, additional|extra baggage",
+    re.I,
+)
+_AGREE_ONLY = re.compile(
+    r"^(yes|yep|yeah|ok|okay|sure|decline|skip|skip add-ons|skip addons|no thanks|no, thanks)$",
+    re.I,
+)
+
+
+def addons_sheet(page: str) -> bool:
+    """Choose add-ons / seats / bags. A later sentence cannot rename this sheet."""
+    return bool(_ADDONS_SHEET.search(page or ""))
+
+
 def decline_tap(page: str) -> str:
     """The skip/decline control actually written on this page. Empty when none."""
     match = _DECLINE.search(page or "")
@@ -320,19 +336,11 @@ def decide_front(
             "why": "Books and prices are on screen",
             "recommend": f"reply with a departure time{(f' like {hint}' if hint else '')} and I'll Book that row",
         }
-    # Vision already named a non-addons sheet — do not keep Skip from leftover DOM copy.
-    skip_addons_regex = (
-        stage == "addons"
-        or (
-            vision_kind in {"", "addons"}
-            and re.search(
-                r"skip add-?ons|missed adding meal|choose add-ons|choose your seat|add meal|extra baggage|add seats",
-                hay,
-                re.I,
-            )
-        )
-    ) and not re.search(r"secure my trip|assure my trip|buy this", hay, re.I)
-    if skip_addons_regex and vision_kind not in {"upsell", "review", "form", "pay", "results", "unavailable"}:
+    # Page text wins. A vision label of insurance cannot rename Choose add-ons.
+    skip_addons_regex = (stage == "addons" or addons_sheet(hay)) and not re.search(
+        r"secure my trip|assure my trip|buy this", hay, re.I
+    )
+    if skip_addons_regex:
         from app.step_contract import build_contract
 
         contract = build_contract(hay, stage="addons", seller=seller, hint=hint, user_goal="skip")

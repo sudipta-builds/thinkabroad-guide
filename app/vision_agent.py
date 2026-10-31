@@ -137,6 +137,16 @@ def see_step(
     if out["kind"] == "addons" and not out["tap"]:
         out["tap"] = "Skip add-ons"
         out["auto"] = "1"
+    from app.step_read import addons_sheet
+
+    if addons_sheet(page_text):
+        out["kind"] = "addons"
+        out["seat_map"] = True
+        out["what"] = "Choose add-ons"
+        out["why"] = "seats and bags are optional"
+        out["recommend"] = "press Skip add-ons"
+        out["tap"] = "Skip add-ons"
+        out["auto"] = "1"
     return out
 
 
@@ -151,6 +161,12 @@ def capture_page_shot(page) -> str:
         fd, name = tempfile.mkstemp(prefix="guide-vision-", suffix=".png")
         os.close(fd)
         # Keep the empty file so Windows allows Playwright to overwrite the path.
+        try:
+            from app.page_agent import settle_visible_sheet
+
+            settle_visible_sheet(page)
+        except Exception:
+            pass
         page.screenshot(path=name, full_page=False, timeout=12000, type="png")
         path = Path(name)
         if path.is_file() and path.stat().st_size > 200:
@@ -197,6 +213,13 @@ def classify_with_vision(
         "fare_sheet": "fare_sheet",
     }
     mapped = stage_map.get(kind, dom_stage)
+    from app.step_read import addons_sheet
+
+    if addons_sheet(page_text) or seen.get("kind") == "addons" or seen.get("seat_map"):
+        seen["kind"] = "addons"
+        seen["tap"] = "Skip add-ons"
+        seen["auto"] = "1"
+        return "addons", seen
     if seen.get("sold_out"):
         return "unavailable", seen
     if seen.get("fares_visible") and mapped == "results":

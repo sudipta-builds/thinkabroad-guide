@@ -815,7 +815,12 @@ def begin_login(
 def _shot(page, seller: str, session_id: str, tag: str) -> str:
     try:
         from app.media_files import ensure_media_dir
+        from app.page_agent import settle_visible_sheet
 
+        try:
+            settle_visible_sheet(page)
+        except Exception:
+            pass
         dest = ensure_media_dir() / f"{tag}-{seller}-{session_id[:8]}.jpg"
         page.screenshot(path=str(dest), type="jpeg", quality=55)
         return str(dest)

@@ -567,6 +567,14 @@ def extract_user_ask(text: str, state: dict[str, Any]) -> dict[str, str]:
     if pending:
         page = str(pending.get("page") or "")
     page = page or str(state.get("stuck_page") or "")
+    if re.fullmatch(
+        r"yes|yep|yeah|ok|okay|sure|decline|skip|skip add-ons|skip addons|no thanks|no, thanks",
+        raw,
+        re.I,
+    ):
+        out["intent"] = "book"
+        out["goal"] = "skip"
+        return out
     phrase = choice_phrase(raw)
     clock_only = bool(re.fullmatch(r"\d{1,2}:\d{2}", phrase))
     if (not clock_only) and (
@@ -2386,6 +2394,16 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         except Exception:
             controls = ""
     hay = f"{page or ''}\n{controls}"
+    from app.step_read import addons_sheet
+
+    if shown == "addons" or addons_sheet(hay):
+        return _stuck_line(
+            state,
+            "addons",
+            f"Choose add-ons for the {which} on {trip}",
+            "seats and bags are optional",
+            "I'll press Skip add-ons",
+        )
     # Results / sold-out are owned above — never fall through to "exact button".
     if shown not in {"results", "loading", "unavailable", "home", "cookie", "pay", "otp", "login"} and (
         surface.get("overlay")

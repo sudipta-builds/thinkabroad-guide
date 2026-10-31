@@ -234,15 +234,19 @@ def _local_turn(text: str, page: str, state: dict[str, Any]) -> dict[str, Any]:
             "facts": [],
             "source": "local",
         }
-    if re.search(r"\bskip\b", raw, re.I):
+    if re.search(r"\b(skip|decline)\b", raw, re.I):
+        from app.step_read import addons_sheet
+
+        on_addons = kind == "addons" or addons_sheet(hay)
+        label = "Skip add-ons" if on_addons else (tap or "Continue")
         return {
             "goal": "skip",
             "intent": "book",
-            "kind": kind or "addons",
+            "kind": "addons" if on_addons else (kind or "other"),
             "what": "skip extras",
             "why": "you asked to skip",
-            "recommend": "press Skip add-ons if that sheet is open, otherwise Continue",
-            "tap": tap or ("Skip add-ons" if re.search(r"skip add", hay, re.I) else "Continue"),
+            "recommend": f"press {label}",
+            "tap": label,
             "auto": "1",
             "reply": "Skipping extras and moving forward. Nothing paid.",
             "facts": [],
@@ -252,8 +256,10 @@ def _local_turn(text: str, page: str, state: dict[str, Any]) -> dict[str, Any]:
         r"yes|yep|yeah|ok|okay", raw, re.I
     ):
         pending = state.get("pending_step") if isinstance(state.get("pending_step"), dict) else {}
+        from app.step_read import addons_sheet
+
         label = tap or str(pending.get("tap") or "") or "Continue"
-        if kind == "addons" and re.search(r"skip add", hay, re.I) and re.fullmatch(r"yes|yep|yeah|ok|okay", raw, re.I):
+        if (kind == "addons" or addons_sheet(hay)) and re.fullmatch(r"yes|yep|yeah|ok|okay", raw, re.I):
             label = "Skip add-ons"
         return {
             "goal": "forward",

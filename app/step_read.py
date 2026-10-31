@@ -36,7 +36,7 @@ _SPEND = re.compile(
 )
 _DECLINE = re.compile(
     r"(I don'?t want Free Cancellation|No,? Thanks|Not this time|Continue without(?: add-?ons)?|"
-    r"Skip (?:add-?ons|this)|I don'?t want|Not now|Maybe later)",
+    r"Skip add-?ons|Skip this|I don'?t want|Not now|Maybe later)",
     re.I,
 )
 _AGREE = re.compile(
@@ -309,6 +309,40 @@ def decide_front(
             "what": "the fare list",
             "why": "Books and prices are on screen",
             "recommend": f"reply with a departure time{(f' like {hint}' if hint else '')} and I'll Book that row",
+        }
+    # Cleartrip/Ixigo optional seats/meals — skip without asking every loop.
+    if (
+        stage == "addons"
+        or re.search(
+            r"skip add-?ons|missed adding meal|choose add-ons|choose your seat|add meal|extra baggage|add seats",
+            hay,
+            re.I,
+        )
+    ) and not re.search(r"secure my trip|assure my trip|buy this", hay, re.I):
+        from app.step_contract import build_contract
+
+        contract = build_contract(hay, stage="addons", seller=seller, hint=hint, user_goal="skip")
+        tap = (
+            decline_tap(hay)
+            or safe_tap("Skip add-ons", hay)
+            or safe_tap("Skip add ons", hay)
+            or safe_tap("Continue without add-ons", hay)
+            or contract.get("tap")
+            or "Skip add-ons"
+        )
+        fact_bit = "; ".join(contract.get("facts") or []) or "optional seats/meals/bags"
+        # If the traveller already chose a tap/yes, click; otherwise still auto-skip extras.
+        action = "click"
+        if raw_choice and _SPEND.search(raw_choice):
+            action = "ask"
+            tap = ""
+        return {
+            "action": action,
+            "tap": tap,
+            "kind": "addons",
+            "what": f"optional add-ons ({fact_bit})",
+            "why": "extras are not required to finish the booking",
+            "recommend": str(contract.get("recommend") or f"I'll press {tap}"),
         }
 
     heard = read_step(page, seller=seller, hint=hint, controls=controls, image_path=image_path)

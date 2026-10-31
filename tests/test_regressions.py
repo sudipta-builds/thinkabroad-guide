@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import unittest
 
@@ -1297,6 +1298,60 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("confirm_fare", smoke)
         self.assertIn("after_book", smoke)
         self.assertIn("without fare follow-through", smoke)
+
+    def test_addons_contract_mentions_seats_and_skips(self) -> None:
+        from app.step_contract import build_contract, format_contract_stuck, left_addons
+        from app.travel_agent import _booking_page_reply
+
+        page = (
+            "Choose add-ons No meal, additional check-in baggage and seats selected. "
+            "Add seats Seats are cheaper when pre-booked. Onward GAU -> DEL No seat added. "
+            "Add delicious meals 0/1 selected Skip add-ons Base fare ₹8,241"
+        )
+        contract = build_contract(page, stage="addons", seller="Cleartrip", hint="18:20", user_goal="skip")
+        self.assertEqual(contract["stage"], "addons")
+        self.assertEqual(contract["action"], "skip_extras")
+        self.assertFalse(contract["requires_user"])
+        self.assertTrue(any(re.search(r"seat", f, re.I) for f in contract["facts"]))
+        spoken = format_contract_stuck(contract, which="18:20")
+        self.assertRegex(spoken.lower(), r"seat")
+        self.assertFalse(left_addons(page, "addons"))
+        self.assertTrue(left_addons("Review Details Continue Fare Summary", "review"))
+
+        reply = _booking_page_reply(
+            {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-11-15",
+                "seller": "cleartrip",
+                "selected_hint": "18:20",
+            },
+            "18:20",
+            page,
+            type("S", (), {"page": None})(),
+        )
+        self.assertRegex(reply.lower(), r"seat")
+        self.assertRegex(reply.lower(), r"skip add-ons")
+        self.assertNotIn("exact button", reply.lower())
+
+    def test_addons_yes_arms_skip_and_checkout_leaves(self) -> None:
+        import inspect
+        import re as _re
+
+        from app.page_agent import deterministic_action, run_checkout_agent
+        from app.step_read import accept_choice, decide_front
+
+        page = "Choose add-ons Add seats No seat added Skip add-ons missed adding Meal(s) and Seat(s)"
+        self.assertEqual(
+            accept_choice("yes", {"tap": "Skip add-ons", "page": page, "kind": "addons"}),
+            "Skip add-ons",
+        )
+        self.assertEqual(deterministic_action("addons", hint="18:20", recovers=0)["target"], "Skip add-ons")
+        decision = decide_front(page, "btn[ ] Skip add-ons", seller="cleartrip", hint="18:20")
+        self.assertEqual(decision.get("action"), "click")
+        self.assertRegex(decision.get("tap") or "", _re.compile(r"skip add", _re.I))
+        src = inspect.getsource(run_checkout_agent)
+        self.assertIn("_leave_addons", src)
 
     def test_itinerary_failure_url_stays_error_not_results(self) -> None:
         self.assertEqual(

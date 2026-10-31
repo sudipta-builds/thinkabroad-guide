@@ -15,17 +15,24 @@ logger = logging.getLogger(__name__)
 _VISION_READ = (
     "You are looking at ONE screenshot of a live Indian flight-booking page "
     "(Ixigo, Cleartrip, EaseMyTrip, or similar).\n"
-    "Act like Instinct: say what the page really is, recommend the next move, never invent buttons.\n"
+    "Act like Instinct: say what the page really is, list visible facts, recommend the next move.\n"
     "Return JSON only with keys:\n"
-    '{"kind":"upsell|form|login|otp|review|results|pay|unavailable|other",'
+    '{"kind":"upsell|form|login|otp|review|results|pay|unavailable|addons|other",'
     '"what":"","why":"","recommend":"","tap":"","auto":false,'
     '"fares_visible":false,"sold_out":false,"toast_only":false,'
+    '"seat_map":false,"meals_offered":false,'
+    '"facts":[],'
     '"best_depart":"","best_price":""}\n'
     "Rules:\n"
     "- kind=results when flight cards with Book/Select and prices are visible, even if a small toast says "
     "'No flight data available' or a filter tip is pre-applied. Set fares_visible=true, toast_only=true for that chip.\n"
     "- kind=unavailable when a modal says the flight is no longer available / Search Again. sold_out=true. "
     "Do not treat this as a filled traveller form.\n"
+    "- kind=addons for Choose add-ons / seat map / meals / baggage / 'missed adding Meal(s) and Seat(s)'. "
+    "Set seat_map=true when a cabin seat map is visible; meals_offered=true when meals are offered. "
+    "facts MUST mention seats if a seat map is shown (e.g. 'seat map open, no seat selected'). "
+    "Default tap=Skip add-ons and auto=true unless the traveller clearly wants a paid seat. "
+    "Never invent a seat purchase.\n"
     "- kind=results: recommend a departure time (best_depart) and price if readable; tap stays empty "
     "(the bot clicks Book by time, not a button label). auto=false.\n"
     "- kind=upsell: optional paid Assured / Free Cancellation / insurance sheet; tap the decline "
@@ -36,6 +43,7 @@ _VISION_READ = (
     "- kind=form: empty or partial traveller fields (title/name/mobile/email) needing fill — tap empty or Continue.\n"
     "- kind=otp / login / pay as usual. kind=other for unknown sheets (still recommend a safe next move).\n"
     "- kind=pay: stop; tap empty; auto=false.\n"
+    "- facts: 1-4 short phrases of what is actually visible (seat map, meals, Skip, toast, sold-out).\n"
     "- Never set tap to Pay, Buy, Secure My Trip, Assure My Trip, Insure My Trip, or anything that spends money.\n"
     "- what/why/recommend: one short sentence each. Do not invent flights not in the image."
 )
@@ -92,6 +100,22 @@ def see_step(
     recommend = re.sub(r"\s+", " ", str(data.get("recommend") or "")).strip()
     if not what and not recommend and not data.get("sold_out") and not data.get("fares_visible"):
         return None
+    facts_raw = data.get("facts") if isinstance(data.get("facts"), list) else []
+    facts = []
+    for item in facts_raw[:6]:
+        line = re.sub(r"\s+", " ", str(item or "")).strip()
+        if line:
+            facts.append(line[:140])
+    seat_map = bool(data.get("seat_map"))
+    meals = bool(data.get("meals_offered"))
+    if kind in {"addons"} or seat_map or meals or re.search(
+        r"choose add-ons|seat map|add seats|skip add-?ons|missed adding", what + recommend, re.I
+    ):
+        kind = "addons"
+    if seat_map and not any(re.search(r"seat", f, re.I) for f in facts):
+        facts.append("seat map is visible")
+    if meals and not any(re.search(r"meal", f, re.I) for f in facts):
+        facts.append("meals are offered")
     out = {
         "kind": kind,
         "what": what[:220],
@@ -102,14 +126,20 @@ def see_step(
         "fares_visible": bool(data.get("fares_visible")),
         "sold_out": bool(data.get("sold_out") or kind == "unavailable"),
         "toast_only": bool(data.get("toast_only")),
+        "seat_map": seat_map,
+        "meals_offered": meals,
+        "facts": facts,
         "best_depart": re.sub(r"\s+", "", str(data.get("best_depart") or ""))[:8],
         "best_price": re.sub(r"\s+", " ", str(data.get("best_price") or "")).strip()[:24],
         "source": "vision",
     }
     if out["sold_out"]:
         out["kind"] = "unavailable"
-    if out["fares_visible"] and out["kind"] not in {"unavailable", "pay", "login", "otp"}:
+    if out["fares_visible"] and out["kind"] not in {"unavailable", "pay", "login", "otp", "addons"}:
         out["kind"] = "results"
+    if out["kind"] == "addons" and not out["tap"]:
+        out["tap"] = "Skip add-ons"
+        out["auto"] = "1"
     return out
 
 
@@ -175,8 +205,10 @@ def classify_with_vision(
     if seen.get("fares_visible") and mapped == "results":
         return "results", seen
     # Toast-only false empty: keep results if vision says so over DOM "other"/loading.
-    if mapped in {"unavailable", "results", "pay", "login", "otp"} and mapped != dom_stage:
+    if mapped in {"unavailable", "results", "pay", "login", "otp", "addons"} and mapped != dom_stage:
         return mapped, seen
+    if seen.get("seat_map") or seen.get("meals_offered"):
+        return "addons", seen
     if dom_stage in {"other", "loading"} and mapped != "other":
         return mapped, seen
     return mapped, seen

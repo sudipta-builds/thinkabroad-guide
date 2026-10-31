@@ -274,11 +274,19 @@ def handle_turn(
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="👀")
     pending = state.get("pending_step") if isinstance(state.get("pending_step"), dict) else None
-    if not pending and state.get("stuck_kind") in {"addon_buy", "upsell", "other", "name_confirm"}:
+    if not pending and state.get("stuck_kind") in {
+        "addon_buy",
+        "upsell",
+        "other",
+        "name_confirm",
+        "addons",
+    }:
         stuck_page = str(state.get("stuck_page") or "")
         if stuck_page:
+            from app.step_read import decline_tap
+
             pending = {
-                "tap": "",
+                "tap": decline_tap(stuck_page) or "Skip add-ons",
                 "page": stuck_page,
                 "kind": str(state.get("stuck_kind") or "other"),
             }
@@ -697,6 +705,11 @@ def resolve_intent(text: str, state: dict[str, Any], prior: list[dict[str, Any]]
             spoken = "I'll move the booking forward and stop before payment."
         elif asked.get("goal") == "skip":
             spoken = "I'll skip the paid extra and keep your traveller selected. Nothing paid."
+            if not state.get("chosen_tap") and _mid_booking(state):
+                from app.step_read import decline_tap
+
+                page = str(state.get("stuck_page") or "")
+                state["chosen_tap"] = decline_tap(page) or "Skip add-ons"
         return local, spoken
     data = llm.converse(_UNDERSTAND, _planner_payload(phone="", text=text, state=state, prior=prior, busy=False), timeout=8)
     model = str(data.get("intent") or "")
@@ -718,6 +731,11 @@ def resolve_intent(text: str, state: dict[str, Any], prior: list[dict[str, Any]]
         tap = safe_tap(wanted, page) if page else wanted[:40]
         if tap:
             state["chosen_tap"] = tap
+    if asked.get("goal") == "skip" and _mid_booking(state) and not state.get("chosen_tap"):
+        from app.step_read import decline_tap
+
+        page = str(state.get("stuck_page") or "")
+        state["chosen_tap"] = decline_tap(page) or "Skip add-ons"
     if not spoken and asked.get("tap"):
         spoken = f"I'll press {asked['tap']} on the open page. Nothing paid."
     return kind, spoken
@@ -2072,7 +2090,9 @@ def _stuck_line(state: dict[str, Any], kind: str, what: str, why: str, recommend
     """Name the block, what it is, and the next move. Same block twice is called out."""
     prev = str(state.get("stuck_kind") or "")
     same = bool(kind) and (
-        prev == kind or {prev, kind} <= {"upsell", "addon_buy"} or (prev and prev == kind)
+        prev == kind
+        or {prev, kind} <= {"upsell", "addon_buy", "addons"}
+        or (prev and prev == kind)
     )
     again = "Still the same block. " if same else ""
     if kind:
@@ -2138,9 +2158,24 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         except Exception:
             vision_seen = None
     which = hint or "that flight"
+    if vision_seen:
+        state["last_vision"] = {
+            "kind": vision_seen.get("kind"),
+            "facts": vision_seen.get("facts") or [],
+            "seat_map": bool(vision_seen.get("seat_map")),
+            "meals_offered": bool(vision_seen.get("meals_offered")),
+            "what": vision_seen.get("what") or "",
+            "tap": vision_seen.get("tap") or "",
+        }
     if vision_seen and vision_seen.get("sold_out"):
         shown = "unavailable"
-    if vision_seen and vision_seen.get("fares_visible") and shown not in {"unavailable", "pay"}:
+    if vision_seen and (
+        vision_seen.get("kind") == "addons"
+        or vision_seen.get("seat_map")
+        or vision_seen.get("meals_offered")
+    ):
+        shown = "addons"
+    if vision_seen and vision_seen.get("fares_visible") and shown not in {"unavailable", "pay", "addons"}:
         shown = "results"
     if shown == "unavailable" or flight_unavailable(page):
         state.pop("form_filled", None)
@@ -2383,14 +2418,44 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             "an extra they want to sell — Continue stays blocked until a cancellation option and a traveller are ticked",
             rec,
         )
-    if shown == "addons" or re.search(r"choose your seat|add meal|skip add-?ons|extra baggage", page, re.I):
-        return _stuck_line(
-            state,
-            "addons",
-            f"{seller} add-ons (seats, meals, or bags) for the {which}",
-            "optional extras before payment, not a required traveller field",
-            "reply skip and I'll leave extras off",
+    if shown == "addons" or re.search(
+        r"choose your seat|add meal|skip add-?ons|extra baggage|missed adding meal|choose add-ons|add seats",
+        page,
+        re.I,
+    ):
+        from app.step_contract import build_contract, format_contract_stuck
+        from app.step_read import decline_tap
+
+        vision = state.get("last_vision") if isinstance(state.get("last_vision"), dict) else None
+        contract = build_contract(
+            page,
+            stage="addons",
+            seller=seller,
+            hint=which,
+            vision=vision,
+            user_goal="skip",
         )
+        tap = decline_tap(page) or str(contract.get("tap") or "Skip add-ons")
+        arm_pending_step(state, page, "addons", tap=tap)
+        state["last_contract"] = contract
+        # Prefer auto-skip wording when we will click without another yes.
+        if not contract.get("requires_user"):
+            state.pop("stuck_kind", None)
+            facts = contract.get("facts") or []
+            fact_bit = (" " + "; ".join(facts) + ".") if facts else ""
+            spoken = (
+                f"On {seller} Choose add-ons for {which}.{fact_bit} "
+                f"I'll press {tap} (and dismiss the missed meals/seats nag if it appears). Nothing paid."
+            )
+            state["last_stuck"] = spoken
+            state["stuck_kind"] = "addons"
+            return spoken
+        spoken = format_contract_stuck(contract, which=which)
+        again = "Still the same block. " if state.get("stuck_kind") == "addons" else ""
+        spoken = again + spoken
+        state["stuck_kind"] = "addons"
+        state["last_stuck"] = spoken
+        return spoken
     if shown == "fare_sheet" or "Select your fare" in page:
         return _stuck_line(
             state,

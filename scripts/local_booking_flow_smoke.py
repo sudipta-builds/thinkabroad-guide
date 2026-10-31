@@ -114,6 +114,11 @@ def smoke_conversation() -> None:
                 f"{kind} missing recommend/book",
             )
             _must("Nothing paid" in spoken, f"{kind} missing nothing paid")
+        elif kind == "addons":
+            # Auto-skip extras; must mention seats/meals and Skip — not freeze on exact-button.
+            _must("exact button" not in spoken.lower(), "addons must not ask exact button")
+            _must("skip" in spoken.lower(), "addons missing skip")
+            _must("Nothing paid" in spoken, f"{kind} missing nothing paid")
         else:
             _must("Stuck:" in spoken, f"{kind} missing Stuck:")
             _must("recommend" in spoken.lower(), f"{kind} missing recommend")

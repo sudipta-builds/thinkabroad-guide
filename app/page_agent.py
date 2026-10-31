@@ -319,7 +319,8 @@ def deterministic_action(stage: str, *, hint: str, recovers: int, url: str = "")
     if stage == "passenger":
         return {"action": "fill_passenger", "target": "Continue", "value": ""}
     if stage == "addons":
-        return {"action": "click", "target": "Continue", "value": ""}
+        # Cleartrip shows Skip add-ons (and a "missed meals/seats" nag). Continue re-opens the nag.
+        return {"action": "click", "target": "Skip add-ons", "value": ""}
     if stage == "unavailable":
         # Instinct reports sold-out honestly; Search Again restarts the fare list.
         return {"action": "stuck", "target": "unavailable", "value": ""}
@@ -582,11 +583,26 @@ def _clear_front_sheet(page, chosen_tap: str = "", *, seller: str = "", hint: st
     if decision.get("action") != "click":
         return "front_ask" if decision.get("action") == "ask" else "front_none"
     label = str(decision.get("tap") or "")
+    front_copy = str(surface.get("text") or "")
+    if re.search(r"skip add|continue without add", label, re.I) or re.search(
+        r"missed adding|skip add-?ons|choose add-ons|add seats", front_copy, re.I
+    ):
+        notes: list[str] = []
+        if _leave_addons(page, notes, rounds=3):
+            return "front_tap:" + (notes[-1] if notes else "Skip add-ons")
+        hit = _skip_addons(page)
+        if hit:
+            return f"front_tap:{hit}"
     if label and _click_label(page, label):
         try:
             page.wait_for_timeout(500)
         except Exception:
             pass
+        # Meal/seat nag after a decline / continue on add-ons.
+        if re.search(r"skip|no,? thanks|continue", label, re.I):
+            notes = []
+            if _leave_addons(page, notes, rounds=2):
+                return f"front_tap:{label}+left"
         return f"front_tap:{label}"
     return "front_tap_miss"
 
@@ -1049,6 +1065,93 @@ def _click_label(page, label: str) -> bool:
         )
     except Exception:
         return False
+
+
+def _skip_addons(page) -> str:
+    """Leave Cleartrip/Ixigo optional extras, including the missed meals/seats nag.
+
+    Scrolls to find Skip when the seat map fills the viewport. Returns the label
+    clicked, or empty when nothing matched.
+    """
+    labels = (
+        "Skip add-ons",
+        "Skip add ons",
+        "Continue without add-ons",
+        "Continue without addons",
+        "No, Thanks",
+        "No Thanks",
+        "Skip",
+    )
+
+    def _try() -> str:
+        for label in labels:
+            if _click_label(page, label):
+                return label
+        return ""
+
+    clicked = _try()
+    if not clicked:
+        for _ in range(4):
+            try:
+                page.mouse.wheel(0, 900)
+                page.wait_for_timeout(350)
+            except Exception:
+                break
+            clicked = _try()
+            if clicked:
+                break
+    if not clicked:
+        return ""
+    try:
+        page.wait_for_timeout(700)
+    except Exception:
+        pass
+    # Cleartrip often opens "You missed adding Meal(s) and Seat(s)" — Skip again.
+    try:
+        text, _url = _read(page)
+        surface = read_surface(page)
+        hay = apply_front_text(text, surface)
+    except Exception:
+        hay = ""
+    if re.search(r"missed adding|skip add-?ons|okay,?\s*let me add", hay, re.I):
+        for label in ("Skip add-ons", "Skip add ons", "Skip"):
+            if _click_label(page, label):
+                clicked = label
+                try:
+                    page.wait_for_timeout(600)
+                except Exception:
+                    pass
+                break
+    return clicked
+
+
+def _leave_addons(page, log: list[str], *, rounds: int = 3) -> bool:
+    """Outcome loop: skip extras until Choose add-ons is gone."""
+    from app.step_contract import left_addons
+
+    for i in range(rounds):
+        text, url = _read(page)
+        try:
+            surface = read_surface(page)
+            text = apply_front_text(text, surface)
+        except Exception:
+            pass
+        stage = classify_page(text, url, book_count=_book_count(page))
+        if left_addons(text, stage):
+            log.append(f"addons_left:{stage}")
+            return True
+        hit = _skip_addons(page)
+        log.append(f"addons_skip:{hit or 'miss'}:{i}")
+        _poll_ready(
+            page,
+            {"review", "passenger", "pay", "login", "otp", "error", "unavailable"},
+            budget_ms=3500,
+        )
+    text, url = _read(page)
+    stage = classify_page(text, url, book_count=_book_count(page))
+    ok = left_addons(text, stage)
+    log.append(f"addons_done:{stage}:{'ok' if ok else 'still'}")
+    return ok
 
 
 def _search(page, origin: str, destination: str) -> None:
@@ -2398,6 +2501,12 @@ def run_checkout_agent(
                     if _click_label(page, label):
                         break
                 page.wait_for_timeout(400)
+                continue
+            if stage == "addons" or re.search(r"skip add|continue without add", target, re.I):
+                if not _leave_addons(page, log, rounds=3) and target and not re.search(
+                    r"skip add", target, re.I
+                ):
+                    _click_label(page, target)
                 continue
             if re.search(r"continue", target, re.I) and (
                 stage == "fare_sheet"

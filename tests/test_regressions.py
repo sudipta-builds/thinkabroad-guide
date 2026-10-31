@@ -1253,6 +1253,20 @@ class SellerChoiceAndProxy(unittest.TestCase):
             classify_page(drawer, "https://www.cleartrip.com/flights/results"),
             "fare_sheet",
         )
+        # Two fare names + Continue over a list, even without the exact header.
+        twin = "Saver ₹9,100 Value ₹10,200 Continue Booking IndiGo 18:20 Book ₹9,100"
+        self.assertTrue(_looks_like_fare_sheet(twin))
+        self.assertEqual(classify_page(twin, "https://www.cleartrip.com/flights/results"), "fare_sheet")
+        # A single VALUE badge on review must not become fare_sheet.
+        review_badge = (
+            "Review & Traveller Details Fare Summary Total Amount ₹9,116 "
+            "Air-India Express IX 1513 13:15 VALUE Continue"
+        )
+        self.assertFalse(_looks_like_fare_sheet(review_badge))
+        self.assertEqual(
+            classify_page(review_badge, "https://www.ixigo.com/flight/booking/1"),
+            "review",
+        )
 
     def test_after_book_follow_through_is_wired(self) -> None:
         import inspect
@@ -1271,6 +1285,27 @@ class SellerChoiceAndProxy(unittest.TestCase):
         click = src.split('if kind == "click_time":')[1][:2500]
         self.assertIn("_advance_after_book", click)
         self.assertIn("confirm_fare", click)
+        # Continue after a card hit uses confirm_fare even when stage is still results.
+        click_branch = src.split('if kind == "click":')[1][:1800]
+        self.assertIn("results_after_book", click_branch)
+        self.assertIn("_confirm_fare", click_branch)
+
+    def test_vision_smoke_guards_post_book_ask_on_results(self) -> None:
+        """Live smoke must fail if Book hits a card then freezes as ask:results."""
+        smoke = Path("scripts/vision_step_smoke.py").read_text(encoding="utf-8")
+        self.assertIn("ask:results", smoke)
+        self.assertIn("confirm_fare", smoke)
+        self.assertIn("after_book", smoke)
+        self.assertIn("without fare follow-through", smoke)
+
+    def test_itinerary_failure_url_stays_error_not_results(self) -> None:
+        self.assertEqual(
+            classify_page(
+                "Something went wrong",
+                "https://www.cleartrip.com/flights/results/itinerary/failure",
+            ),
+            "error",
+        )
 
     def test_sold_out_modal_is_unavailable_not_review(self) -> None:
         from app.page_agent import flight_unavailable

@@ -228,6 +228,10 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         return "pay"
     priced = bool(re.search(r"₹\s*[0-9]", hay))
     has_time = bool(re.search(r"\b\d{1,2}:\d{2}\b", hay))
+    # A real add-ons sheet still shows the flight time and a fare. That is not a results list.
+    # "Add meal" marketing on the fare list is handled later, after the Book+₹ check.
+    if re.search(r"skip add-?ons|choose add-ons|missed adding", hay, re.I):
+        return "addons"
     # Fare picker drawer can sit on top of a still-visible results list — detect it first.
     if _looks_like_fare_sheet(hay):
         return "fare_sheet"

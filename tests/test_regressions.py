@@ -1242,6 +1242,30 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(classify_page(hay, "https://www.cleartrip.com/flights/results"), "results")
         self.assertNotEqual(classify_page(hay, "https://www.cleartrip.com/flights/results"), "addons")
 
+    def test_addons_sheet_with_fare_is_not_a_results_list(self) -> None:
+        """Seat map still shows 18:20 and a price. That must not restart login."""
+        import inspect
+
+        from app.kernel_otp import begin_login
+
+        hay = (
+            "Choose add-ons Add seats 18:20 ₹10,263 Book "
+            "You missed adding Meal(s) and Seat(s) Okay, let me select Skip add-ons"
+        )
+        self.assertEqual(
+            classify_page(hay, "https://www.cleartrip.com/flights/itinerary/abc"),
+            "addons",
+        )
+        src = inspect.getsource(classify_page)
+        self.assertLess(src.index("skip add"), src.index("if fare_list"))
+        login = inspect.getsource(begin_login)
+        self.assertLess(login.index("resume_lost"), login.index("Mobile field did not open"))
+        self.assertLess(login.index("resume_lost"), login.index("ixigo_results_url"))
+        agent = Path("app/travel_agent.py").read_text(encoding="utf-8")
+        self.assertIn('status == "resume_lost"', agent)
+        self.assertIn("Reopening", agent)
+        self.assertIn("did not open login", agent)
+
     def test_fare_drawer_over_results_is_fare_sheet(self) -> None:
         from app.page_agent import _looks_like_fare_sheet
 

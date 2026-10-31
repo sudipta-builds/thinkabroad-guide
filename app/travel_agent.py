@@ -388,7 +388,14 @@ def handle_turn(
                 signed_in = str(state.get("kernel_logged_in") or "") == book_seller
                 trip = _spoken_trip(state)
                 if chosen and resume_booking_url(state, text):
-                    canned = _usable_reply(state, spoken, _mid_booking_ack(state, book_seller, chosen, text))
+                    tap = str(state.get("chosen_tap") or "")
+                    if re.search(r"skip add", tap, re.I):
+                        canned = (
+                            f"Reopening {_seller_label(book_seller)} on the add-ons step to press Skip add-ons. "
+                            "I'll tell you if that sheet isn't there. Nothing paid."
+                        )
+                    else:
+                        canned = _usable_reply(state, spoken, _mid_booking_ack(state, book_seller, chosen, text))
                 elif chosen and signed_in:
                     canned = f"Opening the {chosen} on {_seller_label(book_seller)}. I'll stop before payment."
                 elif chosen:
@@ -2729,6 +2736,20 @@ def _run_kernel_login(
         on_code_requested(result)
     elif status in {"already_logged_in", "fares", "held"} and not announced:
         _deliver_signed_in_page(phone, seller, result, secrets)
+    elif status == "resume_lost" and not announced:
+        state = _load(phone)
+        state["kernel_awaiting_otp"] = False
+        state.pop("kernel_session_id", None)
+        spoken = (
+            f"The saved {_seller_label(seller)} page did not come back on Choose add-ons, "
+            "so I did not press Skip and I did not open login. "
+            "Say the flight time again if you want a fresh fare list. Nothing paid."
+        )
+        state["last_stuck"] = spoken
+        state["stuck_kind"] = "addons"
+        _save(phone, state)
+        shots = [result["screenshot"]] if result.get("screenshot") else None
+        _deliver(phone, spoken, None, secrets, shot_paths=shots)
     elif not announced:
         state = _load(phone)
         state["kernel_awaiting_otp"] = False

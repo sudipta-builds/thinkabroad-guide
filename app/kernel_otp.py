@@ -496,7 +496,7 @@ def begin_login(
             # link falls through and the search runs again with the saved profile.
             if hint and resume_url and is_resume_booking_url(resume_url, seller):
                 try:
-                    page.goto(resume_url, wait_until="domcontentloaded", timeout=120000)
+                    page.goto(resume_url, wait_until="domcontentloaded", timeout=45000 if chosen_tap else 120000)
                     page.wait_for_timeout(1500)
                     text, url = _read(page)
                     stage = classify_page(text, url, book_count=_book_count(page))
@@ -511,17 +511,44 @@ def begin_login(
                             expect_flight="IX1513" if hint == "1:15" else "",
                             allow_pay=False,
                             pause_on_auth=True,
-                            max_steps=16,
+                            max_steps=6 if re.search(r"skip add", chosen_tap or "", re.I) else 16,
                             profile=passenger,
                             chosen_tap=chosen_tap,
                         )
-                        checkout_notes = "resume | " + " | ".join(checkout.log)[:1500]
+                        checkout_notes = ((checkout.handoff + " | ") if checkout.handoff else "") + "resume | " + " | ".join(checkout.log)[:1500]
                         page = _latest(page)
                         text, url = _read(page)
                         if classify_page(text, url, book_count=_book_count(page)) in _MID_BOOKING:
                             resume_kept = True
                 except Exception:
                     resume_kept = False
+            # Skip means "press the button on the page we already had." A dead or
+            # misread link must not start a new search and then fail login.
+            if (
+                not resume_kept
+                and hint
+                and resume_url
+                and is_resume_booking_url(resume_url, seller)
+                and re.search(r"skip add", chosen_tap or "", re.I)
+            ):
+                shot = ""
+                try:
+                    shot = _shot(page, seller, sid, "resume-miss")
+                except Exception:
+                    shot = ""
+                try:
+                    pw.close()
+                except Exception:
+                    pass
+                _drop(client, sid)
+                return {
+                    "status": "resume_lost",
+                    "detail": "Saved add-ons page did not reopen.",
+                    "session_id": sid,
+                    "seller": seller,
+                    "screenshot": shot,
+                    "notes": checkout_notes,
+                }
             if not resume_kept:
                 results_url = (
                     ixigo_results_url(origin, destination, depart)
@@ -557,11 +584,11 @@ def begin_login(
                         expect_flight="IX1513" if hint == "1:15" else "",
                         allow_pay=False,
                         pause_on_auth=True,
-                        max_steps=16,
+                        max_steps=6 if re.search(r"skip add", chosen_tap or "", re.I) else 16,
                         profile=passenger,
                         chosen_tap=chosen_tap,
                     )
-                    checkout_notes = " | ".join(checkout.log)[:1500]
+                    checkout_notes = ((checkout.handoff + " | ") if checkout.handoff else "") + " | ".join(checkout.log)[:1500]
                     page = _latest(page)
                 if hint and checkout.stage != "ask" and classify_page(*_read(page), book_count=_book_count(page)) not in {
                     "passenger",

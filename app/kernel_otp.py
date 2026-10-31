@@ -26,6 +26,20 @@ from app.search import cleartrip_results_url, ixigo_results_url
 
 KERNEL_SELLERS = {"ixigo", "cleartrip"}
 _MID_BOOKING = {"passenger", "review", "addons", "pay", "login", "otp"}
+
+
+def should_hunt_login(stage: str) -> bool:
+    """Open a mobile field only when this sheet is login. Continue on extras is not login."""
+    return stage in {"login", "otp"}
+
+
+def after_checkout_status(stage: str) -> str:
+    """Kernel success is the live page after the click, not a stored OTP step."""
+    if should_hunt_login(stage):
+        return "auth"
+    if stage == "error":
+        return "dead"
+    return "held"
 # Legacy second connection. The prod login keeps the original CDP socket instead.
 _HOLDS: dict[str, dict[str, Any]] = {}
 _HOLD_LOCK = threading.Lock()
@@ -536,20 +550,16 @@ def begin_login(
                 text, url = _read(page)
                 stage = classify_page(text, url, book_count=_book_count(page))
 
-            # Same Kernel tab: press Skip on the sheet we just screenshotted.
-            if reused and hint and stage in {"passenger", "review", "addons", "pay"}:
-                try:
-                    _checkout_now()
-                    resume_kept = stage in _MID_BOOKING or stage in {"results", "fare_sheet"}
-                except Exception:
-                    resume_kept = False
-            elif reused and hint and stage in {"results", "loading", "fare_sheet"}:
-                if skip_tap:
+            # Same Kernel tab: click on this sheet. OTP is not the success test.
+            if reused and hint and should_hunt_login(stage):
+                resume_kept = True
+            elif reused and hint and stage != "error":
+                if skip_tap and stage in {"results", "loading", "fare_sheet"}:
                     chosen_tap = ""
                     skip_tap = False
                 try:
                     _checkout_now()
-                    resume_kept = True
+                    resume_kept = after_checkout_status(stage) != "dead"
                 except Exception:
                     resume_kept = False
             elif reused and stage == "error":
@@ -565,10 +575,10 @@ def begin_login(
                     if stage == "error":
                         chosen_tap = ""
                         skip_tap = False
-                    elif stage in _MID_BOOKING:
+                    elif stage != "error":
                         _checkout_now()
                         checkout_notes = ((checkout.handoff + " | ") if checkout and checkout.handoff else "") + "resume | " + " | ".join((checkout.log if checkout else []))[:1500]
-                        resume_kept = stage in _MID_BOOKING
+                        resume_kept = after_checkout_status(stage) != "dead"
                 except Exception:
                     resume_kept = False
                     try:
@@ -637,12 +647,7 @@ def begin_login(
                     )
                     checkout_notes = ((checkout.handoff + " | ") if checkout.handoff else "") + " | ".join(checkout.log)[:1500]
                     page = _latest(page)
-                if hint and checkout and checkout.stage != "ask" and classify_page(*_read(page), book_count=_book_count(page)) not in {
-                    "passenger",
-                    "review",
-                    "addons",
-                    "pay",
-                }:
+                if hint and checkout and should_hunt_login(classify_page(*_read(page), book_count=_book_count(page))):
                     for _ in range(8):
                         page = _latest(page)
                         if _logged_in(page, seller) or _find(page, "phone", seller) or _otp_visible(page, seller):
@@ -663,17 +668,7 @@ def begin_login(
             if outcome is None:
                 text, url = _read(page)
                 stage = classify_page(text, url, book_count=_book_count(page))
-                if stage in {"passenger", "review", "addons", "pay"}:
-                    outcome = {
-                        "status": "held",
-                        "session_id": sid,
-                        "seller": seller,
-                        "screenshot": _shot(page, seller, sid, "held"),
-                        "page": (text or "")[:8000],
-                        "url": url or "",
-                        "notes": checkout_notes,
-                    }
-                elif hint and stage in {"results", "loading", "fare_sheet", "home", "cookie"}:
+                if after_checkout_status(stage) == "held":
                     outcome = {
                         "status": "held",
                         "session_id": sid,
@@ -694,9 +689,9 @@ def begin_login(
                     "url": url or "",
                 }
             ok = False
-            if outcome is None:
+            if outcome is None and should_hunt_login(stage):
                 ok = _otp_visible(page, seller)
-            if outcome is None and not ok:
+            if outcome is None and should_hunt_login(stage) and not ok:
                 phone_box = _find(page, "phone", seller)
                 if not phone_box:
                     shot = _shot(page, seller, sid, "otp-miss")
@@ -736,6 +731,17 @@ def begin_login(
                     shot = str(dest)
                 except Exception:
                     shot = ""
+            if outcome is None and not should_hunt_login(stage):
+                text, url = _read(page)
+                outcome = {
+                    "status": "held",
+                    "session_id": sid,
+                    "seller": seller,
+                    "screenshot": _shot(page, seller, sid, "held"),
+                    "page": (text or "")[:8000],
+                    "url": url or "",
+                    "notes": checkout_notes,
+                }
             if outcome is None and ok and on_code_requested is not None:
                 # Stay on this CDP connection through Verify. A second connection
                 # reaches the spinner and never becomes an Ixigo account.

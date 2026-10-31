@@ -2747,6 +2747,14 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         from app.turn_loop import remember_shot
 
         remember_shot(state, shot)
+    first_note = notes.split(" | ")[0].strip()
+    if first_note and re.search(r"did not (open|leave)|click did not", first_note, re.I):
+        state["last_stuck"] = first_note[:500]
+        if shown:
+            state["stuck_kind"] = shown
+        _save(phone, state)
+        _deliver(phone, first_note[:500], None, secrets, shot_paths=shots)
+        return
     if notes.startswith("Skip add-ons is on screen") and shown in {"addons", ""}:
         spoken = notes.split(" | ")[0][:500]
         state["stuck_kind"] = "addons"
@@ -2877,13 +2885,19 @@ def _run_kernel_login(
         state["kernel_awaiting_otp"] = False
         state.pop("kernel_session_id", None)
         _save(phone, state)
+        page = str(result.get("page") or "")
         detail = str(result.get("detail") or result.get("status") or "login didn't open")
-        _deliver(
-            phone,
-            f"I couldn't open {_seller_label(seller)} login ({detail}). Nothing paid.",
-            None,
-            secrets,
-        )
+        if page and not re.search(r"enter mobile|otp|log in to ixigo", page, re.I):
+            spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), page, type("S", (), {"page": None})())
+            shots = [result["screenshot"]] if result.get("screenshot") else None
+            _deliver(phone, spoken, None, secrets, shot_paths=shots)
+        else:
+            _deliver(
+                phone,
+                f"I couldn't open {_seller_label(seller)} login ({detail}). Nothing paid.",
+                None,
+                secrets,
+            )
     else:
         _publish_kernel_otp_result(
             phone,

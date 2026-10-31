@@ -1532,6 +1532,32 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertTrue(any(line == "user_tap:Continue" for line in outcome.log), outcome.log)
         self.assertFalse(any("skip add" in line.lower() for line in outcome.log), outcome.log)
 
+    def test_kernel_success_is_the_live_page(self) -> None:
+        import inspect
+
+        from app.kernel_otp import after_checkout_status, begin_login, should_hunt_login
+        from app.page_agent import classify_page
+
+        extras = (
+            "6E 2092 10:45 Fare summary Add ons ₹449 Extra baggage "
+            "Make your journey fully flexible Travel insurance Continue Log in"
+        )
+        shown = classify_page(extras, "https://www.cleartrip.com/flights/itinerary/1")
+        self.assertNotEqual(shown, "login")
+        self.assertFalse(should_hunt_login(shown))
+        self.assertFalse(should_hunt_login("other"))
+        self.assertFalse(should_hunt_login("review"))
+        self.assertTrue(should_hunt_login("login"))
+        self.assertEqual(after_checkout_status(shown), "held")
+        self.assertEqual(after_checkout_status("other"), "held")
+        self.assertEqual(after_checkout_status("login"), "auth")
+        self.assertEqual(after_checkout_status("error"), "dead")
+        src = inspect.getsource(begin_login)
+        self.assertIn("should_hunt_login", src)
+        self.assertIn("after_checkout_status", src)
+        hunt = src.split("if hint and checkout")[1].split("A saved profile")[0]
+        self.assertIn("should_hunt_login", hunt)
+
     def test_one_gemini_turn_names_wish_not_pending_skip(self) -> None:
         import inspect
 

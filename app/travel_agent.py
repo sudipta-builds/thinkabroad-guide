@@ -2006,10 +2006,18 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     trip = _window_phrase(state)
     seller = _seller_label(str(state.get("seller") or "cleartrip"))
     url = ""
+    surface: dict = {"overlay": False, "text": "", "controls": ""}
     if session.page is not None:
         url = str(session.page.url or "")
-    from app.page_agent import classify_page
+        try:
+            from app.page_agent import read_surface
 
+            surface = read_surface(session.page)
+        except Exception:
+            surface = {"overlay": False, "text": "", "controls": ""}
+    from app.page_agent import apply_front_text, classify_page
+
+    page = apply_front_text(page, surface)
     shown = classify_page(page, url)
     which = hint or "that flight"
     if shown in {"home", "cookie"}:
@@ -2071,8 +2079,8 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         )
     from app.step_read import decline_tap, describe_step, read_step
 
-    controls = ""
-    if session.page is not None:
+    controls = str(surface.get("controls") or "")
+    if not controls and session.page is not None and not surface.get("overlay"):
         try:
             from app.page_agent import control_digest
 

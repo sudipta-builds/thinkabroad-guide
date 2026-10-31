@@ -321,6 +321,96 @@ def deterministic_action(stage: str, *, hint: str, recovers: int, url: str = "")
     return None
 
 
+_SURFACE_JS = """() => {
+  const vis = (el) => {
+    const r = el.getBoundingClientRect();
+    const s = getComputedStyle(el);
+    return r.width > 4 && r.height > 4 && s.visibility !== 'hidden'
+      && s.display !== 'none' && r.bottom > 0 && r.top < innerHeight;
+  };
+  const labelOf = (el) => {
+    const aria = el.getAttribute('aria-label') || '';
+    let t = (el.innerText || aria || el.value || '').replace(/\\s+/g, ' ').trim();
+    if (!t || t.length > 100) {
+      const wrap = el.closest('label');
+      if (wrap) t = (wrap.innerText || '').replace(/\\s+/g, ' ').trim();
+    }
+    return t.slice(0, 80);
+  };
+  const onOf = (el) => !!(el.checked
+    || el.getAttribute('aria-checked') === 'true'
+    || el.getAttribute('aria-pressed') === 'true');
+  const disOf = (el) => !!(el.disabled || el.getAttribute('aria-disabled') === 'true');
+  const frontRoot = () => {
+    const cx = innerWidth / 2, cy = innerHeight / 2;
+    const marked = [...document.querySelectorAll('[role=dialog],[aria-modal=true]')].filter(vis);
+    const panels = [...document.querySelectorAll('div,section,aside')].filter((el) => {
+      const s = getComputedStyle(el);
+      if (s.position !== 'fixed' && s.position !== 'absolute') return false;
+      const r = el.getBoundingClientRect();
+      if (r.width < 200 || r.height < 80) return false;
+      if (r.width > innerWidth * 0.96 && r.height > innerHeight * 0.9) return false;
+      if (!(r.left <= cx && r.right >= cx && r.top <= cy && r.bottom >= cy)) return false;
+      return [...el.querySelectorAll('button,a,[role=button],input')].some(vis);
+    });
+    const roots = [...marked, ...panels];
+    if (!roots.length) return null;
+    roots.sort((a, b) => {
+      const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+      return (ra.width * ra.height) - (rb.width * rb.height);
+    });
+    return roots[0];
+  };
+  const root = frontRoot();
+  const scope = root || document.body;
+  const lines = [];
+  const seen = new Set();
+  const add = (kind, el) => {
+    if (!vis(el) || !scope.contains(el)) return;
+    const t = labelOf(el);
+    if (!t || t.length < 2) return;
+    const line = kind + '[' + (onOf(el) ? 'x' : ' ') + ']' + (disOf(el) ? '!' : '') + ' ' + t;
+    if (seen.has(line)) return;
+    seen.add(line);
+    lines.push(line);
+  };
+  for (const el of scope.querySelectorAll('input[type=radio],[role=radio]')) add('radio', el);
+  for (const el of scope.querySelectorAll('input[type=checkbox],[role=checkbox]')) add('check', el);
+  for (const el of scope.querySelectorAll('button,a,[role=button]')) add('btn', el);
+  return {
+    overlay: !!root,
+    text: (scope.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 4000),
+    controls: lines.slice(0, 36).join('\\n'),
+  };
+}"""
+
+
+def read_surface(page) -> dict[str, str | bool]:
+    """The sheet on top, or the page itself when nothing covers the centre.
+
+    overlay is true only for a dialog or a centred fixed panel. Text and controls
+    are limited to that sheet so the review form behind it is not the step.
+    """
+    try:
+        raw = page.evaluate(_SURFACE_JS)
+    except Exception:
+        raw = None
+    if not isinstance(raw, dict):
+        return {"overlay": False, "text": "", "controls": ""}
+    return {
+        "overlay": bool(raw.get("overlay")),
+        "text": str(raw.get("text") or "")[:4000],
+        "controls": str(raw.get("controls") or "")[:2000],
+    }
+
+
+def apply_front_text(page_text: str, surface: dict) -> str:
+    """Use the covering sheet's words when one is open."""
+    if surface.get("overlay") and str(surface.get("text") or "").strip():
+        return str(surface["text"])
+    return page_text or ""
+
+
 def control_digest(page) -> str:
     """Visible radios, checkboxes, and buttons with selected/disabled state.
 
@@ -386,8 +476,11 @@ def _pause_unknown(
     checks: list[str],
     step: int,
 ) -> CheckoutOutcome:
-    """Stop before a guessed click. WhatsApp gets the control list via describe_step."""
-    digest = control_digest(page)
+    """Stop before a guessed click. WhatsApp gets the front sheet, not the page behind it."""
+    surface = read_surface(page)
+    if surface.get("overlay") and str(surface.get("text") or "").strip():
+        text = str(surface["text"])
+    digest = str(surface.get("controls") or "") or control_digest(page)
     from app.step_read import decline_tap, describe_step, read_step
 
     heard = read_step(text, seller=seller, hint=hint, controls=digest)
@@ -799,7 +892,13 @@ def _tap_step_decline(page) -> str:
 
 
 def _select_saved_traveller(page, name: str = "") -> str:
-    """Tick one saved adult on Ixigo Review & Traveller Details. Empty when none."""
+    """Tick one existing person on the front page. Never invent another profile.
+
+    Returns behind_sheet when a dialog covers the list, traveller_unticked when
+    people are listed but none matched, or traveller_clicked / already / card.
+    """
+    if read_surface(page).get("overlay"):
+        return "behind_sheet"
     wanted = re.sub(r"\s+", " ", (name or "").strip()).lower()
     wanted = re.sub(r"^(mr|ms|mrs|mx)\.?\s+", "", wanted)
     try:
@@ -811,12 +910,17 @@ def _select_saved_traveller(page, name: str = "") -> str:
                 return r.width > 4 && r.height > 4 && s.visibility !== 'hidden'
                   && s.display !== 'none' && r.bottom > 0 && r.top < innerHeight;
               };
+              const isPerson = (t) => {
+                if (!t || t.length > 80) return false;
+                if (/pay|assured|cancellation|seat|meal|baggage|continue|gst|email|mobile|contact/.test(t)) return false;
+                return /\\b(mr|ms|mrs|mx)\\b/.test(t) || /[a-z]{2,}\\s+[a-z]{2,}/.test(t);
+              };
               const rowText = (el) => {
                 let node = el;
-                for (let i = 0; i < 8 && node; i++) {
+                for (let i = 0; i < 6 && node; i++) {
                   const t = ((node.innerText || node.getAttribute && node.getAttribute('aria-label')) || '')
                     .replace(/\\s+/g, ' ').trim().toLowerCase();
-                  if (t.length > 6 && /\\b(mr|ms|mrs|mx)\\b/.test(t)) return t;
+                  if (isPerson(t)) return t;
                   node = node.parentElement;
                 }
                 return '';
@@ -824,12 +928,9 @@ def _select_saved_traveller(page, name: str = "") -> str:
               const boxes = [...document.querySelectorAll(
                 'input[type=checkbox],[role=checkbox],input[type=radio]'
               )].filter(vis);
-              const adults = boxes.filter((el) => {
-                const t = rowText(el);
-                return t && !/i don.?t want|free cancellation|assured/.test(t);
-              });
-              const match = (want && adults.find((el) => rowText(el).includes(want)))
-                || adults[0];
+              const adults = boxes.filter((el) => isPerson(rowText(el)));
+              const match = (want && adults.find((el) => rowText(el).includes(want))) || (!want ? adults[0] : null);
+              if (!match && adults.length) return 'unticked';
               if (match) {
                 const already = match.checked || match.getAttribute('aria-checked') === 'true';
                 if (!already) match.click();
@@ -838,9 +939,7 @@ def _select_saved_traveller(page, name: str = "") -> str:
               const cards = [...document.querySelectorAll('label,button,div,li')].filter(vis);
               const card = cards.find((el) => {
                 const t = (el.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                if (!t || t.length > 90) return false;
-                if (!/\\b(mr|ms|mrs|mx)\\b/.test(t)) return false;
-                if (/i don.?t want|free cancellation|assured|continue|lock price/.test(t)) return false;
+                if (!isPerson(t)) return false;
                 return !want || t.includes(want);
               });
               if (card) { card.click(); return 'card'; }
@@ -1752,15 +1851,9 @@ def run_checkout_agent(
             continue
         if kind == "review_continue":
             # Escape closes the Ixigo review sheet, so the Continue control disappears.
-            # Decline paid extras and tick a saved traveller before Continue.
-            # Ask only when a buy overlay still covers Continue and the traveller has not chosen.
-            log.append(_ixigo_opt_out_cancellation(page))
-            log.append(_select_saved_traveller(page, str(profile.get("name") or "")))
-            try:
-                page.wait_for_timeout(400)
-            except Exception:
-                pass
-            if not chosen_tap and _ixigo_buy_this_visible(page):
+            # A covering sheet is the step. Do not click or add a traveller behind it.
+            surface = read_surface(page)
+            if not chosen_tap and (surface.get("overlay") or _ixigo_buy_this_visible(page)):
                 return _pause_unknown(
                     page,
                     seller=seller,
@@ -1772,6 +1865,27 @@ def run_checkout_agent(
                     checks=checks,
                     step=step,
                 )
+            if surface.get("overlay"):
+                from app.step_read import decline_tap
+
+                label = "" if str(chosen_tap).startswith("__") else chosen_tap
+                if not label:
+                    label = decline_tap(f"{surface.get('text') or ''}\n{surface.get('controls') or ''}")
+                log.append(
+                    f"front_tap:{label}" if label and _click_label(page, label) else "front_tap_miss"
+                )
+                try:
+                    page.wait_for_timeout(400)
+                except Exception:
+                    pass
+                continue
+            # Decline paid extras and tick one saved person before Continue. Do not add another.
+            log.append(_ixigo_opt_out_cancellation(page))
+            log.append(_select_saved_traveller(page, str(profile.get("name") or "")))
+            try:
+                page.wait_for_timeout(400)
+            except Exception:
+                pass
             # One accurate click per attempt. A miss can be retried; Pay is never clicked.
             log.append(f"continue_click:{_safe_continue(page)}")
             _poll_ready(
@@ -1817,15 +1931,28 @@ def run_checkout_agent(
             continue
         if kind == "fill_passenger":
             saved = _select_saved_traveller(page, str(profile.get("name") or ""))
-            if saved:
-                log.append(saved)
-            notes = _fill_passenger_fields(page, profile)
-            log.extend(notes)
+            if saved == "behind_sheet" or saved == "traveller_unticked":
+                log.append(saved or "traveller_unticked")
+                return _pause_unknown(
+                    page,
+                    seller=seller,
+                    hint=hint,
+                    text=text,
+                    url=url,
+                    log=log,
+                    facts=facts,
+                    checks=checks,
+                    step=step,
+                )
             if saved.startswith("traveller_"):
+                log.append(saved)
+                log.append("kept_saved_traveller")
                 if not _safe_continue(page):
                     log.append("passenger_continue_miss")
                 _poll_ready(page, {"addons", "review", "pay", "passenger", "error"}, budget_ms=3000)
                 continue
+            notes = _fill_passenger_fields(page, profile)
+            log.extend(notes)
             if not any(item.startswith(("first:ok", "first:typed")) for item in notes):
                 text, url, stage, facts = _snapshot()
                 if (

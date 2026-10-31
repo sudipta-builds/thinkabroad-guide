@@ -404,6 +404,48 @@ class DateAndMemory(unittest.TestCase):
         self.assertIn("_pause_unknown", pause)
         self.assertLess(pause.index("if not chosen_tap"), pause.index("_ask_model"))
 
+    def test_front_sheet_is_the_step_and_saved_people_are_not_duplicated(self) -> None:
+        import inspect
+
+        from app.page_agent import _SURFACE_JS, apply_front_text, read_surface
+        from app.travel_agent import _addon_upsell, _booking_page_reply
+
+        behind = (
+            "Fare Summary I don't want Free Cancellation Traveller Details "
+            "Choose from the saved list Mr Sudipta Saikia Mr Sudipta Saikia Continue"
+        )
+        surface = {"overlay": True, "text": "Free Cancellation No, Thanks", "controls": "btn[ ] No, Thanks"}
+        front = apply_front_text(behind, surface)
+        self.assertEqual(front, "Free Cancellation No, Thanks")
+        self.assertNotEqual(_addon_upsell(front), "radio")
+        self.assertEqual(_addon_upsell(behind), "radio")
+        self.assertIn("[role=dialog]", _SURFACE_JS)
+        self.assertIn("overlay", inspect.getsource(read_surface))
+
+        class _Sheet:
+            url = "https://www.ixigo.com/flight/booking/1"
+
+            def evaluate(self, _script):
+                return {"overlay": True, "text": "Free Cancellation No, Thanks", "controls": "btn[ ] No, Thanks"}
+
+        spoken = _booking_page_reply(
+            {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-12-04",
+                "seller": "ixigo",
+                "selected_hint": "12:30",
+            },
+            "12:30",
+            behind,
+            type("S", (), {"page": _Sheet()})(),
+        )
+        self.assertIn("No, Thanks", spoken)
+        self.assertNotIn("I don't want Free Cancellation vs", spoken)
+        fill = inspect.getsource(run_checkout_agent).split('if kind == "fill_passenger"')[1][:1600]
+        self.assertLess(fill.index("kept_saved_traveller"), fill.index("_fill_passenger_fields"))
+        self.assertIn("behind_sheet", fill)
+
     def test_checkout_links_stay_out_of_whatsapp(self) -> None:
         from app.travel_agent import _clean, _hide_checkout_link, _usable_reply
 

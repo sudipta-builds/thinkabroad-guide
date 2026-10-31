@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -372,6 +373,11 @@ def run_live_short() -> None:
         raise SystemExit("FAIL live reached pay")
     if not vision_lines and get_settings().vision_ready:
         raise SystemExit("FAIL live produced no vision log lines while vision_ready")
+    joined = "\n".join(outcome.log)
+    # Remaining gap was: Book hit a card then froze as ask:results. Follow-through must try fare Continue.
+    if re.search(r"^card:.+", joined, re.M) and "ask:results" in joined:
+        if "confirm_fare" not in joined and "after_book" not in joined:
+            raise SystemExit("FAIL Book hit a card then asked on results without fare follow-through")
     print("PASS live short")
 
 

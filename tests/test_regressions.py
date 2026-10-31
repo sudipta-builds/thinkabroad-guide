@@ -1241,6 +1241,37 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(classify_page(hay, "https://www.cleartrip.com/flights/results"), "results")
         self.assertNotEqual(classify_page(hay, "https://www.cleartrip.com/flights/results"), "addons")
 
+    def test_fare_drawer_over_results_is_fare_sheet(self) -> None:
+        from app.page_agent import _looks_like_fare_sheet
+
+        drawer = (
+            "Select your fare Saver ₹10,283 Value ₹11,100 Continue "
+            "IndiGo 18:25 Book ₹10,283 IndiGo 09:15 Book ₹10,283"
+        )
+        self.assertTrue(_looks_like_fare_sheet(drawer))
+        self.assertEqual(
+            classify_page(drawer, "https://www.cleartrip.com/flights/results"),
+            "fare_sheet",
+        )
+
+    def test_after_book_follow_through_is_wired(self) -> None:
+        import inspect
+
+        from app.page_agent import _advance_after_book, _mouse_book_depart, run_checkout_agent
+
+        self.assertTrue(callable(_advance_after_book))
+        self.assertTrue(callable(_mouse_book_depart))
+        src = inspect.getsource(run_checkout_agent)
+        self.assertIn("_advance_after_book", src)
+        self.assertIn("book_still_results", src)
+        self.assertIn("results_after_book:try_continue", src)
+        # Same results signature after a Book hit must not freeze into ask.
+        self.assertIn("book_retries", src)
+        # After Book, fare_sheet runs confirm_fare instead of pausing on results.
+        click = src.split('if kind == "click_time":')[1][:2500]
+        self.assertIn("_advance_after_book", click)
+        self.assertIn("confirm_fare", click)
+
     def test_sold_out_modal_is_unavailable_not_review(self) -> None:
         from app.page_agent import flight_unavailable
 

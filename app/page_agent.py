@@ -228,6 +228,9 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         return "pay"
     priced = bool(re.search(r"₹\s*[0-9]", hay))
     has_time = bool(re.search(r"\b\d{1,2}:\d{2}\b", hay))
+    # Fare picker drawer can sit on top of a still-visible results list — detect it first.
+    if _looks_like_fare_sheet(hay):
+        return "fare_sheet"
     fare_list = bool(
         has_time and priced and (book_count >= 1 or re.search(r"\b(Book|Select|View fares)\b", hay))
     )
@@ -256,8 +259,6 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         return "review"
     if re.search(r"first & middle|first name|last name|add adult|primary passenger", hay, re.I):
         return "passenger"
-    if re.search(r"select your fare", hay, re.I):
-        return "fare_sheet"
     if re.search(r"we respect your privacy|accept all cookies|cookie policy", hay, re.I) and not (priced and has_time):
         return "cookie"
     if _results_url(url):
@@ -449,6 +450,20 @@ def flight_unavailable(page: str) -> bool:
             re.I,
         )
     )
+
+
+def _looks_like_fare_sheet(hay: str) -> bool:
+    """Cleartrip/Ixigo fare picker (often a drawer over the results list)."""
+    text = hay or ""
+    if re.search(r"select your fare|choose your fare|choose a fare|pick a fare|fare options", text, re.I):
+        return True
+    # A single VALUE badge on Ixigo review is not the fare picker.
+    if re.search(r"review\s*&\s*traveller|review details|traveller details|fare summary", text, re.I):
+        return False
+    fare_names = len(re.findall(r"\b(saver|value|flexi|classic|standard fare|regular fare)\b", text, re.I))
+    if fare_names >= 2 and re.search(r"\b(continue|proceed|continue booking)\b", text, re.I):
+        return True
+    return False
 
 
 def nearest_depart_hint(page: str, hint: str) -> str:
@@ -798,6 +813,93 @@ def interpret_itinerary_create(status: int | None, body: str = "") -> str:
     if 200 <= status < 300:
         return "ok"
     return "unknown"
+
+
+def _advance_after_book(page, hint: str, log: list[str]) -> bool:
+    """After Book on a results row: open/confirm the fare drawer instead of asking.
+
+    Cleartrip often keeps the fare list URL while a Select-your-fare sheet is open.
+    Returns True when the page left results (or Continue was attempted).
+    """
+    text, url = _read(page)
+    surface = read_surface(page)
+    front = apply_front_text(text, surface)
+    stage = classify_page(front, url, book_count=_book_count(page))
+    if stage == "fare_sheet" or _looks_like_fare_sheet(front) or (
+        surface.get("overlay") and re.search(r"continue|saver|value|fare", str(surface.get("text") or ""), re.I)
+    ):
+        log.append("after_book:fare_sheet")
+        ok = _confirm_fare(page)
+        log.append(f"confirm_fare:{ok}")
+        return True
+    # JS Book sometimes paints no drawer — try a real mouse Book on the departure card.
+    if hint and _mouse_book_depart(page, hint):
+        log.append("after_book:mouse_book")
+        try:
+            page.wait_for_timeout(1200)
+        except Exception:
+            pass
+        after, _au, after_stage, _af = _poll_ready(
+            page,
+            {"fare_sheet", "review", "passenger", "login", "otp", "pay", "error", "unavailable"},
+            budget_ms=3500,
+        )
+        if after_stage == "fare_sheet" or _looks_like_fare_sheet(after):
+            log.append("after_book:fare_sheet")
+            ok = _confirm_fare(page)
+            log.append(f"confirm_fare:{ok}")
+            return True
+        if after_stage in {"review", "passenger", "login", "otp", "pay"}:
+            log.append(f"after_book:{after_stage}")
+            return True
+    return False
+
+
+def _mouse_book_depart(page, hint: str) -> bool:
+    """Playwright mouse click on Book for the matching departure (Cleartrip-friendly)."""
+    needles = set(_clock_needles(hint))
+    try:
+        buttons = page.locator("button, a, [role=button]").filter(
+            has_text=re.compile(r"^(Book|Book now|Select|View fares)$", re.I)
+        )
+        count = min(buttons.count(), 40)
+    except Exception:
+        return False
+    for i in range(count):
+        try:
+            btn = buttons.nth(i)
+            card = ""
+            handle = btn.element_handle()
+            if handle is not None:
+                card = str(
+                    page.evaluate(
+                        """(el) => {
+                            let n = el, t = '';
+                            for (let i = 0; i < 10 && n; i++) {
+                                const x = (n.innerText || '').replace(/\\s+/g, ' ').trim();
+                                const books = (x.match(/\\b(Book|Select|View fares)\\b/gi) || []).length;
+                                const times = (x.match(/\\b\\d{1,2}:\\d{2}\\b/g) || []).length;
+                                if (books > 2 || times > 4) break;
+                                if (x) t = x;
+                                n = n.parentElement;
+                            }
+                            return t.slice(0, 240);
+                        }""",
+                        handle,
+                    )
+                    or ""
+                )
+            if not card_matches_depart_hint(card, hint) and not any(n in card for n in needles):
+                continue
+            btn.scroll_into_view_if_needed(timeout=2000)
+            box = btn.bounding_box()
+            if not box:
+                continue
+            page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            return True
+        except Exception:
+            continue
+    return False
 
 
 def _confirm_fare(page) -> bool:
@@ -1870,6 +1972,11 @@ def run_checkout_agent(
 
     def _snapshot() -> tuple[str, str, str, dict[str, str]]:
         t, u = _read(page)
+        try:
+            surface = read_surface(page)
+            t = apply_front_text(t, surface)
+        except Exception:
+            pass
         s = classify_page(t, u, book_count=_book_count(page))
         f = extract_trip_facts(t, u)
         return t, u, s, f
@@ -1959,6 +2066,12 @@ def run_checkout_agent(
         repeat = signature in seen
         if stage == "passenger" and sum(1 for line in log if line.startswith("first:")) < 2:
             repeat = False
+        # Book hit the card but Cleartrip kept the results URL — do not freeze as "ask which button".
+        book_retries = sum(1 for line in log if line in {"book_still_results", "after_book:mouse_book"})
+        if stage == "results" and book_retries < 2 and any(
+            line.startswith("card:") and len(line) > 12 for line in log[-8:]
+        ):
+            repeat = False
         seen.add(signature)
         action = None if repeat else deterministic_action(stage, hint=hint, recovers=recovers, url=url)
         loading_waits = sum(1 for line in log if ":loading:wait" in line)
@@ -1969,6 +2082,16 @@ def run_checkout_agent(
             action = {"action": "click_time", "target": hint, "value": ""}
         if action is None and stage == "fare_sheet" and sum(1 for line in log if line.startswith("confirm_fare")) < 2:
             action = {"action": "click", "target": "Continue", "value": ""}
+        if (
+            action is None
+            and stage == "results"
+            and hint
+            and book_retries < 2
+            and any(line.startswith("card:") and len(line) > 12 for line in log[-8:])
+        ):
+            # Prefer confirming the open fare drawer over another blind Book.
+            action = {"action": "click", "target": "Continue", "value": ""}
+            log.append("results_after_book:try_continue")
         if action is None and stage == "review" and sum(1 for line in log if "review_continue" in line) < 3:
             action = {"action": "review_continue", "target": "Continue", "value": ""}
         if action is None:
@@ -2211,8 +2334,17 @@ def run_checkout_agent(
             after, after_url, after_stage, _af = _poll_ready(
                 page,
                 {"fare_sheet", "review", "passenger", "login", "otp", "pay", "error", "unavailable"},
-                budget_ms=4000,
+                budget_ms=5000,
             )
+            # Drawer over results still looks like a fare list in the DOM — re-read the front sheet.
+            if after_stage == "results":
+                try:
+                    surface = read_surface(page)
+                    front = apply_front_text(after, surface)
+                    after_stage = classify_page(front, after_url, book_count=_book_count(page))
+                    after = front
+                except Exception:
+                    pass
             if after_stage == "unavailable":
                 return CheckoutOutcome("unavailable", after, after_url, log, checks=checks)
             if after_stage == "fare_sheet":
@@ -2224,7 +2356,24 @@ def run_checkout_agent(
 
                     if not time_in_card(after, hint):
                         return CheckoutOutcome("wrong_flight", after, after_url, log, checks=checks)
+                ok = _confirm_fare(page)
+                log.append(f"confirm_fare:{ok}")
+                continue
+            if card and after_stage in {"results", "other", "loading"}:
+                if _advance_after_book(page, hint, log):
+                    continue
+                log.append("book_still_results")
+                continue
             if not card and after_stage == "results":
+                # One mouse Book before giving up — Cleartrip often ignores JS click.
+                if hint and "cleartrip.com" in (after_url or url or "") and _mouse_book_depart(page, hint):
+                    log.append("results:mouse_book")
+                    _poll_ready(
+                        page,
+                        {"fare_sheet", "review", "passenger", "login", "otp", "pay", "error"},
+                        budget_ms=4000,
+                    )
+                    continue
                 return CheckoutOutcome("results", after, after_url, log, checks=checks)
             if after_stage not in {"review", "passenger", "fare_sheet", "login", "otp", "pay", "error"}:
                 _poll_ready(
@@ -2250,7 +2399,11 @@ def run_checkout_agent(
                         break
                 page.wait_for_timeout(400)
                 continue
-            if stage == "fare_sheet" and re.search(r"continue", target, re.I):
+            if re.search(r"continue", target, re.I) and (
+                stage == "fare_sheet"
+                or _looks_like_fare_sheet(text)
+                or any(line.startswith(("card:", "after_book:", "results_after_book")) for line in log[-10:])
+            ):
                 ok = _confirm_fare(page)
                 text, url, left, facts = _snapshot()
                 log.append(f"confirm_fare:{ok}")

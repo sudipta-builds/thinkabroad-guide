@@ -273,30 +273,34 @@ def handle_turn(
         reply = _live_hold_reply(state, text)
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="👀")
-    if _mid_booking(state) and kind not in {"details", "pay", "cancel", "pay_self"} and not _asks_for_filled_form(text):
-        from app.step_read import arm_pending_step
-        from app.turn_loop import format_turn_reply, interpret_turn
+    from app.step_read import arm_pending_step
+    from app.turn_loop import format_turn_reply, interpret_turn
 
-        turn = interpret_turn(text, state)
-        state["last_turn"] = {k: turn.get(k) for k in ("goal", "intent", "kind", "tap", "source")}
-        goal = str(turn.get("goal") or "")
-        tap = str(turn.get("tap") or "")
-        page = str(state.get("stuck_page") or "")
-        if turn.get("intent") == "status" or goal == "ask":
-            if tap:
-                arm_pending_step(state, page, str(turn.get("kind") or "other"), tap=tap)
-            spoken = format_turn_reply(turn)
-            state["last_stuck"] = spoken
-            state["stuck_kind"] = str(turn.get("kind") or state.get("stuck_kind") or "")
-            _save(phone, state)
-            db.add_message(phone, "assistant", spoken)
-            return Reply.of(spoken, emoji="👀")
-        if goal in {"skip", "forward"} or turn.get("intent") == "book":
-            if tap:
-                state["chosen_tap"] = tap
-            state.pop("pending_step", None)
-            _save(phone, state)
-            kind = "book"
+    turn = interpret_turn(text, state)
+    state["last_turn"] = {k: turn.get(k) for k in ("goal", "intent", "kind", "tap", "source")}
+    goal = str(turn.get("goal") or "")
+    tap = str(turn.get("tap") or "")
+    if turn.get("intent"):
+        kind = str(turn["intent"])
+    if turn.get("kind"):
+        state["stuck_kind"] = str(turn["kind"])
+    if tap and kind in {"book", "select"}:
+        state["chosen_tap"] = tap
+        state.pop("pending_step", None)
+    if kind == "status" or goal == "ask":
+        if tap:
+            arm_pending_step(state, str(state.get("stuck_page") or ""), str(turn.get("kind") or "other"), tap=tap)
+        spoken = format_turn_reply(turn)
+        state["last_stuck"] = spoken
+        _save(phone, state)
+        db.add_message(phone, "assistant", spoken)
+        return Reply.of(spoken, emoji="👀")
+    if goal in {"skip", "forward"}:
+        kind = "book"
+        if tap:
+            state["chosen_tap"] = tap
+        state.pop("pending_step", None)
+        _save(phone, state)
     pending = state.get("pending_step") if isinstance(state.get("pending_step"), dict) else None
     if pending and kind not in {"details", "pay", "cancel", "search", "status", "book"}:
         from app.step_read import accept_choice
@@ -307,25 +311,21 @@ def handle_turn(
             state.pop("pending_step", None)
             _save(phone, state)
             kind = "book"
-    if kind == "status" and not _asks_for_filled_form(text):
-        from app.turn_loop import format_turn_reply, interpret_turn
-
-        turn = interpret_turn(text, state)
-        reply = format_turn_reply(turn) if turn.get("reply") or turn.get("what") else str(state.get("last_stuck") or "").strip()
-        if reply:
-            db.add_message(phone, "assistant", reply)
-            return Reply.of(reply, emoji="👀")
     cached = _cached_fares_reply(state, text, kind)
     if cached:
         db.add_message(phone, "assistant", cached)
         return Reply.of(cached, emoji="✈️")
     if kind == "details":
-        waiting = passenger_details_reply(state)
+        waiting = _form_ask_if_needed(state)
         if waiting:
             state.pop("busy_at", None)
             _save(phone, state)
             db.add_message(phone, "assistant", waiting)
             return Reply.of(waiting, emoji="📝")
+        if _sheet_kind(state) in {"addons", "upsell", "review", "fare_sheet"}:
+            kind = "book"
+            state["chosen_tap"] = str(state.get("chosen_tap") or tap or "Skip add-ons")
+            _save(phone, state)
     if kind in _BOOKING and _should_browse(state, text, busy=busy, changed=changed):
         from app.kernel_otp import kernel_configured
 
@@ -530,8 +530,10 @@ def extract_user_ask(text: str, state: dict[str, Any]) -> dict[str, str]:
         page = str(pending.get("page") or "")
     page = page or str(state.get("stuck_page") or "")
     phrase = choice_phrase(raw)
-    if re.match(r"^(?:click|press|tap|hit)\b", raw, re.I) or (
-        2 <= len(phrase) <= 40 and page and phrase.lower() in re.sub(r"\s+", " ", page).lower()
+    clock_only = bool(re.fullmatch(r"\d{1,2}:\d{2}", phrase))
+    if (not clock_only) and (
+        re.match(r"^(?:click|press|tap|hit)\b", raw, re.I)
+        or (2 <= len(phrase) <= 40 and page and phrase.lower() in re.sub(r"\s+", " ", page).lower())
     ):
         tap = safe_tap(phrase, page) if page else re.sub(r"\s+", " ", phrase)[:40]
         if tap:
@@ -1405,8 +1407,14 @@ def absorb_details(state: dict[str, Any], text: str) -> dict[str, Any]:
     name = _NAME.search(raw)
     if name:
         data["name"] = name.group(1).strip(" .")
-    elif re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}", raw.strip()):
-        data["name"] = raw.strip()
+    else:
+        leftover = _GENDER.sub(" ", _DOB.sub(" ", _EMAIL.sub(" ", raw)))
+        leftover = re.sub(r"[,;|/]+", " ", leftover)
+        leftover = re.sub(r"\s+", " ", leftover).strip(" .")
+        if re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}", leftover):
+            data["name"] = leftover
+        elif re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}", raw.strip()):
+            data["name"] = raw.strip()
     if _looks_like_birth_depart(str(data.get("depart") or ""), str(data.get("dob") or "")):
         data["depart"] = "2026-12-04"
         data.pop("depart_until", None)
@@ -2054,6 +2062,20 @@ def passenger_gaps(state: dict[str, Any]) -> list[str]:
     return gaps
 
 
+def _sheet_kind(state: dict[str, Any]) -> str:
+    """What the last screenshot / stuck page actually is."""
+    vision = state.get("last_vision") if isinstance(state.get("last_vision"), dict) else {}
+    return str(vision.get("kind") or state.get("stuck_kind") or state.get("stage") or "")
+
+
+def _form_ask_if_needed(state: dict[str, Any]) -> str:
+    """Ask for missing traveller fields only when the open sheet is still the form."""
+    shown = _sheet_kind(state)
+    if shown in {"addons", "upsell", "review", "fare_sheet", "results", "pay", "unavailable"}:
+        return ""
+    return passenger_details_reply(state)
+
+
 def passenger_details_reply(state: dict[str, Any]) -> str:
     """Ask only for the fields that were not sent. Empty when the form can be filled."""
     gaps = passenger_gaps(state)
@@ -2609,7 +2631,13 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
     state.pop("kernel_session_id", None)
     shots = [result["screenshot"]] if result.get("screenshot") else None
     label = _seller_label(seller)
-    if str(result.get("status") or "") in {"already_logged_in", "fares"}:
+    if str(result.get("status") or "") in {"already_logged_in", "fares"} and shown in {
+        "results",
+        "loading",
+        "home",
+        "cookie",
+        "",
+    }:
         from app.kernel_otp import is_resume_booking_url
 
         if not is_resume_booking_url(str(result.get("url") or ""), seller):
@@ -2657,12 +2685,12 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
     )
     state["form_filled"] = bool(filled)
     _save(phone, state)
-    waiting = passenger_details_reply(state)
+    waiting = _form_ask_if_needed(state)
     from app.page_agent import flight_unavailable as _flight_gone
 
     if shown == "unavailable" or _flight_gone(text):
         spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), text, _Session())  # type: ignore[arg-type]
-    elif shown in {"home", "cookie", "results", "loading"}:
+    elif shown in {"home", "cookie", "results", "loading", "addons", "fare_sheet", "review", "pay"}:
         spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), text, _Session())  # type: ignore[arg-type]
     elif waiting:
         spoken = waiting

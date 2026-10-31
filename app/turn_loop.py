@@ -28,6 +28,11 @@ _TURN = (
     "If the screenshot is NOT Choose add-ons / seat map / missed-meals, do not recommend Skip add-ons.\n"
     "If the screenshot is an optional paid extra (flexibility, protect, cancellation, insurance), "
     "kind=upsell, tap Continue or the decline label, never Book now on that extra.\n"
+    "Your job is to complete the booking until the payment page, then stop. Nothing is paid.\n"
+    "If they sent passenger details (name/email/DOB/gender) and the screenshot is add-ons or an extra, "
+    "do not re-ask the form. goal=skip or forward, tap Skip add-ons or Continue, intent=book.\n"
+    "If the screenshot is the traveller form and a field in Memory is still empty, intent=details.\n"
+    "Do not re-ask a field already listed as saved. Do not recommend Skip add-ons unless that sheet is on screen.\n"
     "tap must be a short label visible on the page/screenshot. auto true only for Skip add-ons, "
     "name-check Confirm, or Continue that does not spend money.\n"
     "reply: one short sentence for WhatsApp. No emoji. Nothing paid."
@@ -102,6 +107,36 @@ def _local_turn(text: str, page: str, state: dict[str, Any]) -> dict[str, Any]:
             "facts": list(vision.get("facts") or []),
             "source": "local",
         }
+    looks_details = bool(re.search(r"@|\bmale\b|\bfemale\b|\bother\b|\d{1,2}/\d{1,2}/\d{2,4}", raw, re.I))
+    if looks_details and kind in {"addons", "upsell", "review", "fare_sheet"}:
+        label = tap or ("Skip add-ons" if kind == "addons" or re.search(r"skip add", hay, re.I) else "Continue")
+        return {
+            "goal": "skip" if "skip" in label.lower() else "forward",
+            "intent": "book",
+            "kind": kind,
+            "what": str(vision.get("what") or "the open booking sheet"),
+            "why": "details are saved; this screenshot is not the form",
+            "recommend": f"press {label} and continue the booking",
+            "tap": label,
+            "auto": "1",
+            "reply": f"Saved those details. The page is already past the form — I'll press {label}. Nothing paid.",
+            "facts": list(vision.get("facts") or []),
+            "source": "local",
+        }
+    if looks_details:
+        return {
+            "goal": "details",
+            "intent": "details",
+            "kind": kind or "form",
+            "what": "passenger details",
+            "why": "you sent name or contact fields",
+            "recommend": "I'll save these and fill the form if it is open",
+            "tap": "",
+            "auto": "",
+            "reply": "",
+            "facts": [],
+            "source": "local",
+        }
     if re.search(r"\bskip\b", raw, re.I):
         return {
             "goal": "skip",
@@ -160,9 +195,13 @@ def _gemini_turn(text: str, page: str, image_path: str, state: dict[str, Any]) -
         return {}
     hint = str(state.get("selected_hint") or "")
     seller = str(state.get("seller") or state.get("preferred_seller") or "")
+    missing = [key for key in ("name", "email", "phone", "dob", "gender") if not str(state.get(key) or "").strip()]
     user = (
         f"Traveller: {text}\nSeller: {seller or 'unknown'}. Chosen departure: {hint or 'unknown'}.\n"
         f"Last step kind: {state.get('stuck_kind') or state.get('stage') or ''}.\n"
+        f"Saved passenger: name={bool(state.get('name'))} email={bool(state.get('email'))} "
+        f"phone={bool(state.get('phone'))} dob={bool(state.get('dob'))} gender={bool(state.get('gender'))}. "
+        f"Still missing: {', '.join(missing) if missing else 'none'}.\n"
         f"Page text (may be stale):\n{(page or '')[:1200]}"
     )
     if image_path:

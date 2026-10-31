@@ -113,6 +113,16 @@ class DateAndMemory(unittest.TestCase):
         self.assertEqual(state["dob"], "29/07/1997")
         self.assertEqual(state["email"], "sudipta@example.com")
         self.assertEqual(state["gender"], "Male")
+        named = absorb_details(
+            {"stage": "booking"},
+            "Sudipta Saikia, sudiptasaikia6@gmail.com, 29/07/1997",
+        )
+        self.assertEqual(named.get("name"), "Sudipta Saikia")
+        self.assertEqual(named.get("email"), "sudiptasaikia6@gmail.com")
+        self.assertEqual(named.get("dob"), "29/07/1997")
+        named = absorb_details(named, "Sudipta Saikia, Male")
+        self.assertEqual(named.get("name"), "Sudipta Saikia")
+        self.assertEqual(named.get("gender"), "Male")
         self.assertEqual(infer_intent(state, "sudipta@example.com, 29/07/1997, Male"), "details")
         stuck = _recover_trip(
             {
@@ -1390,9 +1400,25 @@ class SellerChoiceAndProxy(unittest.TestCase):
         go = interpret_turn("confirm the fligt", booking)
         self.assertEqual(go["intent"], "book")
         self.assertEqual(go["goal"], "forward")
+        addons = {
+            **booking,
+            "stuck_kind": "addons",
+            "last_vision": {"kind": "addons", "what": "seat map", "tap": "Skip add-ons", "facts": []},
+            "stuck_page": "Choose add-ons Add seats Skip add-ons",
+        }
+        saved = interpret_turn("Sudipta Saikia, Male", addons)
+        self.assertEqual(saved["intent"], "book")
+        self.assertIn("Skip add-ons", saved.get("tap") or "")
+        self.assertEqual(extract_user_ask("18:20", addons).get("tap"), "")
         src = inspect.getsource(handle_turn)
         self.assertIn("interpret_turn", src)
+        self.assertIn("_form_ask_if_needed", src)
+        self.assertLess(src.index("interpret_turn"), src.index("_form_ask_if_needed"))
+        self.assertNotIn('kind not in {"details", "pay", "cancel", "pay_self"}', src)
         self.assertNotIn('Reply yes and I\'ll press {tap}', src)
+        deliver = inspect.getsource(__import__("app.travel_agent", fromlist=["_deliver_signed_in_page"])._deliver_signed_in_page)
+        self.assertIn("_form_ask_if_needed", deliver)
+        self.assertIn('"addons"', deliver)
         brain = inspect.getsource(converse)
         self.assertIn("gemini_chat", brain)
         self.assertNotIn("deepseek", brain.lower())

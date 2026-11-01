@@ -40,6 +40,8 @@ _TURN = (
     "A new trip (from/to/date) is intent=search, goal=search.\n"
     "If they say start fresh / start over / search again, intent=search, goal=search. "
     "Ignore a stale add-ons screenshot and do not recommend Skip add-ons.\n"
+    "If the screenshot is a site error (system acting up, Go to home), kind=error. "
+    "Never say ready to pay. Recommend start fresh or Go to home.\n"
     "reply: one short sentence for WhatsApp. No emoji. Nothing paid."
 )
 
@@ -371,6 +373,23 @@ def interpret_turn(
         if not tap and re.search(r"continue", page, re.I):
             tap = "Continue"
     trip_ready = bool(state.get("origin") and state.get("destination") and state.get("depart"))
+    from app.page_agent import site_error_page
+    from app.step_read import safe_tap
+
+    if site_error_page(page, ""):
+        kind = "error"
+        if wants_fresh_search(text):
+            intent, goal, tap, reply = "search", "search", "", ""
+        elif re.search(r"go to home", text or "", re.I):
+            intent, goal = "book", "forward"
+            tap = safe_tap("Go to home", page) or tap
+        elif goal in {"forward", "skip"} and tap:
+            intent = "book"
+        elif re.fullmatch(r"yes|yep|yeah|ok|okay|sure", (text or "").strip(), re.I):
+            intent, goal = "book", "forward"
+            tap = safe_tap("Go to home", page) or safe_tap("Search Again", page) or tap
+        if intent == "pay" or goal == "pay" or (reply and re.search(r"ready to pay", reply, re.I)):
+            intent, goal, reply = "status", "ask", ""
     if wants_fresh_search(text) and trip_ready:
         intent = "search"
         goal = "search"
@@ -445,6 +464,24 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
 
     if wants_fresh_search(text) and trip:
         return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
+
+    from app.page_agent import site_error_page
+    from app.step_read import safe_tap
+
+    stuck_text = str(state.get("stuck_page") or "")
+    if sheet == "error" or site_error_page(stuck_text, ""):
+        if wants_fresh_search(text):
+            return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
+        home = safe_tap("Go to home", stuck_text) or safe_tap("Search Again", stuck_text)
+        if intent in {"book", "select"} or goal in {"forward", "skip"}:
+            return {
+                "do": "book",
+                "kind": "book",
+                "tap": tap or home or "",
+                "turn": turn,
+                "reply": "",
+            }
+        return {"do": "reply", "kind": "error", "tap": "", "turn": turn, "reply": format_turn_reply(turn)}
 
     if not live:
         if trip:

@@ -578,7 +578,12 @@ def extract_user_ask(text: str, state: dict[str, Any]) -> dict[str, str]:
         re.I,
     ):
         out["intent"] = "book"
-        out["goal"] = "skip"
+        pending_tap = str((pending or {}).get("tap") or "").strip()
+        if pending_tap and re.fullmatch(r"yes|yep|yeah|ok|okay|sure", raw, re.I):
+            out["goal"] = "forward"
+            out["tap"] = pending_tap
+        else:
+            out["goal"] = "skip"
         return out
     phrase = choice_phrase(raw)
     clock_only = bool(re.fullmatch(r"\d{1,2}:\d{2}", phrase))
@@ -1047,6 +1052,11 @@ def remember_booking_page(state: dict[str, Any], seller: str, url: str, page_tex
     from app.kernel_otp import is_resume_booking_url
     from app.page_agent import classify_page
 
+    from app.page_agent import site_error_page
+
+    if site_error_page(page_text, url):
+        state.pop("live", None)
+        return "error"
     if not is_resume_booking_url(url, seller):
         live = state.get("live") if isinstance(state.get("live"), dict) else {}
         if is_resume_booking_url(str(live.get("url") or ""), seller):
@@ -2236,7 +2246,11 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     from app.page_agent import apply_front_text, classify_page, flight_unavailable, nearest_depart_hint
 
     page = apply_front_text(page, surface)
+    from app.page_agent import payment_sheet_open, site_error_page
+
     shown = classify_page(page, url)
+    if site_error_page(page, url):
+        shown = "error"
     vision_seen = None
     if session.page is not None:
         try:
@@ -2265,7 +2279,9 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             "recommend": vision_seen.get("recommend") or "",
             "shot": str(state.get("last_shot") or ""),
         }
-    if vision_seen and vision_seen.get("sold_out"):
+    if site_error_page(page, url):
+        shown = "error"
+    elif vision_seen and vision_seen.get("sold_out"):
         shown = "unavailable"
     if (
         vision_seen
@@ -2351,19 +2367,29 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             "flights are loading or filters hid the cards",
             "reply with a departure time (or go on) and I'll Book that fare",
         )
-    if "itinerary/failure" in url or re.search(r"connection lost|been disconnected|server error", page, re.I):
+    if shown == "error" or site_error_page(page, url) or "itinerary/failure" in url:
+        state.pop("live", None)
         state["stuck_kind"] = "error"
-        return (
-            f"Stuck: {seller} itinerary failed after the {which} for {trip} (connection lost). "
-            "That's a site error, not a missing detail. "
-            "I recommend EaseMyTrip or Ixigo. Nothing paid."
+        from app.step_read import safe_tap as _safe
+
+        home = _safe("Go to home", page) or _safe("Search Again", page)
+        rec = (
+            f"I'll press {home} and open a fresh fare list"
+            if home
+            else "say start fresh or search again and I'll open a new fare list"
+        )
+        return _stuck_line(
+            state,
+            "error",
+            f"{seller} system error for the {which} on {trip}",
+            "the site is not showing the booking sheet (see the screenshot)",
+            rec,
         )
     needs_login = bool(re.search(r"\bpassword\b", page, re.I) and re.search(r"log ?in|sign in|sign up", page, re.I))
     contact = bool(re.search(r"add contact|contact details|traveller details|passenger details", page, re.I))
     needs_email = bool(re.search(r"\b(email|gmail)\b", page, re.I) and contact)
     needs_phone = bool(re.search(r"mobile|phone", page, re.I) and contact)
     needs_dob = bool(re.search(r"date of birth|\bdob\b", page, re.I) and contact)
-    payment = bool(re.search(r"\bupi\b|pay now|card number|pay to complete|net banking", page, re.I))
     if shown == "otp" or re.search(r"enter otp|otp sent|verify your mobile", page, re.I):
         need = "4" if str(state.get("seller") or "") == "cleartrip" else "6"
         return _stuck_line(
@@ -2382,7 +2408,7 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             "the site wants an account before the traveller form",
             f"send the email and password, for example SAVE {site} you@gmail.com yourpassword",
         )
-    if payment or shown == "pay":
+    if payment_sheet_open(page, shown):
         state.pop("stuck_kind", None)
         totals = [n for n in prices_in(page) if n >= 3000]
         total = f"₹{totals[0]:,}" if totals else "the total on the screenshot"
@@ -2691,7 +2717,11 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
     page_url = str(result.get("url") or "")
     from app.page_agent import classify_page
 
+    from app.page_agent import payment_sheet_open, site_error_page
+
     shown = classify_page(text, page_url)
+    if site_error_page(text, page_url):
+        shown = "error"
     shot = str(result.get("screenshot") or "")
     if shot:
         try:
@@ -2707,6 +2737,8 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
                 )
         except Exception:
             pass
+    if site_error_page(text, page_url):
+        shown = "error"
     if str(result.get("status") or "") in {"already_logged_in", "held"}:
         if shown in {"home", "cookie"}:
             state.pop("kernel_logged_in", None)
@@ -2746,6 +2778,7 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         intro = f"You're already logged in on {label}.\n" if signed_in else ""
         _deliver(phone, f"{intro}{body}", None, secrets, shot_paths=shots)
         return
+    state["stuck_page"] = text[:4000]
     state["stage"] = remember_booking_page(state, seller, page_url, text)
     _save(phone, state)
 
@@ -2760,6 +2793,20 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         from app.turn_loop import remember_shot
 
         remember_shot(state, shot)
+    if shown == "error" or site_error_page(text, page_url):
+        state.pop("live", None)
+        state["last_vision"] = {
+            "kind": "error",
+            "what": f"{label} system error",
+            "tap": "",
+            "recommend": "start fresh or search again",
+            "facts": [],
+            "shot": str(state.get("last_shot") or ""),
+        }
+        spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), text, _Session())  # type: ignore[arg-type]
+        _save(phone, state)
+        _deliver(phone, spoken, None, secrets, shot_paths=shots)
+        return
     first_note = notes.split(" | ")[0].strip()
     if first_note and re.search(r"did not (open|leave)|click did not", first_note, re.I):
         state["last_stuck"] = first_note[:500]
@@ -2811,7 +2858,7 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         )
     else:
         spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), text, _Session())  # type: ignore[arg-type]
-    if re.search(r"\bupi\b|pay now|card number|pay to complete|net banking", text, re.I):
+    if payment_sheet_open(text, shown):
         state.pop("stuck_kind", None)
         trip = _window_phrase(state)
         spoken = f"I stopped before payment for {trip} on {label}. Nothing paid. The screenshot is that page."

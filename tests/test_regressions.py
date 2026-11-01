@@ -1611,6 +1611,43 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("Enter mobile number", text)
         self.assertFalse(refused)
 
+    def test_acting_up_is_error_not_payment(self) -> None:
+        from app.page_agent import classify_page, payment_sheet_open, site_error_page
+        from app.travel_agent import _booking_page_reply
+
+        err = (
+            "Sorry our system is acting up Go to home "
+            "Review your itinerary Pay now UPI card number pay to complete hidden"
+        )
+        self.assertTrue(site_error_page(err, "https://www.cleartrip.com/flights/itinerary/x"))
+        self.assertEqual(classify_page(err, "https://www.cleartrip.com/flights/itinerary/x"), "error")
+        self.assertFalse(payment_sheet_open(err, "error"))
+        self.assertFalse(payment_sheet_open(err, "pay"))
+        state = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "cleartrip",
+            "selected_hint": "10:45",
+        }
+        reply = _booking_page_reply(state, "10:45", err, type("S", (), {"page": None})())
+        self.assertIn("system error", reply.lower())
+        self.assertNotIn("Ready to pay", reply)
+
+    def test_yes_after_go_to_home_arms_pending_tap(self) -> None:
+        from app.travel_agent import extract_user_ask
+
+        page = "Sorry our system is acting up Go to home"
+        ask = extract_user_ask(
+            "yes",
+            {
+                "pending_step": {"tap": "Go to home", "page": page, "kind": "error"},
+                "stuck_page": page,
+            },
+        )
+        self.assertEqual(ask.get("tap"), "Go to home")
+        self.assertEqual(ask.get("goal"), "forward")
+
     def test_kernel_success_is_the_live_page(self) -> None:
         import inspect
 

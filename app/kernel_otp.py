@@ -17,11 +17,17 @@ from app.config import get_settings
 from app.page_agent import (
     _book_count,
     _latest,
-    _read,
     classify_page,
     ixigo_auth_session_ready,
+    read_visible_page,
     run_checkout_agent,
+    site_error_page,
 )
+
+
+def _read_visible(page) -> tuple[str, str]:
+    text, url, _surface = read_visible_page(page)
+    return text, url
 from app.search import cleartrip_results_url, ixigo_results_url
 
 KERNEL_SELLERS = {"ixigo", "cleartrip"}
@@ -329,7 +335,7 @@ def ixigo_verify_in_progress(text: str) -> bool:
 
 
 def _otp_visible(page, seller: str) -> bool:
-    text, _url = _read(page)
+    text, _url = _read_visible(page)
     if seller == "ixigo" and ixigo_verify_in_progress(text):
         return False
     if seller == "cleartrip":
@@ -352,7 +358,7 @@ def cleartrip_looks_logged_in(text: str, url: str = "") -> bool:
 
 
 def _logged_in(page, seller: str) -> bool:
-    text, url = _read(page)
+    text, url = _read_visible(page)
     if seller == "ixigo":
         if ixigo_auth_session_ready(page):
             return True
@@ -526,7 +532,7 @@ def begin_login(
             checkout_notes = ""
             resume_kept = False
             skip_tap = bool(re.search(r"skip add", chosen_tap or "", re.I))
-            text, url = _read(page)
+            text, url = _read_visible(page)
             stage = classify_page(text, url, book_count=_book_count(page))
 
             def _checkout_now() -> None:
@@ -547,7 +553,7 @@ def begin_login(
                 )
                 checkout_notes = ((checkout.handoff + " | ") if checkout.handoff else "") + " | ".join(checkout.log)[:1500]
                 page = _latest(page)
-                text, url = _read(page)
+                text, url = _read_visible(page)
                 stage = classify_page(text, url, book_count=_book_count(page))
 
             # Same Kernel tab: click on this sheet. OTP is not the success test.
@@ -570,7 +576,7 @@ def begin_login(
                 try:
                     page.goto(resume_url, wait_until="domcontentloaded", timeout=45000 if chosen_tap else 120000)
                     page.wait_for_timeout(1500)
-                    text, url = _read(page)
+                    text, url = _read_visible(page)
                     stage = classify_page(text, url, book_count=_book_count(page))
                     if stage == "error":
                         chosen_tap = ""
@@ -582,7 +588,7 @@ def begin_login(
                 except Exception:
                     resume_kept = False
                     try:
-                        text, url = _read(page)
+                        text, url = _read_visible(page)
                         stage = classify_page(text, url, book_count=_book_count(page))
                     except Exception:
                         stage = stage or ""
@@ -621,7 +627,7 @@ def begin_login(
                 if not hint:
                     # Leave the results alone. Clicking Log in here texts a code
                     # before the traveller has chosen a flight.
-                    text, url = _read(page)
+                    text, url = _read_visible(page)
                     outcome = {
                         "status": "already_logged_in" if _logged_in(page, seller) else "fares",
                         "session_id": sid,
@@ -647,7 +653,7 @@ def begin_login(
                     )
                     checkout_notes = ((checkout.handoff + " | ") if checkout.handoff else "") + " | ".join(checkout.log)[:1500]
                     page = _latest(page)
-                if hint and checkout and should_hunt_login(classify_page(*_read(page), book_count=_book_count(page))):
+                if hint and checkout and should_hunt_login(classify_page(*_read_visible(page), book_count=_book_count(page))):
                     for _ in range(8):
                         page = _latest(page)
                         if _logged_in(page, seller) or _find(page, "phone", seller) or _otp_visible(page, seller):
@@ -666,7 +672,7 @@ def begin_login(
             # A traveller form is not a login screen, even when the header has no Logout text.
             # A Cleartrip homepage "My Account" header is not a finished booking.
             if outcome is None:
-                text, url = _read(page)
+                text, url = _read_visible(page)
                 stage = classify_page(text, url, book_count=_book_count(page))
                 if after_checkout_status(stage) == "held":
                     outcome = {
@@ -679,7 +685,7 @@ def begin_login(
                         "notes": checkout_notes,
                     }
             if outcome is None and _logged_in(page, seller) and not _otp_visible(page, seller):
-                text, url = _read(page)
+                text, url = _read_visible(page)
                 outcome = {
                     "status": "already_logged_in" if not hint else "held",
                     "session_id": sid,
@@ -732,7 +738,7 @@ def begin_login(
                 except Exception:
                     shot = ""
             if outcome is None and not should_hunt_login(stage):
-                text, url = _read(page)
+                text, url = _read_visible(page)
                 outcome = {
                     "status": "held",
                     "session_id": sid,
@@ -789,7 +795,7 @@ def begin_login(
                         )
                         checkout_notes = " | ".join(checkout.log)[:1500]
                         page = _latest(page)
-                        text, url = _read(page)
+                        text, url = _read_visible(page)
                         outcome = {
                             "status": "held",
                             "session_id": sid,
@@ -899,7 +905,7 @@ def _apply_otp(client, session_id: str, page, seller: str, code: str) -> dict[st
                 page = _latest(page)
         except Exception:
             page = _latest(page)
-        text, _url = _read(page)
+        text, _url = _read_visible(page)
         if seller == "ixigo" and ixigo_verify_in_progress(text):
             verifying = True
             still = False

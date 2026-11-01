@@ -202,12 +202,51 @@ def verify_trip_facts(
     return (not problems, problems)
 
 
+_SITE_ERROR = re.compile(
+    r"acting up|system is acting|go to home|itinerary/failure|been disconnected|connection lost|server error",
+    re.I,
+)
+_PAY_SHEET = re.compile(
+    r"pay to complete your booking|name on card|enter card number|scan qr code|payment options",
+    re.I,
+)
+
+
+def site_error_page(text: str, url: str = "") -> bool:
+    """Cleartrip/Ixigo hard failure — not review, not payment."""
+    hay = f"{text or ''}\n{url or ''}"
+    return bool(_SITE_ERROR.search(hay))
+
+
+def payment_sheet_open(hay: str, stage: str) -> bool:
+    """Payment wording counts only on a pay sheet, never on a site error."""
+    if stage in {"error", "home", "cookie", "loading", "results"}:
+        return False
+    if site_error_page(hay, ""):
+        return False
+    if stage == "pay":
+        return True
+    return bool(_PAY_SHEET.search(hay or ""))
+
+
+def read_visible_page(page) -> tuple[str, str, dict]:
+    """Text that matches the viewport sheet — what the screenshot should show."""
+    text, url = _read(page)
+    try:
+        surface = read_surface(page)
+        visible = apply_front_text(text, surface)
+    except Exception:
+        surface = {"overlay": False, "text": "", "controls": ""}
+        visible = text
+    return visible, url, surface
+
+
 def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
     """Name the booking step from visible text. A nav 'Book' link is not a fare list."""
     hay = f"{text or ''}\n{url or ''}"
     if flight_unavailable(hay):
         return "unavailable"
-    if re.search(r"itinerary/failure|server error|connection lost|been disconnected", hay, re.I):
+    if site_error_page(hay, url):
         return "error"
     if re.search(
         r"enter otp|enter the otp|otp sent|otp received|verify your mobile|"

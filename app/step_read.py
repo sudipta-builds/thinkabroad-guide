@@ -497,3 +497,184 @@ def decide_front(
         "recommend": (heard or {}).get("recommend")
         or (f"reply yes to press {tap}" if tap else "send the exact button you want pressed"),
     }
+
+
+_FORM_MARK = re.compile(
+    r"add contact|contact details|email address|mobile number|first name|last name|date of birth|passenger details",
+    re.I,
+)
+_SLOTS = (
+    ("email", ("email address", "email")),
+    ("phone", ("mobile number", "mobile", "phone")),
+    ("name", ("first name", "first & middle name", "full name")),
+    ("dob", ("date of birth", "dob")),
+)
+
+
+def form_sheet(page: str) -> bool:
+    """A visible form, not a fare list, add-ons sheet, or review itinerary."""
+    hay = page or ""
+    if addons_sheet(hay) or on_review_itinerary(hay):
+        return False
+    return bool(_FORM_MARK.search(hay))
+
+
+def profile_slots(profile: dict) -> dict[str, str]:
+    """Facts safe to type. Phone is a 10-digit Indian mobile or empty."""
+    raw = re.sub(r"\D", "", str((profile or {}).get("phone") or ""))
+    phone = ""
+    if raw.startswith("91") and len(raw) == 12:
+        phone = raw[2:]
+    elif len(raw) == 10:
+        phone = raw
+    return {
+        "email": str((profile or {}).get("email") or "").strip(),
+        "phone": phone,
+        "name": str((profile or {}).get("name") or "").strip(),
+        "dob": str((profile or {}).get("dob") or "").strip(),
+    }
+
+
+def ground_unknown_plan(
+    page: str,
+    controls: str = "",
+    profile: dict | None = None,
+    *,
+    intent: str = "",
+) -> dict:
+    """One safe action from the visible sheet and saved facts. No screen catalog."""
+    hay = _hay(page, controls)
+    empty = {"action": "", "tap": "", "fills": [], "what": "", "why": "", "recommend": "", "handled": False}
+    if re.search(r"pay to complete|enter card number|payment options", hay, re.I):
+        return {
+            "action": "stop",
+            "tap": "",
+            "fills": [],
+            "what": "the payment page",
+            "why": "I stop before payment",
+            "recommend": "say you'll pay yourself, or pay with card",
+            "handled": True,
+        }
+    if not form_sheet(hay):
+        if intent == "agree":
+            tap = forward_tap(hay)
+            if tap:
+                return {
+                    "action": "click",
+                    "tap": tap,
+                    "fills": [],
+                    "what": "the open step",
+                    "why": "you said to go on",
+                    "recommend": f"I'll press {tap}",
+                    "handled": True,
+                }
+        return empty
+    slots = profile_slots(profile or {})
+    fills: list[dict] = []
+    missing: list[str] = []
+    for key, labels in _SLOTS:
+        present = any(re.search(re.escape(label), hay, re.I) for label in labels)
+        if key == "phone" and re.search(r"\+91", hay):
+            present = True
+        if not present:
+            continue
+        if slots.get(key):
+            fills.append({"key": key, "labels": list(labels), "value": slots[key]})
+        elif key == "email":
+            missing.append("email")
+        elif key == "phone":
+            missing.append("an Indian mobile (+91)")
+    tap = forward_tap(hay)
+    if missing:
+        need = ", ".join(missing)
+        return {
+            "action": "ask",
+            "tap": "",
+            "fills": [],
+            "what": "a contact or traveller form",
+            "why": f"this step needs {need}",
+            "recommend": f"send {need}",
+            "handled": True,
+        }
+    if fills:
+        return {
+            "action": "fill",
+            "tap": tap,
+            "fills": fills,
+            "what": "a contact or traveller form",
+            "why": "the empty fields match details already saved",
+            "recommend": f"I'll type them and press {tap}" if tap else "I'll type the saved details",
+            "handled": True,
+        }
+    if tap and intent in {"agree", "give_facts"}:
+        return {
+            "action": "click",
+            "tap": tap,
+            "fills": [],
+            "what": "the open step",
+            "why": f"{tap} is on screen",
+            "recommend": f"I'll press {tap}",
+            "handled": True,
+        }
+    return empty
+
+
+def format_unknown_plan(plan: dict) -> str:
+    """WhatsApp line for one grounded unknown-step action."""
+    action = str(plan.get("action") or "")
+    if action == "stop":
+        return "This is the payment page. I stop here. Nothing paid."
+    if action == "ask":
+        return (
+            f"{plan.get('what')}. {plan.get('why')}. {plan.get('recommend')}. Nothing paid."
+        )
+    if action == "fill":
+        keys = ", ".join(str(item.get("key") or "") for item in (plan.get("fills") or []) if item.get("key"))
+        tap = str(plan.get("tap") or "")
+        if tap:
+            return f"I'll type the saved {keys} and press {tap}. Nothing paid."
+        return f"I'll type the saved {keys}. Nothing paid."
+    if action == "click" and plan.get("tap"):
+        return f"I'll press {plan.get('tap')}. Nothing paid."
+    return ""
+
+
+def plan_unknown_step(
+    page: str,
+    controls: str = "",
+    profile: dict | None = None,
+    *,
+    intent: str = "",
+    use_model: bool = True,
+) -> dict:
+    """Rails first. The model is asked only when the sheet is still unnamed."""
+    grounded = ground_unknown_plan(page, controls, profile, intent=intent)
+    if grounded.get("handled") or not use_model or not step_read_enabled():
+        return grounded
+    heard = read_step(page, controls=controls)
+    if not heard:
+        return grounded
+    hay = _hay(page, controls)
+    if heard.get("kind") == "pay":
+        grounded = ground_unknown_plan(page + "\npay to complete", controls, profile, intent=intent)
+        return grounded if grounded.get("handled") else {
+            "action": "stop",
+            "tap": "",
+            "fills": [],
+            "what": heard.get("what") or "payment",
+            "why": "I stop before payment",
+            "recommend": "say you'll pay yourself",
+            "handled": True,
+        }
+    tap = safe_tap(str(heard.get("tap") or ""), hay) or forward_tap(hay)
+    if tap and heard.get("kind") in {"form", "review", "other"}:
+        return {
+            "action": "click",
+            "tap": tap,
+            "fills": [],
+            "what": heard.get("what") or "the open step",
+            "why": heard.get("why") or "that control is on screen",
+            "recommend": f"I'll press {tap}",
+            "handled": True,
+        }
+    return grounded

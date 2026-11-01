@@ -1068,6 +1068,106 @@ class SellerChoiceAndProxy(unittest.TestCase):
         )
         self.assertIn("+91", spoken)
         self.assertIn("Nothing paid", spoken)
+        self.assertNotIn("skip for extras", spoken.lower())
+
+    def test_saved_contact_on_unknown_form_presses_continue(self) -> None:
+        from app.step_read import form_sheet, ground_unknown_plan
+
+        page = "Add Contact details +91 Email address Mobile number Continue Review traveller details"
+        self.assertTrue(form_sheet(page))
+        plan = ground_unknown_plan(
+            page,
+            "",
+            {"email": "sudipta@example.com", "phone": "8638586171"},
+            intent="give_facts",
+        )
+        self.assertEqual(plan["action"], "fill")
+        self.assertEqual(plan["tap"], "Continue")
+        self.assertEqual({item["key"] for item in plan["fills"]}, {"email", "phone"})
+
+        class FakeSession:
+            page = type("P", (), {"url": "https://www.cleartrip.com/flights/itinerary"})()
+
+        spoken = _booking_page_reply(
+            {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-12-04",
+                "seller": "cleartrip",
+                "email": "sudipta@example.com",
+                "phone": "8638586171",
+                "selected_hint": "10:20",
+            },
+            "10:20",
+            page,
+            FakeSession(),  # type: ignore[arg-type]
+        )
+        self.assertIn("Continue", spoken)
+        self.assertNotIn("stage other", spoken.lower())
+        self.assertNotIn("skip for extras", spoken.lower())
+
+    def test_contact_slots_match_labels_types_and_prefix(self) -> None:
+        from app.page_agent import _passenger_ready, box_slot, contact_report
+
+        self.assertEqual(box_slot({"label": "Email address", "type": "email", "value": ""}), "email")
+        self.assertEqual(box_slot({"label": "Mobile number", "placeholder": "", "value": ""}), "phone")
+        self.assertEqual(box_slot({"label": "", "value": "+91"}), "prefix")
+        self.assertEqual(box_slot({"placeholder": "Email", "type": "text", "value": ""}), "email")
+        self.assertTrue(_passenger_ready(["first:none", "email:ok", "phone:ok", "title:none"]))
+        self.assertFalse(_passenger_ready(["first:none", "email:ok", "phone:miss", "title:none"]))
+        stuck = contact_report("email:miss | phone:ok", "Add Contact details")
+        self.assertIn("email did not stick", stuck)
+        moved = contact_report("email:ok | phone:ok | tap:1", "Review traveller details")
+        self.assertIn("Review traveller details", moved)
+        self.assertNotIn("stage other", moved.lower())
+
+    def test_slot_fill_on_cleartrip_and_ixigo_markup(self) -> None:
+        from playwright.sync_api import sync_playwright
+
+        from app.browser_hands import chromium_ready
+        from app.page_agent import _apply_unknown_plan, reveal_form_step
+
+        if not chromium_ready():
+            self.skipTest("chromium missing")
+        cleartrip = """<!doctype html><html><body>
+          <div style="height:1600px">Base Fare Taxes</div>
+          <h3>Add Contact details</h3>
+          <div>+91<input id="cc" value="+91"></div>
+          <div><input id="mobile"></div>
+          <div>Email address<input id="email" type="email" placeholder="Email address"></div>
+          <button onclick="this.remove();document.getElementById('next').hidden=false">Continue</button>
+          <p id="next" hidden>Review traveller details</p>
+        </body></html>"""
+        ixigo = """<!doctype html><html><body>
+          <h3>Traveller details</h3>
+          <div>Email<input id="email" type="email" placeholder="Email"></div>
+          <div>Mobile number<input id="mobile" type="tel"></div>
+          <button onclick="this.remove();document.getElementById('next').hidden=false">Continue</button>
+          <p id="next" hidden>Review traveller details</p>
+        </body></html>"""
+        plan = {
+            "action": "fill",
+            "tap": "Continue",
+            "fills": [
+                {"key": "email", "value": "sudipta@example.com"},
+                {"key": "phone", "value": "8638586171"},
+            ],
+        }
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            for html in (cleartrip, ixigo):
+                page = browser.new_page()
+                page.set_content(html)
+                self.assertTrue(reveal_form_step(page))
+                notes = _apply_unknown_plan(page, plan)
+                body = page.inner_text("body")
+                page.close()
+                self.assertIn("email:ok", notes)
+                self.assertIn("phone:ok", notes)
+                self.assertIn("tap:1", notes)
+                self.assertIn("Review traveller details", body)
+                self.assertNotIn("contact_unready", " ".join(notes))
+            browser.close()
 
     def test_cleartrip_homepage_is_not_the_traveller_form(self) -> None:
         from app.kernel_otp import cleartrip_looks_logged_in

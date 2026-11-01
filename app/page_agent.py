@@ -1984,6 +1984,9 @@ def _field_boxes(page) -> list[dict[str, str]]:
               return [...document.querySelectorAll('input, textarea')].filter(el => vis(el) && !/hidden|radio|checkbox|submit/i.test(el.type || '')).map((el, index) => ({
                 index: String(index),
                 label: labelOf(el),
+                placeholder: el.getAttribute('placeholder') || '',
+                type: (el.getAttribute('type') || '').toLowerCase(),
+                name: (el.getAttribute('aria-label') || el.getAttribute('name') || '').slice(0, 80),
                 value: el.value || '',
               }));
             }"""
@@ -2144,6 +2147,150 @@ def _choose_title(page, title: str) -> tuple[str, str]:
     return "miss", str(menu or "")
 
 
+def box_slot(row: dict) -> str:
+    """Map one input to a profile slot. Prefix boxes are not the mobile number."""
+    label = str(row.get("label") or "")
+    # A parent that wraps several fields leaks every label into one box.
+    if re.search(r"e-?mail", label, re.I) and re.search(r"\+91|mobile|phone", label, re.I):
+        label = ""
+    blob = " ".join(
+        [
+            label,
+            str(row.get("placeholder") or ""),
+            str(row.get("name") or ""),
+            str(row.get("type") or ""),
+        ]
+    ).lower()
+    value = str(row.get("value") or "").strip()
+    if re.fullmatch(r"\+?91", value) or re.search(r"country code|dial code|dialling", blob):
+        return "prefix"
+    if row.get("type") == "email" or re.search(r"e-?mail", blob):
+        return "email"
+    if row.get("type") == "tel" or re.search(r"\bmobile\b|\bphone\b", blob):
+        return "phone"
+    if re.search(r"date of birth|\bdob\b", blob):
+        return "dob"
+    if re.search(r"last name", blob):
+        return "last"
+    if re.search(r"first name|full name|traveller name", blob):
+        return "name"
+    return ""
+
+
+def reveal_form_step(page) -> bool:
+    """Scroll a contact or traveller block into view when it sits below the fold."""
+    try:
+        return bool(
+            page.evaluate(
+                """() => {
+                  const nodes = [...document.querySelectorAll('h1,h2,h3,h4,label,legend,p,div,span,button')];
+                  const hit = nodes.find((node) => {
+                    const text = (node.innerText || '').replace(/\\s+/g, ' ').trim();
+                    return text.length > 3 && text.length < 80
+                      && /add contact|contact details|email address|mobile number|first name/i.test(text);
+                  });
+                  if (!hit) return false;
+                  hit.scrollIntoView({block: 'center'});
+                  return true;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+def _value_stuck(got: str, expected: str, key: str) -> bool:
+    if key == "phone":
+        want = re.sub(r"\D", "", expected)[-10:]
+        return bool(want) and want in re.sub(r"\D", "", got or "")
+    return expected.strip().lower() in (got or "").strip().lower()
+
+
+def _phone_box(boxes: list[dict]) -> dict | None:
+    """The national-number box. A +91 prefix next to it is not that box."""
+    prefix_at = None
+    for index, row in enumerate(boxes):
+        if box_slot(row) == "prefix":
+            prefix_at = index
+    for row in boxes:
+        if box_slot(row) == "phone":
+            return row
+    if prefix_at is None:
+        return None
+    for nxt in boxes[prefix_at + 1 :]:
+        own = f"{nxt.get('placeholder') or ''} {nxt.get('name') or ''} {nxt.get('type') or ''}".lower()
+        if nxt.get("type") == "email" or re.search(r"e-?mail", own):
+            continue
+        if box_slot(nxt) in {"name", "last", "dob"}:
+            continue
+        return nxt
+    return None
+
+
+def fill_profile_slots(page, profile: dict, *, keys: tuple[str, ...] = ("email", "phone", "name", "dob")) -> list[str]:
+    """Type saved facts into whatever boxes this sheet actually shows.
+
+    Matching uses label, placeholder, aria-name, and input type. A +91 prefix
+    stays put; the 10-digit mobile goes in the next box. Each value is checked
+    after typing, with one retry.
+    """
+    from app.step_read import profile_slots
+
+    slots = profile_slots(profile or {})
+    if slots.get("name") == "" and profile.get("name"):
+        slots["name"] = str(profile.get("name") or "").strip()
+    reveal_form_step(page)
+    notes: dict[str, str] = {}
+    for _attempt in (1, 2):
+        boxes = _field_boxes(page)
+        targets: dict[str, dict] = {}
+        for row in boxes:
+            slot = box_slot(row)
+            if slot in keys and slot not in targets:
+                targets[slot] = row
+        phone = _phone_box(boxes)
+        if phone is not None and "phone" in keys:
+            targets["phone"] = phone
+        for key in keys:
+            value = slots.get(key) or ""
+            if not value:
+                continue
+            row = targets.get(key)
+            if row is None:
+                notes[key] = "none"
+                continue
+            if _value_stuck(str(row.get("value") or ""), value, key):
+                notes[key] = "ok"
+                continue
+            status = _set_box(page, int(row["index"]), value)
+            notes[key] = "ok" if status == "ok" else "miss"
+        if all(notes.get(key) in {"ok", "skip"} for key in keys if slots.get(key) and notes.get(key) != "none"):
+            break
+    return [f"{key}:{status}" for key, status in notes.items()]
+
+
+def contact_report(notes: str, page: str) -> str:
+    """WhatsApp line from the fill log and the page after the attempt."""
+    blob = notes or ""
+    if not re.search(r"\b(?:email|phone):", blob):
+        return ""
+    misses = []
+    if re.search(r"\bemail:miss\b", blob):
+        misses.append("email")
+    if re.search(r"\bphone:miss\b", blob):
+        misses.append("mobile")
+    if misses or "contact_unready" in blob:
+        fields = " and ".join(misses) or "a contact field"
+        return f"The contact step is open, but {fields} did not stick. Nothing paid."
+    if re.search(r"\bemail:ok\b", blob) and re.search(r"\bphone:(?:ok|none)\b", blob):
+        if re.search(r"review traveller", page or "", re.I):
+            return "Contact is saved. The page is on Review traveller details. Nothing paid."
+        if re.search(r"\btap:1\b", blob):
+            return "I typed the contact details and pressed Continue. Nothing paid."
+        return "I typed the contact details. Nothing paid."
+    return ""
+
+
 def _field_state(notes: list[str], tag: str) -> str:
     for item in notes:
         if item.startswith(f"{tag}:"):
@@ -2164,7 +2311,16 @@ def _passenger_missing(notes: list[str]) -> list[str]:
 
 
 def _passenger_ready(notes: list[str]) -> bool:
-    """Title, name, and email kept their values. A missing birth-date box is not a failure."""
+    """Ready when every box this sheet actually has kept its value.
+
+    A contact step with no name field is ready once email (and mobile, if shown) stuck.
+    """
+    first = _field_state(notes, "first")
+    email = _field_state(notes, "email")
+    if first in {"", "none", "skip"} and email in {"ok", "typed"}:
+        if _field_state(notes, "phone") in {"miss", "set"}:
+            return False
+        return True
     for tag in ("title", "first", "email"):
         if _field_state(notes, tag) not in {"ok", "typed", "skip", "none"}:
             return False
@@ -2172,7 +2328,34 @@ def _passenger_ready(notes: list[str]) -> bool:
         return False
     if _field_state(notes, "dob") in {"miss", "set"}:
         return False
+    if _field_state(notes, "phone") in {"miss", "set"}:
+        return False
     return True
+
+
+def _apply_unknown_plan(page, plan: dict) -> list[str]:
+    """Fill the slots this sheet shows, and press Continue only after they stick."""
+    profile = {
+        "email": "",
+        "phone": "",
+        "name": "",
+        "dob": "",
+    }
+    for item in plan.get("fills") or []:
+        key = str(item.get("key") or "")
+        if key in profile:
+            profile[key] = str(item.get("value") or "")
+    notes = fill_profile_slots(page, profile)
+    wanted = [str(item.get("key") or "") for item in (plan.get("fills") or [])]
+    missed = [key for key in wanted if _field_state(notes, key) == "miss"]
+    absent = [key for key in wanted if _field_state(notes, key) in {"", "none"}]
+    if missed or absent:
+        notes.append("contact_unready:" + ",".join(missed + absent))
+        return notes
+    tap = str(plan.get("tap") or "")
+    if tap:
+        notes.append(f"tap:{int(_click_label(page, tap))}")
+    return notes
 
 
 def _fill_passenger_fields(page, profile: dict[str, str]) -> list[str]:
@@ -2299,6 +2482,10 @@ def run_checkout_agent(
     for step in range(max_steps):
         page = _latest(page)
         text, url, stage, facts = _snapshot()
+        if "reveal_form" not in log and stage in {"other", "passenger", "review"}:
+            log.append("reveal_form")
+            if reveal_form_step(page):
+                continue
         if time.monotonic() > deadline:
             log.append("checkout_deadline")
             handoff = handoff or (
@@ -2307,7 +2494,11 @@ def run_checkout_agent(
             return CheckoutOutcome(stage, text, url, log, facts=facts, checks=checks, handoff=handoff)
         # A named button is clicked before any add-ons shortcut. Review is not Choose add-ons.
         if tap_pending and not tap_pending.startswith("__"):
-            if re.search(r"pay now|pay to complete|make payment", tap_pending, re.I) and not allow_pay:
+            from app.step_read import form_sheet
+
+            if form_sheet(text) and re.fullmatch(r"continue", tap_pending, re.I):
+                log.append("defer_continue_for_fill")
+            elif re.search(r"pay now|pay to complete|make payment", tap_pending, re.I) and not allow_pay:
                 log.append("user_tap_refused")
                 tap_pending = ""
             elif _click_label(page, tap_pending):
@@ -2383,7 +2574,13 @@ def run_checkout_agent(
                 log.append(f"{step}:vision_off")
         except Exception as exc:
             log.append(f"{step}:vision_err:{type(exc).__name__}")
-        if tap_pending:
+        from app.step_read import form_sheet as _form_sheet
+
+        if _form_sheet(text) and stage not in {"pay", "otp", "login", "error", "unavailable"}:
+            if stage != "other":
+                log.append(f"{step}:form_sheet:{stage}->other")
+            stage = "other"
+        if tap_pending and "defer_continue_for_fill" not in log[-4:]:
             label = tap_pending
             tap_pending = ""
             if label.startswith("__"):
@@ -2462,6 +2659,43 @@ def run_checkout_agent(
             log.append("results_after_book:try_continue")
         if action is None and stage == "review" and sum(1 for line in log if "review_continue" in line) < 3:
             action = {"action": "review_continue", "target": "Continue", "value": ""}
+        contact_tries = sum(1 for line in log if line.startswith("contact_try:"))
+        if action is None and stage == "other" and contact_tries < 2:
+            from app.step_read import form_sheet, plan_unknown_step
+
+            if form_sheet(text):
+                from app.step_read import format_unknown_plan
+
+                plan = plan_unknown_step(text, control_digest(page), profile, intent="give_facts", use_model=False)
+                if plan.get("handled") and plan.get("action") == "ask":
+                    return CheckoutOutcome(
+                        "passenger",
+                        text,
+                        url,
+                        log,
+                        facts=facts,
+                        checks=checks,
+                        handoff=format_unknown_plan(plan) or "Send the missing contact detail. Nothing paid.",
+                    )
+                if plan.get("handled") and plan.get("action") in {"fill", "click"}:
+                    log.append(f"contact_try:{contact_tries + 1}")
+                    applied = _apply_unknown_plan(page, plan)
+                    log.extend(applied)
+                    tap_pending = ""
+                    if any(line.startswith("contact_unready") for line in applied) and contact_tries == 0:
+                        continue
+                    if any(line.startswith("contact_unready") for line in applied):
+                        return CheckoutOutcome(
+                            "passenger",
+                            text,
+                            url,
+                            log,
+                            facts=facts,
+                            checks=checks,
+                            handoff=contact_report(" | ".join(applied), text)
+                            or "The contact step is open, but a field did not stick. Nothing paid.",
+                        )
+                    continue
         if action is None:
             if not chosen_tap:
                 return _pause_unknown(
@@ -2649,8 +2883,17 @@ def run_checkout_agent(
                     log.append(after)
                 continue
             notes = _fill_passenger_fields(page, profile)
+            for extra in fill_profile_slots(page, profile):
+                tag = extra.split(":", 1)[0]
+                if _field_state(notes, tag) in {"", "miss", "none"}:
+                    notes = [line for line in notes if not line.startswith(f"{tag}:")]
+                    notes.append(extra)
             log.extend(notes)
-            if not any(item.startswith(("first:ok", "first:typed")) for item in notes):
+            first = _field_state(notes, "first")
+            email = _field_state(notes, "email")
+            if first not in {"ok", "typed", "none", "skip"} or (
+                first in {"none", "skip", ""} and email not in {"ok", "typed"}
+            ):
                 text, url, stage, facts = _snapshot()
                 if (
                     sum(1 for line in log if line == "review_not_form") < 2
@@ -2666,7 +2909,9 @@ def run_checkout_agent(
                         log.append(after)
                     continue
                 log.append("passenger_unfilled")
-                handoff = "Passenger form is open, but the name did not go into the fields. Nothing paid."
+                handoff = contact_report(" | ".join(notes), text) or (
+                    "Passenger form is open, but the name did not go into the fields. Nothing paid."
+                )
                 return CheckoutOutcome("passenger", text, url, log, facts=facts, checks=checks, handoff=handoff)
             if not _passenger_ready(notes):
                 text, url, stage, facts = _snapshot()

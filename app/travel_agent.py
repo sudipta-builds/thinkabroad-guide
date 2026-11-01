@@ -350,7 +350,13 @@ def handle_turn(
             db.add_message(phone, "assistant", waiting)
             return Reply.of(waiting, emoji="📝")
         kind = "book"
-        state["chosen_tap"] = tap or str(state.get("chosen_tap") or "Skip add-ons")
+        from app.step_read import form_sheet
+
+        open_page = str(state.get("stuck_page") or "")
+        if form_sheet(open_page):
+            state["chosen_tap"] = tap or "Continue"
+        else:
+            state["chosen_tap"] = tap or str(state.get("chosen_tap") or "Skip add-ons")
         _save(phone, state)
     if do == "search":
         kind = "search"
@@ -2309,6 +2315,10 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         shown = "addons"
     if vision_seen and vision_seen.get("fares_visible") and shown not in {"unavailable", "pay", "addons"}:
         shown = "results"
+    from app.step_read import form_sheet
+
+    if form_sheet(page) and shown not in {"pay", "otp", "login", "error", "unavailable"}:
+        shown = "other"
     if shown == "unavailable" or flight_unavailable(page):
         state.pop("form_filled", None)
         return _stuck_line(
@@ -2432,9 +2442,35 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             "I can't tap UPI or net banking myself. Approve that amount and say pay with card "
             "(or send a card to the vault), or say you'll pay yourself and I'll send the link."
         )
-    from app.step_read import arm_pending_step, decide_front, describe_step, step_read_enabled
+    from app.step_read import (
+        arm_pending_step,
+        decide_front,
+        describe_step,
+        format_unknown_plan,
+        plan_unknown_step,
+        step_read_enabled,
+    )
 
     controls = str(surface.get("controls") or "")
+    if shown == "other":
+        intent = "give_facts" if state.get("email") or state.get("phone") or state.get("name") else ""
+        if re.fullmatch(r"continue|go on|yes", str(state.get("chosen_tap") or ""), re.I):
+            intent = "agree"
+        plan = plan_unknown_step(
+            f"{page or ''}\n{controls}",
+            controls,
+            state,
+            intent=intent,
+            use_model=False,
+        )
+        spoken = format_unknown_plan(plan)
+        if spoken:
+            if plan.get("action") in {"fill", "click"} and plan.get("tap"):
+                state["chosen_tap"] = str(plan["tap"])
+                arm_pending_step(state, page, "form", tap=str(plan["tap"]))
+            state["stuck_kind"] = "pay" if plan.get("action") == "stop" else "form"
+            state["last_stuck"] = spoken
+            return spoken
     if not controls and session.page is not None and not surface.get("overlay"):
         try:
             from app.page_agent import control_digest
@@ -2842,12 +2878,22 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         and re.search(r"title:(?:ok|typed|none)\b", notes)
         and not re.search(r"(?:title|first|last|email|dob):(?:miss|set)\b", notes)
     )
-    state["form_filled"] = bool(filled)
+    contact_filled = bool(
+        re.search(r"email:ok\b", notes)
+        and re.search(r"phone:(?:ok|none)\b", notes)
+        and not re.search(r"(?:email|phone):miss\b", notes)
+    )
+    state["form_filled"] = bool(filled or contact_filled)
+    from app.page_agent import contact_report
+
+    report = contact_report(notes, text)
     _save(phone, state)
     waiting = _form_ask_if_needed(state)
     from app.page_agent import flight_unavailable as _flight_gone
 
-    if shown == "unavailable" or _flight_gone(text):
+    if report:
+        spoken = report
+    elif shown == "unavailable" or _flight_gone(text):
         spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), text, _Session())  # type: ignore[arg-type]
     elif shown in {"home", "cookie", "results", "loading", "addons", "fare_sheet", "review", "pay"}:
         spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), text, _Session())  # type: ignore[arg-type]

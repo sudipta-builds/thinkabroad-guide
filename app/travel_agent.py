@@ -378,6 +378,8 @@ def handle_turn(
         kind = str(plan.get("kind") or "book")
         if tap:
             state["chosen_tap"] = tap
+        elif named_seller_from(text):
+            state.pop("chosen_tap", None)
         state.pop("pending_step", None)
         _save(phone, state)
     cached = _cached_fares_reply(state, text, kind)
@@ -2408,19 +2410,15 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     if shown == "error" or site_error_page(page, url) or "itinerary/failure" in url:
         state.pop("live", None)
         state["stuck_kind"] = "error"
-        from app.step_read import safe_tap as _safe
-
-        home = _safe("Go to home", page) or _safe("Search Again", page)
-        rec = (
-            f"I'll press {home} and open a fresh fare list"
-            if home
-            else "say start fresh or search again and I'll open a new fare list"
-        )
+        seller_id = str(state.get("seller") or "").lower()
+        other = "Ixigo" if seller_id == "cleartrip" else "Cleartrip"
+        when = hint or str(state.get("selected_hint") or "")
+        rec = f"send {other} {when}".strip() + " and I'll open that same flight there"
         return _stuck_line(
             state,
             "error",
             f"{seller} system error for the {which} on {trip}",
-            "the site is not showing the booking sheet (see the screenshot)",
+            "the site rejected this itinerary after one fresh search",
             rec,
         )
     needs_login = bool(re.search(r"\bpassword\b", page, re.I) and re.search(r"log ?in|sign in|sign up", page, re.I))

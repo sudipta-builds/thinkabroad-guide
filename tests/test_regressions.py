@@ -1735,8 +1735,19 @@ class SellerChoiceAndProxy(unittest.TestCase):
         }
         reply = _booking_page_reply(state, "10:45", err, type("S", (), {"page": None})())
         self.assertIn("system error", reply.lower())
+        self.assertIn("Ixigo 10:45", reply)
+        self.assertNotIn("I'll press Go to home", reply)
         self.assertNotIn("Ready to pay", reply)
         self.assertNotIn("payment page", reply.lower())
+        import inspect as _inspect
+
+        from app.page_agent import _confirm_fare, _reopen_cleartrip_results, run_checkout_agent
+
+        checkout_src = _inspect.getsource(run_checkout_agent)
+        self.assertIn("leave_site_error", checkout_src)
+        self.assertIn("_reopen_cleartrip_results", checkout_src)
+        self.assertIn("error_rebook:results", _inspect.getsource(_reopen_cleartrip_results))
+        self.assertIn('outcome in {"denied", "error"}', _inspect.getsource(_confirm_fare))
         import inspect
 
         from app.kernel_otp import begin_login, kernel_failure_line
@@ -1763,6 +1774,32 @@ class SellerChoiceAndProxy(unittest.TestCase):
         )
         self.assertEqual(ask.get("tap"), "Go to home")
         self.assertEqual(ask.get("goal"), "forward")
+
+    def test_naming_ixigo_on_cleartrip_error_does_not_press_go_home(self) -> None:
+        from app.turn_loop import align_action
+
+        state = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "cleartrip",
+            "selected_hint": "10:45",
+            "stuck_kind": "error",
+            "stuck_page": "Sorry our system is acting up Go to home",
+            "last_vision": {"kind": "error", "tap": "Go to home"},
+            "chosen_tap": "Go to home",
+        }
+        turn = {
+            "kind": "error",
+            "intent": "status",
+            "goal": "ask",
+            "tap": "Go to home",
+            "reply": "The site encountered an error, please tap Go to home to start fresh.",
+        }
+        plan = align_action("Ixigo 10:45", state, turn)
+        self.assertEqual(plan["do"], "book")
+        self.assertEqual(plan.get("tap") or "", "")
+        self.assertNotIn("go to home", str(plan.get("reply") or "").lower())
 
     def test_kernel_success_is_the_live_page(self) -> None:
         import inspect

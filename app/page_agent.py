@@ -354,7 +354,8 @@ def deterministic_action(stage: str, *, hint: str, recovers: int, url: str = "")
     if stage == "cookie":
         return {"action": "click", "target": "Accept", "value": ""}
     if stage == "error" and recovers < 1:
-        return {"action": "click", "target": "Try again", "value": ""}
+        # Cleartrip's sheet says Go to home, not Try again.
+        return {"action": "click", "target": "Go to home", "value": ""}
     if stage == "error":
         return {"action": "stuck", "target": "error", "value": ""}
     if stage == "fare_sheet":
@@ -1033,7 +1034,12 @@ def _confirm_fare(page) -> bool:
         create.get("status"),
         outcome,
     )
+    # A 403 or server error is a rejected booking even if the URL changes to the beach-chair page.
+    if outcome in {"denied", "error"}:
+        return False
     left = _wait_until(page, "fare_sheet", rounds=8)
+    if left == "error":
+        return False
     if left != "fare_sheet":
         return True
     # Click ran; Cleartrip did not accept the booking step.
@@ -1223,6 +1229,35 @@ def click_verified(page, label: str) -> bool:
 def _click_label(page, label: str) -> bool:
     """Verified click. True only when the page actually changes."""
     return click_verified(page, label)
+
+
+def leave_site_error(page) -> str:
+    """Click the control Cleartrip actually shows on the acting-up sheet."""
+    text, _url = _read(page)
+    for label in ("Go to home", "Search Again", "Try again"):
+        if not re.search(re.escape(label), text or "", re.I):
+            continue
+        if _click_label(page, label):
+            return label
+    return ""
+
+
+def _reopen_cleartrip_results(page, origin: str, destination: str, depart: str, log: list[str]) -> bool:
+    """Drop the dead itinerary and open a fresh Cleartrip fare list. One recovery, same browser."""
+    from app.search import cleartrip_results_url
+
+    try:
+        page.goto(
+            cleartrip_results_url(origin, destination, depart),
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        page.wait_for_timeout(800)
+        log.append("error_rebook:results")
+        return True
+    except Exception:
+        log.append("error_rebook:miss")
+        return False
 
 
 def _skip_addons(page) -> str:
@@ -3027,14 +3062,23 @@ def run_checkout_agent(
                 text, url, left, facts = _snapshot()
                 log.append(f"confirm_fare:{ok}")
                 log.append(f"after_continue:{left}")
-                if not ok and left == "fare_sheet":
-                    return CheckoutOutcome("error", text, url, log + ["continue_blocked"], facts=facts, checks=checks)
+                if not ok and left in {"fare_sheet", "error"}:
+                    log.append("continue_blocked")
+                    if seller == "cleartrip" and recovers < 1:
+                        recovers += 1
+                        if _reopen_cleartrip_results(page, origin, destination, depart, log):
+                            continue
+                    return CheckoutOutcome("error", text, url, log, facts=facts, checks=checks)
                 continue
             if stage == "error":
                 recovers += 1
-                _click_label(page, target or "Try again")
-                left = _wait_until(page, "error", rounds=8)
+                tapped = leave_site_error(page)
+                log.append(f"error_tap:{tapped or 'miss'}")
+                left = _wait_until(page, "error", rounds=6)
                 log.append(f"after_retry:{left}")
+                if left == "error" and seller == "cleartrip":
+                    if not _reopen_cleartrip_results(page, origin, destination, depart, log):
+                        break
                 continue
             _click_label(page, target)
             _poll_ready(

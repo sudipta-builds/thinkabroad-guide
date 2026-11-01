@@ -41,7 +41,7 @@ _TURN = (
     "If they say start fresh / start over / search again, intent=search, goal=search. "
     "Ignore a stale add-ons screenshot and do not recommend Skip add-ons.\n"
     "If the screenshot is a site error (system acting up, Go to home), kind=error. "
-    "Never say ready to pay. Recommend start fresh or Go to home.\n"
+    "Never say ready to pay. Do not recommend Go to home. Recommend the other seller and the saved departure time.\n"
     "reply: one short sentence for WhatsApp. No emoji. Nothing paid."
 )
 
@@ -477,6 +477,11 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
     if sheet == "error" or site_error_page(stuck_text, ""):
         if wants_fresh_search(text):
             return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
+        from app.search import named_seller
+
+        if named_seller(text) or clock:
+            # A new site or a flight time leaves the dead sheet. Do not press Go to home.
+            return {"do": "book", "kind": "book", "tap": "", "turn": turn, "reply": ""}
         home = safe_tap("Go to home", stuck_text) or safe_tap("Search Again", stuck_text)
         if intent in {"book", "select"} or goal in {"forward", "skip"}:
             return {

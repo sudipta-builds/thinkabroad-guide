@@ -545,6 +545,10 @@ def ground_unknown_plan(
     """One safe action from the visible sheet and saved facts. No screen catalog."""
     hay = _hay(page, controls)
     empty = {"action": "", "tap": "", "fills": [], "what": "", "why": "", "recommend": "", "handled": False}
+    from app.page_agent import site_error_page
+
+    if site_error_page(hay, ""):
+        return empty
     if re.search(r"pay to complete|enter card number|payment options", hay, re.I):
         return {
             "action": "stop",

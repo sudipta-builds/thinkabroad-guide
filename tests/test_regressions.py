@@ -1717,12 +1717,15 @@ class SellerChoiceAndProxy(unittest.TestCase):
 
         err = (
             "Sorry our system is acting up Go to home "
-            "Review your itinerary Pay now UPI card number pay to complete hidden"
+            "Review your itinerary Pay now UPI card number pay to complete hidden Payment options"
         )
         self.assertTrue(site_error_page(err, "https://www.cleartrip.com/flights/itinerary/x"))
         self.assertEqual(classify_page(err, "https://www.cleartrip.com/flights/itinerary/x"), "error")
         self.assertFalse(payment_sheet_open(err, "error"))
         self.assertFalse(payment_sheet_open(err, "pay"))
+        from app.step_read import ground_unknown_plan
+
+        self.assertNotEqual(ground_unknown_plan(err, "btn Payment options", {}).get("action"), "stop")
         state = {
             "origin": "Guwahati",
             "destination": "Delhi",
@@ -1733,6 +1736,19 @@ class SellerChoiceAndProxy(unittest.TestCase):
         reply = _booking_page_reply(state, "10:45", err, type("S", (), {"page": None})())
         self.assertIn("system error", reply.lower())
         self.assertNotIn("Ready to pay", reply)
+        self.assertNotIn("payment page", reply.lower())
+        import inspect
+
+        from app.kernel_otp import begin_login, kernel_failure_line
+
+        src = inspect.getsource(begin_login)
+        self.assertIn("dead_error", src)
+        self.assertLess(src.index("dead_error = True"), src.index("is_resume_booking_url"))
+        self.assertIn("timeout=90_000", src)
+        self.assertIn(
+            "browser didn't connect",
+            kernel_failure_line("Cleartrip", "TimeoutError: BrowserType.connect_over_cdp: Timeout 180000ms exceeded"),
+        )
 
     def test_yes_after_go_to_home_arms_pending_tap(self) -> None:
         from app.travel_agent import extract_user_ask
@@ -1881,6 +1897,8 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn('do == "book"', src)
         self.assertIn("last_vision", inspect.getsource(handle_turn).split("if changed:")[1][:400])
         self.assertIn("clear_checkout_memory", src)
+        self.assertIn("release_saved_kernel", src)
+        self.assertLess(src.index("release_saved_kernel("), src.index("clear_checkout_memory(state)"))
         self.assertIn("wants_fresh_search", src)
         self.assertEqual(align_action("let's start fresh", addons)["do"], "search")
         self.assertEqual(align_action("Skip add-ons", addons)["do"], "book")

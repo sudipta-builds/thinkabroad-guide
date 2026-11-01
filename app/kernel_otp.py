@@ -417,6 +417,27 @@ def _drop(client, session_id: str) -> None:
         pass
 
 
+def release_saved_kernel(session_id: str) -> None:
+    """Delete the remote browser. Chat memory is cleared by the caller."""
+    sid = (session_id or "").strip()
+    if not sid or not kernel_configured():
+        return
+    try:
+        _drop(_client(), sid)
+    except Exception:
+        pass
+
+
+def kernel_failure_line(seller_label: str, detail: str) -> str:
+    """WhatsApp line for a Kernel failure. A CDP timeout is not a login form."""
+    if re.search(r"Timeout|connect_over_cdp|TimeoutError", detail or "", re.I):
+        return (
+            f"{seller_label} browser didn't connect. "
+            "Say the flight time again and I'll open a new one. Nothing paid."
+        )
+    return f"I couldn't open {seller_label} ({detail}). Nothing paid."
+
+
 def _start_hold(session_id: str, cdp_ws_url: str) -> None:
     """Hold a Playwright CDP socket open until the traveller replies with the code."""
     _stop_hold(session_id)
@@ -524,13 +545,21 @@ def begin_login(
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as p:
-            pw = p.chromium.connect_over_cdp(browser.cdp_ws_url)
+            try:
+                pw = p.chromium.connect_over_cdp(browser.cdp_ws_url, timeout=90_000)
+            except Exception:
+                _drop(client, sid)
+                browser = _open_browser(client, browser_profile)
+                reused = False
+                sid = browser.session_id
+                pw = p.chromium.connect_over_cdp(browser.cdp_ws_url, timeout=90_000)
             context = pw.contexts[0] if pw.contexts else pw.new_context()
             page = context.pages[0] if context.pages else context.new_page()
             outcome: dict[str, str] | None = None
             checkout = None
             checkout_notes = ""
             resume_kept = False
+            dead_error = False
             skip_tap = bool(re.search(r"skip add", chosen_tap or "", re.I))
             text, url = _read_visible(page)
             stage = classify_page(text, url, book_count=_book_count(page))
@@ -600,12 +629,22 @@ def begin_login(
                         _checkout_now()
                     except Exception:
                         pass
-                    resume_kept = True
+                    text, url = _read_visible(page)
+                    stage = classify_page(text, url, book_count=_book_count(page))
+                    if stage == "error" or site_error_page(text, url):
+                        # Go to home did not leave the dead sheet. Do not keep it or reopen it.
+                        dead_error = True
+                        chosen_tap = ""
+                        skip_tap = False
+                        resume_kept = False
+                    else:
+                        resume_kept = True
                 else:
+                    dead_error = True
                     chosen_tap = ""
                     skip_tap = False
             # Saved checkout URL is a fallback when that tab is gone.
-            if not resume_kept and hint and resume_url and is_resume_booking_url(resume_url, seller):
+            if not resume_kept and not dead_error and hint and resume_url and is_resume_booking_url(resume_url, seller):
                 try:
                     page.goto(resume_url, wait_until="domcontentloaded", timeout=45000 if chosen_tap else 120000)
                     page.wait_for_timeout(1500)

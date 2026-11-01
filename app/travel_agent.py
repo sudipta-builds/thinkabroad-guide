@@ -155,6 +155,9 @@ def handle_turn(
 
         state["preferred_seller"] = next_bookable_seller(str(state.get("seller") or state.get("preferred_seller") or ""))
         state["seller"] = state["preferred_seller"]
+        from app.kernel_otp import release_saved_kernel
+
+        release_saved_kernel(str(state.get("kernel_session_id") or ""))
         state.pop("live", None)
         state.pop("kernel_session_id", None)
         state.pop("kernel_logged_in", None)
@@ -167,6 +170,9 @@ def handle_turn(
         if kind == "book" and named and named not in NOT_BOOKABLE:
             previous = str(state.get("kernel_seller") or state.get("seller") or state.get("preferred_seller") or "")
             if named != previous:
+                from app.kernel_otp import release_saved_kernel
+
+                release_saved_kernel(str(state.get("kernel_session_id") or ""))
                 state.pop("live", None)
                 state.pop("kernel_session_id", None)
                 state.pop("kernel_logged_in", None)
@@ -177,6 +183,9 @@ def handle_turn(
     named_now = named_seller_from(text)
     kernel_now = str(state.get("kernel_seller") or "")
     if named_now and kernel_now and named_now != kernel_now:
+        from app.kernel_otp import release_saved_kernel
+
+        release_saved_kernel(str(state.get("kernel_session_id") or ""))
         state.pop("kernel_session_id", None)
         state.pop("kernel_logged_in", None)
         state.pop("kernel_seller", None)
@@ -269,6 +278,9 @@ def handle_turn(
     from app.turn_loop import wants_fresh_search, clear_checkout_memory
 
     if wants_fresh_search(text):
+        from app.kernel_otp import release_saved_kernel
+
+        release_saved_kernel(str(state.get("kernel_session_id") or ""))
         clear_checkout_memory(state)
         state.pop("selected_hint", None)
         _save(phone, state)
@@ -2319,6 +2331,8 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
 
     if form_sheet(page) and shown not in {"pay", "otp", "login", "error", "unavailable"}:
         shown = "other"
+    if site_error_page(page, url) or (vision_seen and str(vision_seen.get("kind") or "") == "error"):
+        shown = "error"
     if shown == "unavailable" or flight_unavailable(page):
         state.pop("form_filled", None)
         return _stuck_line(
@@ -3012,9 +3026,11 @@ def _run_kernel_login(
             shots = [result["screenshot"]] if result.get("screenshot") else None
             _deliver(phone, spoken, None, secrets, shot_paths=shots)
         else:
+            from app.kernel_otp import kernel_failure_line
+
             _deliver(
                 phone,
-                f"I couldn't open {_seller_label(seller)} login ({detail}). Nothing paid.",
+                kernel_failure_line(_seller_label(seller), detail),
                 None,
                 secrets,
             )

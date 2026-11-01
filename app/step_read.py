@@ -57,7 +57,8 @@ def step_read_enabled() -> bool:
 
 
 _ADDONS_SHEET = re.compile(
-    r"choose add-ons|choose your seat|add seats|missed adding meal|skip add-?ons|seat map",
+    r"choose add-ons|choose your seat|add seats|missed adding meal|skip add-?ons|"
+    r"add meals|add extra luggage|seat map",
     re.I,
 )
 _AGREE_ONLY = re.compile(
@@ -72,10 +73,13 @@ def on_review_itinerary(page: str) -> bool:
 
 
 def addons_sheet(page: str) -> bool:
-    """Choose add-ons / seat map. Review your itinerary is never this sheet."""
-    if on_review_itinerary(page):
+    """Choose add-ons / seat map. Skip add-ons on screen always counts as this sheet."""
+    hay = page or ""
+    if re.search(r"skip add-?ons|choose add-ons|missed adding meal", hay, re.I):
+        return True
+    if on_review_itinerary(hay):
         return False
-    return bool(_ADDONS_SHEET.search(page or ""))
+    return bool(_ADDONS_SHEET.search(hay))
 
 
 def visible_forward(page: str, requested: str = "") -> str:
@@ -512,9 +516,16 @@ _SLOTS = (
 
 
 def form_sheet(page: str) -> bool:
-    """A visible form, not a fare list, add-ons sheet, or review itinerary."""
+    """A visible contact form, not traveller names, fare list, or add-ons."""
     hay = page or ""
     if addons_sheet(hay) or on_review_itinerary(hay):
+        return False
+    # Cleartrip "Add traveller details" still shows the saved email in the header.
+    if re.search(
+        r"add traveller|first & middle|first name|last name \(surname\)|adult 1",
+        hay,
+        re.I,
+    ):
         return False
     return bool(_FORM_MARK.search(hay))
 

@@ -260,8 +260,19 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         re.I,
     ):
         return "otp"
-    if re.search(r"log in to ixigo|loginVisible=true|enter mobile number", hay, re.I) and re.search(
+    # Cleartrip contact validation says "Please enter Mobile Number" — that is not login.
+    if re.search(r"add contact details|email address", hay, re.I) and re.search(
+        r"\+91|continue|review traveller", hay, re.I
+    ):
+        return "other"
+    if re.search(r"log in to ixigo|loginVisible=true", hay, re.I) and re.search(
         r"continue|google", hay, re.I
+    ):
+        return "login"
+    if (
+        re.search(r"enter mobile number", hay, re.I)
+        and re.search(r"continue|google|get otp", hay, re.I)
+        and not re.search(r"add contact|email address|review traveller", hay, re.I)
     ):
         return "login"
     if re.search(r"pay to complete your booking|name on card|enter card number|scan qr code", hay, re.I):
@@ -276,21 +287,22 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         return "pay"
     priced = bool(re.search(r"₹\s*[0-9]", hay))
     has_time = bool(re.search(r"\b\d{1,2}:\d{2}\b", hay))
-    if re.search(r"review your itinerary", hay, re.I):
-        return "review"
-    if re.search(r"choose add-ons|missed adding|add seats|skip add-?ons", hay, re.I):
-        return "addons"
     # Fare picker drawer can sit on top of a still-visible results list — detect it first.
     if _looks_like_fare_sheet(hay):
         return "fare_sheet"
+    # Live Skip / Choose add-ons beats a lone "Book" word left on the itinerary sheet.
+    if re.search(r"choose add-ons|missed adding|skip add-?ons", hay, re.I):
+        return "addons"
     fare_list = bool(
         has_time and priced and (book_count >= 1 or re.search(r"\b(Book|Select|View fares)\b", hay))
     )
-    # Fare lists win over add-on marketing copy / stepper labels on Cleartrip/Ixigo results.
+    # Fare lists win over soft add-on marketing copy on Cleartrip/Ixigo results.
     if fare_list and not flight_unavailable(hay):
         return "results"
-    # Ixigo review also shows the "Add-ons" stepper label — require the real add-on sheet.
-    if re.search(r"choose your seat|add meal|skip add-?ons", hay, re.I):
+    if re.search(r"review your itinerary", hay, re.I):
+        return "review"
+    # Meals/luggage sheet without a review heading (Skip already handled above).
+    if re.search(r"add seats|add meals|add extra luggage|choose your seat|add meal", hay, re.I):
         return "addons"
     # A review sheet that already shows the traveller is not the empty name form.
     if re.search(r"review details", hay, re.I) and re.search(r"\bcontinue\b", hay, re.I) and not re.search(
@@ -301,15 +313,20 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         r"mobile|email|gender", hay, re.I
     ):
         return "passenger"
+    # Heading alone is enough — placeholders may not appear in inner_text.
+    if re.search(r"add traveller details|review traveller details", hay, re.I) and re.search(
+        r"\bcontinue\b|male|female|title", hay, re.I
+    ):
+        return "passenger"
     if re.search(r"review & traveller|fare summary|total amount", hay, re.I) and re.search(
         r"\b(?:IX|AI|6E|SG|QP)[\s-]*\d+", hay, re.I
     ):
         return "review"
     if re.search(r"fare summary", hay, re.I) and re.search(r"\bcontinue\b", hay, re.I) and not re.search(
-        r"first & middle|first name|last name", hay, re.I
+        r"first & middle|first name|last name|add traveller", hay, re.I
     ):
         return "review"
-    if re.search(r"first & middle|first name|last name|add adult|primary passenger", hay, re.I):
+    if re.search(r"first & middle|first name|last name|add adult|primary passenger|add traveller", hay, re.I):
         return "passenger"
     if re.search(r"we respect your privacy|accept all cookies|cookie policy", hay, re.I) and not (priced and has_time):
         return "cookie"
@@ -900,7 +917,18 @@ def _advance_after_book(page, hint: str, log: list[str]) -> bool:
         log.append("after_book:fare_sheet")
         ok = _confirm_fare(page)
         log.append(f"confirm_fare:{ok}")
-        return True
+        if not ok:
+            try:
+                page.wait_for_timeout(800)
+            except Exception:
+                pass
+            ok = _confirm_fare(page)
+            log.append(f"confirm_fare_retry:{ok}")
+        text_after, url_after = _read(page)
+        stage_after = classify_page(text_after, url_after, book_count=_book_count(page))
+        return ok or stage_after in {"addons", "review", "passenger", "pay", "login", "otp"} or (
+            "itinerary" in (url_after or "").lower() and stage_after != "error"
+        )
     # JS Book sometimes paints no drawer — try a real mouse Book on the departure card.
     if hint and _mouse_book_depart(page, hint):
         log.append("after_book:mouse_book")
@@ -910,15 +938,18 @@ def _advance_after_book(page, hint: str, log: list[str]) -> bool:
             pass
         after, _au, after_stage, _af = _poll_ready(
             page,
-            {"fare_sheet", "review", "passenger", "login", "otp", "pay", "error", "unavailable"},
+            {"fare_sheet", "review", "passenger", "login", "otp", "pay", "error", "unavailable", "addons"},
             budget_ms=3500,
         )
         if after_stage == "fare_sheet" or _looks_like_fare_sheet(after):
             log.append("after_book:fare_sheet")
             ok = _confirm_fare(page)
             log.append(f"confirm_fare:{ok}")
-            return True
-        if after_stage in {"review", "passenger", "login", "otp", "pay"}:
+            if not ok:
+                ok = _confirm_fare(page)
+                log.append(f"confirm_fare_retry:{ok}")
+            return ok or "itinerary" in (_read(page)[1] or "").lower()
+        if after_stage in {"review", "passenger", "login", "otp", "pay", "addons"}:
             log.append(f"after_book:{after_stage}")
             return True
     return False
@@ -993,43 +1024,90 @@ def _confirm_fare(page) -> bool:
         page.on("response", on_response)
     except Exception:
         pass
-    try:
-        point = page.evaluate(
-            """() => {
-                const root = document.querySelector('[role="dialog"]') || document.body;
-                const radio = [...root.querySelectorAll('input[type="radio"]')].find(r => !r.checked)
-                    || root.querySelector('input[type="radio"]');
-                if (radio) radio.click();
-                const fare = [...root.querySelectorAll('label,div,button')].find(el => {
-                    const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-                    return t.length > 0 && t.length < 180 && /₹/.test(t)
-                        && /saver|value|flexi|classic|flex|standard|regular fare/i.test(t);
-                });
-                if (fare) fare.click();
-                const btn = [...root.querySelectorAll('button,a,[role=button]')].reverse().find(
-                    b => /^(continue|proceed|continue booking)$/i.test((b.innerText || '').trim())
-                );
-                if (!btn) return null;
-                btn.scrollIntoView({block:'center'});
-                const r = btn.getBoundingClientRect();
-                return {x: r.x + r.width / 2, y: r.y + r.height / 2};
-            }"""
-        )
-    except Exception:
+
+    def _click_continue() -> bool:
+        try:
+            point = page.evaluate(
+                """() => {
+                    const root = document.querySelector('[role="dialog"]') || document.body;
+                    const radios = [...root.querySelectorAll('input[type="radio"]')];
+                    const radio = radios.find(r => r.checked) || radios.find(r => !r.disabled) || radios[0];
+                    if (radio && !radio.checked) radio.click();
+                    const fare = [...root.querySelectorAll('label,div,button')].find(el => {
+                        const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                        return t.length > 0 && t.length < 180 && /₹/.test(t)
+                            && /saver|value|flexi|classic|flex|standard|regular fare/i.test(t);
+                    });
+                    if (fare) fare.click();
+                    const btn = [...root.querySelectorAll('button,a,[role=button]')].reverse().find(
+                        b => /^(continue|proceed|continue booking)$/i.test((b.innerText || '').trim())
+                    );
+                    if (!btn) return null;
+                    btn.scrollIntoView({block:'center'});
+                    const r = btn.getBoundingClientRect();
+                    return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+                }"""
+            )
+        except Exception:
+            point = None
+        if isinstance(point, dict) and point.get("x") is not None:
+            try:
+                page.mouse.click(float(point["x"]), float(point["y"]))
+                return True
+            except Exception:
+                pass
+        try:
+            btn = page.get_by_role("button", name=re.compile(r"^(Continue|Proceed)$", re.I)).last
+            btn.scroll_into_view_if_needed(timeout=3000)
+            btn.click(timeout=5000)
+            return True
+        except Exception:
+            return _safe_continue(page)
+
+    clicked = _click_continue()
+    if not clicked:
+        try:
+            page.remove_listener("response", on_response)
+        except Exception:
+            pass
         return False
-    if not isinstance(point, dict):
-        return False
-    try:
-        page.mouse.click(float(point["x"]), float(point["y"]))
-    except Exception:
-        return False
-    for _ in range(30):
+
+    for _ in range(60):
         if create["status"] is not None:
             break
         try:
+            url_now = page.url or ""
+            if "itinerary" in url_now and "/results" not in url_now:
+                break
             page.wait_for_timeout(500)
         except Exception:
             break
+
+    # First click often no-ops under Akamai; one more Continue if still on the fare drawer.
+    try:
+        text_now, url_now = _read(page)
+        still_fare = classify_page(text_now, url_now, book_count=_book_count(page)) == "fare_sheet" or (
+            _looks_like_fare_sheet(text_now) and "itinerary" not in (url_now or "")
+        )
+    except Exception:
+        still_fare = create["status"] is None
+    if still_fare and create["status"] is None:
+        _click_continue()
+        for _ in range(40):
+            if create["status"] is not None:
+                break
+            try:
+                if "itinerary" in (page.url or "") and "/results" not in (page.url or ""):
+                    break
+                page.wait_for_timeout(500)
+            except Exception:
+                break
+
+    try:
+        page.remove_listener("response", on_response)
+    except Exception:
+        pass
+
     outcome = interpret_itinerary_create(
         create["status"] if isinstance(create["status"], int) else None,
         str(create.get("body") or ""),
@@ -1042,11 +1120,19 @@ def _confirm_fare(page) -> bool:
     # A 403 or server error is a rejected booking even if the URL changes to the beach-chair page.
     if outcome in {"denied", "error"}:
         return False
-    left = _wait_until(page, "fare_sheet", rounds=8)
+    left = _wait_until(page, "fare_sheet", rounds=16)
     if left == "error":
         return False
+    if left in {"addons", "review", "passenger", "pay", "login", "otp", "other"}:
+        return True
     if left != "fare_sheet":
         return True
+    try:
+        # Kernel can miss the XHR body while the tab already opened itinerary.
+        if "itinerary" in (page.url or "") and "/results" not in (page.url or ""):
+            return True
+    except Exception:
+        pass
     # Click ran; Cleartrip did not accept the booking step.
     return False
 
@@ -1384,20 +1470,48 @@ def _leave_addons(page, log: list[str], *, rounds: int = 3) -> bool:
             return True
         hit = _skip_addons(page)
         log.append(f"addons_skip:{hit or 'miss'}:{i}")
+        try:
+            page.wait_for_timeout(900)
+        except Exception:
+            pass
         text, url = _read(page)
         stage = classify_page(text, url, book_count=_book_count(page))
-        if re.search(r"review your itinerary", text or "", re.I) or left_addons(text, stage):
+        if left_addons(text, stage):
             log.append(f"addons_left:{stage}")
             return True
-        # Skip is absent or did not move this sheet. Continue is the control that opens review.
+        # Flex upsell / meals with Skip still up: scroll and try Skip again before Continue.
+        if re.search(r"skip add-?ons|add meals|fully flexible", text or "", re.I):
+            try:
+                page.mouse.wheel(0, 1200)
+                page.wait_for_timeout(400)
+            except Exception:
+                pass
+            hit2 = _skip_addons(page)
+            log.append(f"addons_skip_scroll:{hit2 or 'miss'}:{i}")
+            text, url = _read(page)
+            stage = classify_page(text, url, book_count=_book_count(page))
+            if left_addons(text, stage):
+                log.append(f"addons_left:{stage}")
+                return True
+        # Skip is absent or did not move this sheet. Continue opens contact / review.
         if stage != "pay" and not re.search(r"pay to complete|enter card number|payment options", text or "", re.I):
+            try:
+                page.mouse.wheel(0, 900)
+                page.wait_for_timeout(300)
+            except Exception:
+                pass
             moved = _safe_continue(page)
             log.append(f"review_continue:{int(bool(moved))}:{i}")
         _poll_ready(
             page,
-            {"review", "passenger", "pay", "login", "otp", "error", "unavailable"},
-            budget_ms=3500,
+            {"review", "passenger", "pay", "login", "otp", "error", "unavailable", "other"},
+            budget_ms=4500,
         )
+        text, url = _read(page)
+        stage = classify_page(text, url, book_count=_book_count(page))
+        if left_addons(text, stage):
+            log.append(f"addons_left:{stage}")
+            return True
     text, url = _read(page)
     stage = classify_page(text, url, book_count=_book_count(page))
     ok = left_addons(text, stage)
@@ -2010,7 +2124,8 @@ def _field_boxes(page) -> list[dict[str, str]]:
               const vis = (el) => {
                 const r = el.getBoundingClientRect();
                 const s = getComputedStyle(el);
-                return r.width > 8 && r.height > 8 && s.visibility !== 'hidden' && s.display !== 'none';
+                return r.width > 4 && r.height > 4 && s.visibility !== 'hidden' && s.display !== 'none'
+                  && s.opacity !== '0';
               };
               const labelOf = (el) => {
                 let node = el;
@@ -2021,19 +2136,176 @@ def _field_boxes(page) -> list[dict[str, str]]:
                 }
                 return '';
               };
-              return [...document.querySelectorAll('input, textarea')].filter(el => vis(el) && !/hidden|radio|checkbox|submit/i.test(el.type || '')).map((el, index) => ({
-                index: String(index),
-                label: labelOf(el),
-                placeholder: el.getAttribute('placeholder') || '',
-                type: (el.getAttribute('type') || '').toLowerCase(),
-                name: (el.getAttribute('aria-label') || el.getAttribute('name') || '').slice(0, 80),
-                value: el.value || '',
-              }));
+              const nodes = [...document.querySelectorAll(
+                'input, textarea, [contenteditable="true"], [role="textbox"]'
+              )];
+              return nodes.filter(el => {
+                if (!vis(el)) return false;
+                const type = (el.getAttribute('type') || '').toLowerCase();
+                if (/hidden|radio|checkbox|submit|button/.test(type)) return false;
+                return true;
+              }).map((el, index) => {
+                const r = el.getBoundingClientRect();
+                return {
+                  index: String(index),
+                  label: labelOf(el),
+                  placeholder: el.getAttribute('placeholder') || '',
+                  type: (el.getAttribute('type') || (el.isContentEditable ? 'text' : '')).toLowerCase(),
+                  name: (el.getAttribute('aria-label') || el.getAttribute('name') || '').slice(0, 80),
+                  value: (el.value != null ? el.value : (el.innerText || '')).slice(0, 120),
+                  x: r.x,
+                  y: r.y,
+                };
+              });
             }"""
         )
     except Exception:
         return []
     return [row for row in (rows or []) if isinstance(row, dict)]
+
+
+def _wake_cleartrip_mobile(page) -> None:
+    """Cleartrip often hides the national box until the +91 row is focused."""
+    try:
+        page.evaluate(
+            """() => {
+              const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              const inputs = [...document.querySelectorAll('input')].filter(vis);
+              const prefix = inputs.find((el) => /^\\+?91$/.test((el.value || '').trim()));
+              const row = [...document.querySelectorAll('div,span,label')].find((el) => {
+                const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                return t === '+91' || /^\\+91\\s*$/.test(t);
+              });
+              const hit = prefix || row;
+              if (!hit) return false;
+              hit.scrollIntoView({block: 'center'});
+              hit.click();
+              return true;
+            }"""
+        )
+        page.wait_for_timeout(200)
+        page.keyboard.press("Tab")
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+
+def _type_phone_after_prefix(page, digits: str) -> bool:
+    """When no separate mobile input is listed, click right of +91 and type the 10 digits."""
+    national = re.sub(r"\D", "", digits or "")[-10:]
+    if len(national) != 10:
+        return False
+    _wake_cleartrip_mobile(page)
+    boxes = _field_boxes(page)
+    phone = _phone_box(boxes)
+    if phone is not None and not _is_email_box(phone):
+        return _set_box(page, int(phone["index"]), national) == "ok"
+    try:
+        # Only type into the input to the right of +91 — never the email box.
+        placed = page.evaluate(
+            """(national) => {
+              const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 4 && r.height > 4 && s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              const deep = [];
+              const walk = (root) => {
+                if (!root) return;
+                if (root.querySelectorAll) {
+                  for (const el of root.querySelectorAll('input')) deep.push(el);
+                }
+                const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                for (const el of all) {
+                  if (el.shadowRoot) walk(el.shadowRoot);
+                }
+              };
+              walk(document);
+              const inputs = deep.filter(vis);
+              const prefix = inputs.find((el) => /^\\+?91$/.test((el.value || '').trim()));
+              if (!prefix) return {ok: false, reason: 'no-prefix'};
+              const pr = prefix.getBoundingClientRect();
+              const next = inputs
+                .filter((el) => {
+                  if (el === prefix) return false;
+                  const r = el.getBoundingClientRect();
+                  const type = (el.type || '').toLowerCase();
+                  const ph = (el.placeholder || '') + (el.name || '') + (el.getAttribute('aria-label') || '');
+                  if (type === 'email' || /e-?mail/i.test(ph)) return false;
+                  return Math.abs(r.top - pr.top) < 50 && r.left >= pr.left - 4;
+                })
+                .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left)[0];
+              if (next) {
+                next.focus();
+                next.click();
+                const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+                if (proto && proto.set) proto.set.call(next, national);
+                else next.value = national;
+                next.dispatchEvent(new InputEvent('input', {bubbles: true, data: national, inputType: 'insertFromPaste'}));
+                next.dispatchEvent(new Event('change', {bubbles: true}));
+                return {ok: (next.value || '').replace(/\\D/g, '').includes(national), x: 0, y: 0};
+              }
+              // No neighbour input in the tree — return click point to the right of +91.
+              return {ok: false, x: pr.right + 36, y: pr.top + pr.height / 2};
+            }""",
+            national,
+        )
+        if isinstance(placed, dict) and placed.get("ok"):
+            return True
+        if isinstance(placed, dict) and placed.get("x"):
+            page.mouse.click(float(placed["x"]), float(placed["y"]))
+            page.wait_for_timeout(150)
+            page.keyboard.press("Control+A")
+            page.keyboard.insert_text(national)
+            page.wait_for_timeout(250)
+            # Accept if any non-email input now holds the digits.
+            for row in _field_boxes(page):
+                if _is_email_box(row) or row.get("type") == "email":
+                    continue
+                if _value_stuck(str(row.get("value") or ""), national, "phone"):
+                    return True
+            # Also check shadow inputs.
+            got = page.evaluate(
+                """(national) => {
+                  const deep = [];
+                  const walk = (root) => {
+                    if (!root || !root.querySelectorAll) return;
+                    for (const el of root.querySelectorAll('input')) deep.push(el);
+                    for (const el of root.querySelectorAll('*')) {
+                      if (el.shadowRoot) walk(el.shadowRoot);
+                    }
+                  };
+                  walk(document);
+                  return deep.some((el) => {
+                    const type = (el.type || '').toLowerCase();
+                    if (type === 'email') return false;
+                    return (el.value || '').replace(/\\D/g, '').includes(national);
+                  });
+                }""",
+                national,
+            )
+            return bool(got)
+        return False
+    except Exception:
+        return False
+
+
+def _box_keeps(got: str, expected: str) -> bool:
+    """True when the input kept what we typed. Phone allows formatting spaces."""
+    want = (expected or "").strip()
+    have = (got or "").strip()
+    if not want:
+        return False
+    if want == have or want.lower() in have.lower():
+        return True
+    digits = re.sub(r"\D", "", want)
+    if len(digits) >= 10:
+        return digits[-10:] in re.sub(r"\D", "", have)
+    return False
 
 
 def _set_box(page, index: int, value: str) -> str:
@@ -2044,43 +2316,64 @@ def _set_box(page, index: int, value: str) -> str:
               const vis = (el) => {
                 const r = el.getBoundingClientRect();
                 const s = getComputedStyle(el);
-                return r.width > 8 && r.height > 8 && s.visibility !== 'hidden' && s.display !== 'none';
+                return r.width > 4 && r.height > 4 && s.visibility !== 'hidden' && s.display !== 'none'
+                  && s.opacity !== '0';
               };
-              const inputs = [...document.querySelectorAll('input, textarea')].filter(
-                el => vis(el) && !/hidden|radio|checkbox|submit/i.test(el.type || '')
-              );
+              const inputs = [...document.querySelectorAll(
+                'input, textarea, [contenteditable="true"], [role="textbox"]'
+              )].filter(el => {
+                if (!vis(el)) return false;
+                const type = (el.getAttribute('type') || '').toLowerCase();
+                return !/hidden|radio|checkbox|submit|button/.test(type);
+              });
               const el = inputs[index];
-              if (!el) return 'gone';
-              el.focus();
+              if (!el) return {status: 'gone', value: ''};
               el.scrollIntoView({block: 'center'});
+              el.focus();
+              el.click();
+              if (el.isContentEditable) {
+                el.textContent = value;
+                el.dispatchEvent(new InputEvent('input', {bubbles: true, data: value, inputType: 'insertFromPaste'}));
+                return {status: 'set', value: el.innerText || ''};
+              }
               const proto = el instanceof HTMLTextAreaElement
                 ? Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')
                 : Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+              if (proto && proto.set) proto.set.call(el, '');
+              else el.value = '';
               if (proto && proto.set) proto.set.call(el, value);
               else el.value = value;
+              el.dispatchEvent(new InputEvent('input', {bubbles: true, cancelable: true, data: value, inputType: 'insertFromPaste'}));
               el.dispatchEvent(new Event('input', {bubbles: true}));
               el.dispatchEvent(new Event('change', {bubbles: true}));
-              return (el.value || '') === value ? 'ok' : 'soft';
+              el.dispatchEvent(new Event('blur', {bubbles: true}));
+              return {status: 'set', value: el.value || ''};
             }""",
             {"index": index, "value": value},
         )
     except Exception:
-        return "miss"
-    if stuck == "ok":
-        return "ok"
-    if stuck == "gone":
-        return "miss"
+        stuck = None
+    if isinstance(stuck, dict):
+        if stuck.get("status") == "gone":
+            return "miss"
+        if _box_keeps(str(stuck.get("value") or ""), value):
+            return "ok"
     try:
         page.evaluate(
             """(index) => {
               const vis = (el) => {
                 const r = el.getBoundingClientRect();
                 const s = getComputedStyle(el);
-                return r.width > 8 && r.height > 8 && s.visibility !== 'hidden' && s.display !== 'none';
+                return r.width > 4 && r.height > 4 && s.visibility !== 'hidden' && s.display !== 'none'
+                  && s.opacity !== '0';
               };
-              const inputs = [...document.querySelectorAll('input, textarea')].filter(
-                el => vis(el) && !/hidden|radio|checkbox|submit/i.test(el.type || '')
-              );
+              const inputs = [...document.querySelectorAll(
+                'input, textarea, [contenteditable="true"], [role="textbox"]'
+              )].filter(el => {
+                if (!vis(el)) return false;
+                const type = (el.getAttribute('type') || '').toLowerCase();
+                return !/hidden|radio|checkbox|submit|button/.test(type);
+              });
               document.querySelectorAll('[data-guide-fill]').forEach(el => el.removeAttribute('data-guide-fill'));
               if (inputs[index]) inputs[index].setAttribute('data-guide-fill', '1');
             }""",
@@ -2088,25 +2381,79 @@ def _set_box(page, index: int, value: str) -> str:
         )
         box = page.locator("[data-guide-fill='1']")
         box.click(timeout=2000)
+        box.fill("")
+        box.type(value, delay=25)
+        page.wait_for_timeout(200)
+        got = (box.input_value(timeout=1500) or "").strip()
+        if _box_keeps(got, value):
+            return "ok"
         page.keyboard.press("Control+A")
         page.keyboard.insert_text(value)
+        page.wait_for_timeout(200)
         got = (box.input_value(timeout=1500) or "").strip()
-        return "ok" if got == value.strip() else "miss"
+        return "ok" if _box_keeps(got, value) else "miss"
     except Exception:
         return "miss"
 
 
 def _type_labeled(page, labels: tuple[str, ...], value: str, *, optional: bool = False) -> str:
-    """Type into the box whose wrapper text is exactly this label."""
+    """Type into the box whose wrapper text matches this label (exact or contains)."""
     if not value:
         return "skip"
     wanted = {item.lower() for item in labels}
-    match = next((row for row in _field_boxes(page) if str(row.get("label") or "").strip().lower() in wanted), None)
+    boxes = _field_boxes(page)
+    match = next((row for row in boxes if str(row.get("label") or "").strip().lower() in wanted), None)
+    if match is None:
+        match = next(
+            (
+                row
+                for row in boxes
+                if any(w in str(row.get("label") or "").strip().lower() for w in wanted)
+                and not _is_email_box(row)
+            ),
+            None,
+        )
+    if match is None:
+        # Placeholder-only Cleartrip boxes (Given name / Surname).
+        match = next(
+            (
+                row
+                for row in boxes
+                if any(w in str(row.get("placeholder") or "").strip().lower() for w in wanted)
+            ),
+            None,
+        )
     if match is None:
         return "none" if optional else "miss"
     if str(match.get("value") or "").strip() == value.strip():
         return "ok"
     return _set_box(page, int(match["index"]), value)
+
+
+def _pick_gender(page, gender: str) -> str:
+    """Cleartrip shows Male/Female toggles instead of a Title dropdown."""
+    wanted = (gender or "").strip().lower()
+    label = "Female" if wanted in {"female", "f", "ms", "mrs"} else "Male"
+    if _click_label(page, label):
+        return "ok"
+    try:
+        hit = page.evaluate(
+            """(label) => {
+              const nodes = [...document.querySelectorAll('button,div,span,label,[role=button]')];
+              const el = nodes.find((n) => {
+                const t = (n.innerText || '').replace(/\\s+/g, ' ').trim();
+                return new RegExp('^' + label + '$', 'i').test(t) && t.length < 12;
+              });
+              if (!el) return null;
+              el.scrollIntoView({block:'center'});
+              el.click();
+              return true;
+            }""",
+            label,
+        )
+        return "ok" if hit else "miss"
+    except Exception:
+        return "miss"
 
 
 def _title_selected(page, title: str) -> bool:
@@ -2246,25 +2593,98 @@ def _value_stuck(got: str, expected: str, key: str) -> bool:
     return expected.strip().lower() in (got or "").strip().lower()
 
 
+def _is_email_box(row: dict) -> bool:
+    """True only for the email input — not a mobile box whose parent leaked 'Email address'."""
+    if row.get("type") == "email":
+        return True
+    label = str(row.get("label") or "")
+    # Parent wrappers on Cleartrip include both +91 and Email address in one label.
+    if re.search(r"e-?mail", label, re.I) and re.search(r"\+91|mobile|phone|add contact", label, re.I):
+        label = ""
+    own = f"{row.get('placeholder') or ''} {row.get('name') or ''} {label} {row.get('type') or ''}".lower()
+    if re.search(r"e-?mail", own):
+        return True
+    value = str(row.get("value") or "")
+    return "@" in value and "." in value
+
+
 def _phone_box(boxes: list[dict]) -> dict | None:
-    """The national-number box. A +91 prefix next to it is not that box."""
+    """The national-number box. A +91 prefix next to it is not that box.
+
+    Never returns the email field — Kernel once typed the mobile into Email address.
+    Live Cleartrip often paints +91 as plain text (not an input). Then the mobile
+    box is the empty text input on the same row, to the left of Email address.
+    """
     prefix_at = None
     for index, row in enumerate(boxes):
         if box_slot(row) == "prefix":
             prefix_at = index
     for row in boxes:
-        if box_slot(row) == "phone":
+        if box_slot(row) == "phone" and not _is_email_box(row):
             return row
-    if prefix_at is None:
+    if prefix_at is not None:
+        prefix = boxes[prefix_at]
+        try:
+            px = float(prefix.get("x") or 0)
+            py = float(prefix.get("y") or 0)
+        except (TypeError, ValueError):
+            px, py = 0.0, 0.0
+        same_row: list[tuple[float, dict]] = []
+        for nxt in boxes:
+            if nxt is prefix or _is_email_box(nxt) or box_slot(nxt) in {"name", "last", "dob", "email", "prefix"}:
+                continue
+            value = str(nxt.get("value") or "").strip()
+            if re.fullmatch(r"\+?91", value):
+                continue
+            try:
+                nx = float(nxt.get("x") or 0)
+                ny = float(nxt.get("y") or 0)
+            except (TypeError, ValueError):
+                nx, ny = 0.0, 0.0
+            if py and abs(ny - py) < 45 and nx >= px - 8:
+                same_row.append((nx, nxt))
+        if same_row:
+            same_row.sort(key=lambda item: item[0])
+            return same_row[0][1]
+        for nxt in boxes[prefix_at + 1 :]:
+            if _is_email_box(nxt) or box_slot(nxt) in {"name", "last", "dob", "email", "prefix"}:
+                continue
+            value = str(nxt.get("value") or "").strip()
+            if value and "@" in value:
+                continue
+            if re.fullmatch(r"\+?91", value):
+                continue
+            return nxt
+    # No +91 input: Cleartrip contact — empty text left of the email field.
+    email = next((row for row in boxes if row.get("type") == "email" or _is_email_box(row)), None)
+    if email is None:
         return None
-    for nxt in boxes[prefix_at + 1 :]:
-        own = f"{nxt.get('placeholder') or ''} {nxt.get('name') or ''} {nxt.get('type') or ''}".lower()
-        if nxt.get("type") == "email" or re.search(r"e-?mail", own):
+    try:
+        ex = float(email.get("x") or 0)
+        ey = float(email.get("y") or 0)
+    except (TypeError, ValueError):
+        return None
+    left: list[tuple[float, dict]] = []
+    for row in boxes:
+        if row is email or _is_email_box(row) or row.get("type") == "email":
             continue
-        if box_slot(nxt) in {"name", "last", "dob"}:
+        if box_slot(row) in {"name", "last", "dob", "prefix"}:
             continue
-        return nxt
-    return None
+        value = str(row.get("value") or "").strip()
+        if "@" in value:
+            continue
+        try:
+            nx = float(row.get("x") or 0)
+            ny = float(row.get("y") or 0)
+        except (TypeError, ValueError):
+            continue
+        if abs(ny - ey) < 50 and nx < ex - 8:
+            left.append((nx, row))
+    if not left:
+        return None
+    # Closest to the email on its left (the national number box).
+    left.sort(key=lambda item: item[0])
+    return left[-1][1]
 
 
 def fill_profile_slots(page, profile: dict, *, keys: tuple[str, ...] = ("email", "phone", "name", "dob")) -> list[str]:
@@ -2281,29 +2701,91 @@ def fill_profile_slots(page, profile: dict, *, keys: tuple[str, ...] = ("email",
         slots["name"] = str(profile.get("name") or "").strip()
     reveal_form_step(page)
     notes: dict[str, str] = {}
-    for _attempt in (1, 2):
+
+    def _targets() -> dict[str, dict]:
         boxes = _field_boxes(page)
-        targets: dict[str, dict] = {}
+        found: dict[str, dict] = {}
         for row in boxes:
             slot = box_slot(row)
-            if slot in keys and slot not in targets:
-                targets[slot] = row
+            if slot in keys and slot not in found and not (slot == "phone" and _is_email_box(row)):
+                found[slot] = row
         phone = _phone_box(boxes)
-        if phone is not None and "phone" in keys:
-            targets["phone"] = phone
-        for key in keys:
+        if phone is not None and "phone" in keys and not _is_email_box(phone):
+            found["phone"] = phone
+        elif "phone" in found and _is_email_box(found["phone"]):
+            found.pop("phone", None)
+        # Email must be the real email input, never the +91 neighbour.
+        for row in boxes:
+            if _is_email_box(row) or (
+                box_slot(row) == "email" and row.get("type") == "email"
+            ):
+                found["email"] = row
+                break
+        return found
+
+    for _attempt in (1, 2):
+        if slots.get("phone") and "phone" in keys:
+            _wake_cleartrip_mobile(page)
+        # Cleartrip bug: mobile digits landed in Email address.
+        for row in _field_boxes(page):
+            if _is_email_box(row) or row.get("type") == "email":
+                got = str(row.get("value") or "")
+                if re.fullmatch(r"\d{10}", re.sub(r"\D", "", got) or "") and "@" not in got:
+                    _set_box(page, int(row["index"]), "")
+        # Fill phone before email. Re-resolve boxes before every field — wake/Tab shifts indexes.
+        order = [key for key in ("phone", "email", "name", "dob") if key in keys]
+        for key in order:
             value = slots.get(key) or ""
             if not value:
                 continue
+            targets = _targets()
             row = targets.get(key)
+            if key == "phone" and row is not None and _is_email_box(row):
+                row = None
+            if key == "email" and row is not None and not (
+                _is_email_box(row) or row.get("type") == "email" or re.search(r"e-?mail", str(row.get("placeholder") or ""), re.I)
+            ):
+                row = None
             if row is None:
+                if key == "phone" and _type_phone_after_prefix(page, value):
+                    notes[key] = "ok"
+                    continue
                 notes[key] = "none"
                 continue
             if _value_stuck(str(row.get("value") or ""), value, key):
                 notes[key] = "ok"
                 continue
             status = _set_box(page, int(row["index"]), value)
-            notes[key] = "ok" if status == "ok" else "miss"
+            if status == "ok":
+                notes[key] = "ok"
+                continue
+            again = _targets().get(key)
+            if again is not None and _value_stuck(str(again.get("value") or ""), value, key):
+                notes[key] = "ok"
+            elif key == "phone" and _type_phone_after_prefix(page, value):
+                notes[key] = "ok"
+            else:
+                notes[key] = "miss"
+        # Final guard: phone must not sit in the email box; email must not sit in mobile.
+        boxes = _field_boxes(page)
+        phone_row = _phone_box(boxes)
+        for row in boxes:
+            if row.get("type") == "email" or _is_email_box(row):
+                got = str(row.get("value") or "")
+                if slots.get("phone") and _value_stuck(got, slots["phone"], "phone") and "@" not in got:
+                    notes["phone"] = "miss"
+                    if slots.get("email"):
+                        _set_box(page, int(row["index"]), slots["email"])
+                elif slots.get("email") and _value_stuck(got, slots["email"], "email"):
+                    notes["email"] = "ok"
+        if phone_row is not None and slots.get("email"):
+            got = str(phone_row.get("value") or "")
+            if slots["email"].lower() in got.lower():
+                notes["phone"] = "miss"
+                _set_box(page, int(phone_row["index"]), slots.get("phone") or "")
+                email_row = _targets().get("email")
+                if email_row is not None:
+                    _set_box(page, int(email_row["index"]), slots["email"])
         if all(notes.get(key) in {"ok", "skip"} for key in keys if slots.get(key) and notes.get(key) != "none"):
             break
     return [f"{key}:{status}" for key, status in notes.items()]
@@ -2354,10 +2836,20 @@ def _passenger_ready(notes: list[str]) -> bool:
     """Ready when every box this sheet actually has kept its value.
 
     A contact step with no name field is ready once email (and mobile, if shown) stuck.
+    A traveller-name step is ready once first + last stick (title/gender optional).
     """
     first = _field_state(notes, "first")
     email = _field_state(notes, "email")
     if first in {"", "none", "skip"} and email in {"ok", "typed"}:
+        if _field_state(notes, "phone") in {"miss", "set"}:
+            return False
+        return True
+    if first in {"ok", "typed"} and _field_state(notes, "last") in {"ok", "typed", "skip", "none"}:
+        if _field_state(notes, "title") in {"miss", "set"} and _field_state(notes, "gender") in {"miss", "set", ""}:
+            return False
+        # email/phone "set" or "miss" means the box is on this sheet and did not stick.
+        if _field_state(notes, "email") in {"miss", "set"}:
+            return False
         if _field_state(notes, "phone") in {"miss", "set"}:
             return False
         return True
@@ -2411,12 +2903,17 @@ def _fill_passenger_fields(page, profile: dict[str, str]) -> list[str]:
     # Ixigo leaves Title blank when we skip it; the Review Details sheet then blocks Continue.
     title = {"male": "Mr", "female": "Ms", "m": "Mr", "f": "Ms"}.get(gender.lower(), "Mr" if name else "")
     title_status, title_menu = _choose_title(page, title)
+    gender_status = "skip"
+    if title_status in {"none", "skip"} and (gender or name):
+        gender_status = _pick_gender(page, gender or "male")
     notes = [
         f"title:{title_status}",
-        f"first:{_type_labeled(page, ('first & middle name', 'first name'), first)}",
-        f"last:{_type_labeled(page, ('last name',), last)}",
-        f"email:{_type_labeled(page, ('email',), profile.get('email') or '')}",
-        f"phone:{_type_labeled(page, ('mobile number',), phone)}",
+        f"gender:{gender_status}",
+        f"first:{_type_labeled(page, ('first & middle name', 'first name', 'given name'), first)}",
+        f"last:{_type_labeled(page, ('last name', 'surname'), last)}",
+        # Contact email/phone are often already saved; traveller sheet may not show them.
+        f"email:{_type_labeled(page, ('email',), profile.get('email') or '', optional=True)}",
+        f"phone:{_type_labeled(page, ('mobile number',), phone, optional=True)}",
         f"dob:{_type_labeled(page, ('date of birth', 'dob'), dob, optional=True)}",
     ]
     if title_menu:
@@ -2506,7 +3003,9 @@ def run_checkout_agent(
     origin_code = "GAU" if re.search(r"guwahati|gau", origin or "", re.I) else ""
     dest_code = "DEL" if re.search(r"delhi|del", destination or "", re.I) else ""
     tap_pending = (chosen_tap or "").strip()
-    deadline = time.monotonic() + 70
+    # Book → meals Skip → contact → traveller → pay needs a long Cleartrip pass.
+    deadline = time.monotonic() + (240 if seller == "cleartrip" else 90)
+    vision_down = False
 
     def _snapshot() -> tuple[str, str, str, dict[str, str]]:
         t, u = _read(page)
@@ -2555,39 +3054,63 @@ def run_checkout_agent(
         from app.step_read import on_review_itinerary
 
         # Add-ons skip is an outcome loop, not a 16-step vision tour. Reply within ~20s.
-        skip_now = bool(
-            not on_review_itinerary(text)
-            and re.search(r"choose add-ons|skip add-?ons|add seats|missed adding meal", text or "", re.I)
+        # Never treat a fare list's marketing copy ("Add meals") as the itinerary extras sheet.
+        skip_now = stage == "addons" or (
+            "itinerary" in (url or "").lower()
+            and stage not in {"results", "fare_sheet", "loading", "home", "error", "review"}
+            and bool(
+                re.search(
+                    r"choose add-ons|skip add-?ons|add seats|missed adding meal|add meals|add extra luggage",
+                    text or "",
+                    re.I,
+                )
+            )
         )
         if skip_now:
             log.append("addons_fast")
+            try:
+                settle_visible_sheet(page, budget_ms=4000)
+            except Exception:
+                pass
             left = _leave_addons(page, log, rounds=3)
             text, url, stage, facts = _snapshot()
             if not left or stage == "addons":
-                # Vision must not report success while Choose add-ons is still the DOM step.
+                # Seat map often needs a second Skip after scroll; try once more before stopping.
+                try:
+                    settle_visible_sheet(page, budget_ms=3000)
+                except Exception:
+                    pass
+                left = _leave_addons(page, log, rounds=2)
                 text, url, stage, facts = _snapshot()
-                left = stage != "addons" and not re.search(r"choose add-ons|add seats|missed adding meal", text or "", re.I)
+                left = bool(left) and stage != "addons" and not re.search(
+                    r"choose add-ons|add seats|missed adding meal", text or "", re.I
+                )
                 log.append(f"addons_fast_dom:{stage}")
             if left and stage != "addons":
                 log.append(f"addons_fast_left:{stage}")
             else:
-                if re.search(r"choose add-ons|skip add-?ons|add seats", text or "", re.I):
+                # Keep walking — deadline still bounds the loop. Do not freeze on one missed Skip.
+                log.append("addons_fast_still")
+                if sum(1 for line in log if line == "addons_fast_still") >= 3:
                     handoff = (
                         "That click did not leave this sheet. "
                         "Nothing paid."
                     )
-                else:
-                    handoff = (
-                        "Continue did not open Review your itinerary. "
-                        "Nothing paid."
-                    )
-                log.append("addons_fast_still")
-                return CheckoutOutcome("addons", text, url, log, facts=facts, checks=checks, handoff=handoff)
+                    return CheckoutOutcome("addons", text, url, log, facts=facts, checks=checks, handoff=handoff)
+                action = {"action": "click", "target": "Skip add-ons", "value": ""}
+                kind = action["action"]
+                log.append(f"{step}:{stage}:{kind}:{action.get('target')}")
+                if _click_label(page, "Skip add-ons") or _click_label(page, "Skip add ons"):
+                    log.append("addons_retry_skip")
+                continue
         # Vision on every step: screenshot overrides a wrong DOM toast / sold-out miss.
+        # One network miss disables vision for the rest of this checkout (avoids 28s×N hangs).
         try:
             from app.vision_agent import capture_page_shot, classify_with_vision, vision_enabled
 
-            if vision_enabled():
+            if vision_down:
+                pass
+            elif vision_enabled():
                 shot = capture_page_shot(page)
                 if not shot:
                     log.append(f"{step}:vision_shot_miss")
@@ -2603,9 +3126,17 @@ def run_checkout_agent(
                         )
                     else:
                         log.append(f"{step}:vision_empty")
+                        vision_down = True
+                        log.append("vision_down")
                     if new_stage and new_stage != stage:
-                        log.append(f"{step}:vision_override:{stage}->{new_stage}")
-                        stage = new_stage
+                        # Never demote a live Skip-add-ons sheet to review.
+                        if stage == "addons" and new_stage == "review" and re.search(
+                            r"skip add-?ons|add meals|choose add-ons", text or "", re.I
+                        ):
+                            log.append(f"{step}:vision_keep_addons")
+                        else:
+                            log.append(f"{step}:vision_override:{stage}->{new_stage}")
+                            stage = new_stage
                     try:
                         Path(shot).unlink(missing_ok=True)
                     except Exception:
@@ -2613,7 +3144,9 @@ def run_checkout_agent(
             else:
                 log.append(f"{step}:vision_off")
         except Exception as exc:
+            vision_down = True
             log.append(f"{step}:vision_err:{type(exc).__name__}")
+            log.append("vision_down")
         from app.step_read import form_sheet as _form_sheet
 
         if _form_sheet(text) and stage not in {"pay", "otp", "login", "error", "unavailable"}:
@@ -2785,6 +3318,13 @@ def run_checkout_agent(
         if kind == "review_continue":
             # Escape closes the Ixigo review sheet, so the Continue control disappears.
             # Conscience reads the covering sheet; rails never pay.
+            # If meals/Skip is actually on screen, leave add-ons — do not Continue past them.
+            if re.search(r"skip add-?ons|add meals|choose add-ons|add extra luggage", text or "", re.I):
+                log.append("review_was_addons")
+                left = _leave_addons(page, log, rounds=4)
+                text, url, stage, facts = _snapshot()
+                log.append(f"review_addons_left:{int(bool(left))}:{stage}")
+                continue
             surface = read_surface(page)
             if surface.get("overlay") or _ixigo_buy_this_visible(page):
                 note = _clear_front_sheet(page, chosen_tap, seller=seller, hint=hint)
@@ -2986,8 +3526,8 @@ def run_checkout_agent(
             log.append(f"card:{card[:120]}")
             after, after_url, after_stage, _af = _poll_ready(
                 page,
-                {"fare_sheet", "review", "passenger", "login", "otp", "pay", "error", "unavailable"},
-                budget_ms=5000,
+                {"fare_sheet", "review", "passenger", "login", "otp", "pay", "error", "unavailable", "addons"},
+                budget_ms=7000,
             )
             # Drawer over results still looks like a fare list in the DOM — re-read the front sheet.
             if after_stage == "results":
@@ -3000,6 +3540,9 @@ def run_checkout_agent(
                     pass
             if after_stage == "unavailable":
                 return CheckoutOutcome("unavailable", after, after_url, log, checks=checks)
+            if after_stage in {"addons", "review", "passenger", "pay"}:
+                log.append(f"after_book_direct:{after_stage}")
+                continue
             if after_stage == "fare_sheet":
                 if hint and not (
                     card_matches_depart_hint(card, hint)
@@ -3011,6 +3554,11 @@ def run_checkout_agent(
                         return CheckoutOutcome("wrong_flight", after, after_url, log, checks=checks)
                 ok = _confirm_fare(page)
                 log.append(f"confirm_fare:{ok}")
+                if not ok and seller == "cleartrip" and recovers < 1:
+                    recovers += 1
+                    log.append("confirm_fare_rebook")
+                    if _reopen_cleartrip_results(page, origin, destination, depart, log):
+                        continue
                 continue
             if card and after_stage in {"results", "other", "loading"}:
                 if _advance_after_book(page, hint, log):
@@ -3023,15 +3571,15 @@ def run_checkout_agent(
                     log.append("results:mouse_book")
                     _poll_ready(
                         page,
-                        {"fare_sheet", "review", "passenger", "login", "otp", "pay", "error"},
-                        budget_ms=4000,
+                        {"fare_sheet", "review", "passenger", "login", "otp", "pay", "error", "addons"},
+                        budget_ms=5000,
                     )
                     continue
                 return CheckoutOutcome("results", after, after_url, log, checks=checks)
-            if after_stage not in {"review", "passenger", "fare_sheet", "login", "otp", "pay", "error"}:
+            if after_stage not in {"review", "passenger", "fare_sheet", "login", "otp", "pay", "error", "addons"}:
                 _poll_ready(
                     page,
-                    {"review", "passenger", "fare_sheet", "login", "otp", "pay", "error"},
+                    {"review", "passenger", "fare_sheet", "login", "otp", "pay", "error", "addons"},
                     budget_ms=2500,
                 )
             continue

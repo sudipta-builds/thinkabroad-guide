@@ -958,6 +958,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(next_bookable_seller("google"), "easemytrip")
         self.assertEqual(next_bookable_seller("cleartrip"), "easemytrip")
         self.assertEqual(next_bookable_seller("easemytrip"), "ixigo")
+        self.assertEqual(next_bookable_seller("ixigo"), "cleartrip")
 
     def test_another_service_stays_a_booking(self) -> None:
         trip = {"origin": "Guwahati", "destination": "Delhi", "depart": "2026-12-04", "seller": "google", "stage": "results"}
@@ -1115,6 +1116,36 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(box_slot({"placeholder": "Email", "type": "text", "value": ""}), "email")
         self.assertTrue(_passenger_ready(["first:none", "email:ok", "phone:ok", "title:none"]))
         self.assertFalse(_passenger_ready(["first:none", "email:ok", "phone:miss", "title:none"]))
+        # Traveller name sheet often has no email/mobile boxes (already saved on contact).
+        self.assertTrue(
+            _passenger_ready(
+                ["title:none", "gender:ok", "first:ok", "last:ok", "email:skip", "phone:skip", "dob:skip"]
+            )
+        )
+        self.assertTrue(
+            _passenger_ready(
+                ["title:none", "gender:ok", "first:ok", "last:ok", "email:none", "phone:none", "dob:none"]
+            )
+        )
+        from app.page_agent import classify_page as _classify
+        from app.step_read import addons_sheet as _addons
+
+        meals = (
+            "Review your itinerary Add Meals Fruit Cake Skip add-ons "
+            "Add Extra Luggage Continue Review contact details"
+        )
+        self.assertEqual(_classify(meals, "https://www.cleartrip.com/flights/itinerary/x"), "addons")
+        self.assertTrue(_addons(meals))
+        from app.step_contract import left_addons as _left
+
+        self.assertFalse(_left(meals, "addons"))
+        self.assertFalse(
+            _left(
+                "Review your itinerary Add Meals Skip add-ons Free Date Change Continue",
+                "addons",
+            )
+        )
+        self.assertTrue(_left("Review your itinerary Fare summary Total amount Continue", "review"))
         stuck = contact_report("email:miss | phone:ok", "Add Contact details")
         self.assertIn("email did not stick", stuck)
         moved = contact_report("email:ok | phone:ok | tap:1", "Review traveller details")
@@ -1153,21 +1184,200 @@ class SellerChoiceAndProxy(unittest.TestCase):
                 {"key": "phone", "value": "8638586171"},
             ],
         }
+        # Cleartrip-like React mobile: simple .value= is wiped unless input events fire.
+        react_cleartrip = """<!doctype html><html><body>
+          <h3>Add Contact details</h3>
+          <div>+91<input id="cc" value="+91" readonly></div>
+          <div><input id="mobile"></div>
+          <div>Email address<input id="email" type="email" placeholder="Email address"></div>
+          <button id="go">Continue</button>
+          <p id="next" hidden>Review traveller details</p>
+          <script>
+            const mobile = document.getElementById('mobile');
+            let phone = '';
+            Object.defineProperty(mobile, 'value', {
+              get() { return phone; },
+              set(v) { /* ignore raw assigns — only input events count */ }
+            });
+            mobile.addEventListener('input', (e) => {
+              phone = (e.target && e.data != null) ? (phone + (e.data || '')) : phone;
+              if (e.inputType === 'insertFromPaste' && e.data) phone = e.data;
+            });
+            document.getElementById('go').onclick = () => {
+              if (phone.replace(/\\D/g,'').length >= 10 && document.getElementById('email').value.includes('@')) {
+                document.getElementById('go').remove();
+                document.getElementById('next').hidden = false;
+              }
+            };
+          </script>
+        </body></html>"""
+        # +91 only listed until focus/Tab reveals the national box (Kernel phone:none case).
+        hidden_mobile = """<!doctype html><html><body>
+          <h3>Add Contact details</h3>
+          <div id="row"><input id="cc" value="+91"><input id="mobile" style="width:1px;height:1px;opacity:0.01"></div>
+          <div>Email address<input id="email" type="email" placeholder="Email address"></div>
+          <button onclick="this.remove();document.getElementById('next').hidden=false">Continue</button>
+          <p id="next" hidden>Review traveller details</p>
+          <script>
+            const cc = document.getElementById('cc');
+            const mobile = document.getElementById('mobile');
+            cc.addEventListener('click', () => {
+              mobile.style.width = '160px';
+              mobile.style.height = '40px';
+              mobile.style.opacity = '1';
+              mobile.focus();
+            });
+          </script>
+        </body></html>"""
+        # Prod bug: phone digits landed in Email; mobile stayed empty with validation text.
+        swapped = """<!doctype html><html><body>
+          <h3>Add Contact details</h3>
+          <div style="display:flex">
+            <input id="cc" value="+91" style="width:48px">
+            <input id="mobile" style="width:160px;margin-left:8px">
+          </div>
+          <p>Please enter Mobile Number</p>
+          <div>Email address<input id="email" type="email" placeholder="Email address" value="8638586171"></div>
+          <p>Please enter a valid email address</p>
+          <button onclick="
+            const m=document.getElementById('mobile').value.replace(/\\D/g,'');
+            const e=document.getElementById('email').value;
+            if(m.length===10 && e.includes('@')){this.remove();document.getElementById('next').hidden=false;}
+          ">Continue</button>
+          <p id="next" hidden>Review traveller details</p>
+        </body></html>"""
+        # Live Kernel DOM: +91 is plain text; mobile is empty text left of email.
+        cleartrip_live = """<!doctype html><html><body>
+          <h3>Add Contact details</h3>
+          <div style="position:relative;height:80px">
+            <span style="position:absolute;left:40px;top:20px">+91</span>
+            <input id="mobile" style="position:absolute;left:90px;top:12px;width:240px;height:40px">
+            <input id="email" type="email" style="position:absolute;left:360px;top:12px;width:280px;height:40px"
+              placeholder="Email address">
+          </div>
+          <button onclick="
+            const m=document.getElementById('mobile').value.replace(/\\D/g,'');
+            const e=document.getElementById('email').value;
+            if(m.length===10 && e.includes('@')){this.remove();document.getElementById('next').hidden=false;}
+          ">Continue</button>
+          <p id="next" hidden>Review traveller details</p>
+        </body></html>"""
+        contact_login_trap = (
+            "Add Contact details Please enter Mobile Number +91 Email address Continue "
+            "Review traveller details"
+        )
+        self.assertEqual(
+            __import__("app.page_agent", fromlist=["classify_page"]).classify_page(
+                contact_login_trap, "https://www.cleartrip.com/flights/itinerary/x"
+            ),
+            "other",
+        )
+        from app.step_read import form_sheet as _form_sheet
+
+        traveller = (
+            "Add traveller details Adult 1 First & middle name (Given name) "
+            "Last name (Surname) Male Female sudipta@example.com 8638586171 Continue"
+        )
+        self.assertFalse(_form_sheet(traveller))
+        self.assertEqual(
+            classify_page(traveller, "https://www.cleartrip.com/flights/itinerary/x"),
+            "passenger",
+        )
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
-            for html in (cleartrip, ixigo):
+            for html in (cleartrip, ixigo, react_cleartrip, hidden_mobile, swapped, cleartrip_live):
                 page = browser.new_page()
                 page.set_content(html)
                 self.assertTrue(reveal_form_step(page))
                 notes = _apply_unknown_plan(page, plan)
                 body = page.inner_text("body")
+                email_val = page.input_value("#email")
+                mobile_val = page.input_value("#mobile")
                 page.close()
-                self.assertIn("email:ok", notes)
-                self.assertIn("phone:ok", notes)
-                self.assertIn("tap:1", notes)
+                self.assertIn("email:ok", notes, notes)
+                self.assertIn("phone:ok", notes, notes)
+                self.assertIn("tap:1", notes, notes)
                 self.assertIn("Review traveller details", body)
+                self.assertIn("@", email_val)
+                self.assertIn("8638586171", re.sub(r"\D", "", mobile_val))
                 self.assertNotIn("contact_unready", " ".join(notes))
             browser.close()
+
+    def test_continue_after_contact_reaches_payment(self) -> None:
+        """Contact → traveller name → Skip add-ons → payment handoff (never Pay)."""
+        from playwright.sync_api import sync_playwright
+
+        from app.browser_hands import chromium_ready
+        from app.page_agent import payment_sheet_open, run_checkout_agent
+
+        if not chromium_ready():
+            self.skipTest("chromium missing")
+        html = """<!doctype html><html><body>
+          <div id="sheet">
+            <h3>Add Contact details</h3>
+            <div>+91 <input id="mobile"></div>
+            <div>Email address <input id="email" type="email" placeholder="Email address"></div>
+            <button id="go">Continue</button>
+          </div>
+          <script>
+            let step = 0;
+            document.getElementById('go').onclick = () => {
+              const m = document.getElementById('mobile').value.replace(/\\D/g,'');
+              const e = document.getElementById('email').value;
+              if (step === 0 && m.length >= 10 && e.includes('@')) {
+                step = 1;
+                document.getElementById('sheet').innerHTML =
+                  '<h3>Add traveller details</h3>' +
+                  '<label>First & middle name (Given name)</label>' +
+                  '<input placeholder="First & middle name (Given name)">' +
+                  '<label>Last name (Surname)</label>' +
+                  '<input placeholder="Last name (Surname)">' +
+                  '<button>Male</button><button>Female</button>' +
+                  '<button id="go2">Continue</button>';
+                document.getElementById('go2').onclick = () => {
+                  const inputs = [...document.querySelectorAll('input')];
+                  if (inputs[0].value && inputs[1].value) {
+                    step = 2;
+                    document.getElementById('sheet').innerHTML =
+                      '<h3>Add-ons</h3><p>Meals and seats</p>' +
+                      '<button id="skip">Skip add-ons</button>';
+                    document.getElementById('skip').onclick = () => {
+                      document.getElementById('sheet').innerHTML =
+                        '<h1>Payment options</h1><p>Pay to complete your booking</p>' +
+                        '<p>Enter card number</p><button>Pay now</button>';
+                    };
+                  }
+                };
+              }
+            };
+          </script>
+        </body></html>"""
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_content(html)
+            out = run_checkout_agent(
+                page,
+                hint="10:45",
+                seller="cleartrip",
+                origin="Guwahati",
+                destination="Delhi",
+                depart="2026-12-04",
+                allow_pay=False,
+                pause_on_auth=True,
+                max_steps=12,
+                profile={
+                    "name": "Sudipta Saikia",
+                    "email": "sudipta@example.com",
+                    "phone": "8638586171",
+                    "gender": "male",
+                },
+            )
+            body = page.inner_text("body")
+            browser.close()
+        self.assertEqual(out.stage, "pay", out.log)
+        self.assertTrue(payment_sheet_open(body, out.stage))
+        self.assertNotRegex(body, r"(?i)pay now.*clicked|charged")
 
     def test_cleartrip_homepage_is_not_the_traveller_form(self) -> None:
         from app.kernel_otp import cleartrip_looks_logged_in
@@ -1378,6 +1588,8 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn('stage == "error"', login)
         self.assertIn('{"login", "otp"}', login)
         self.assertIn("keep_kernel_browser", login)
+        self.assertIn("_RetryBeginLogin", login)
+        self.assertGreaterEqual(login.count("raise _RetryBeginLogin"), 2)
         agent = Path("app/travel_agent.py").read_text(encoding="utf-8")
         self.assertIn('status == "resume_lost"', agent)
         self.assertIn("fresh fare list", agent)
@@ -1425,7 +1637,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
         # Same results signature after a Book hit must not freeze into ask.
         self.assertIn("book_retries", src)
         # After Book, fare_sheet runs confirm_fare instead of pausing on results.
-        click = src.split('if kind == "click_time":')[1][:2500]
+        click = src.split('if kind == "click_time":')[1][:5000]
         self.assertIn("_advance_after_book", click)
         self.assertIn("confirm_fare", click)
         # Continue after a card hit uses confirm_fare even when stage is still results.
@@ -1735,7 +1947,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
         }
         reply = _booking_page_reply(state, "10:45", err, type("S", (), {"page": None})())
         self.assertIn("system error", reply.lower())
-        self.assertIn("Ixigo 10:45", reply)
+        self.assertIn("EaseMyTrip 10:45", reply)
         self.assertNotIn("I'll press Go to home", reply)
         self.assertNotIn("Ready to pay", reply)
         self.assertNotIn("payment page", reply.lower())
@@ -1814,6 +2026,87 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(plan["do"], "book")
         self.assertEqual(plan.get("tap") or "", "")
         self.assertNotIn("go to home", str(plan.get("reply") or "").lower())
+
+    def test_yes_accepts_recommended_next_seller_after_error(self) -> None:
+        from app.search import next_bookable_seller
+        from app.turn_loop import align_action
+
+        for current in ("cleartrip", "easemytrip", "ixigo"):
+            nxt = next_bookable_seller(current)
+            state = {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-12-04",
+                "seller": current,
+                "selected_hint": "10:45",
+                "stuck_kind": "error",
+                "pending_seller_switch": nxt,
+                "stuck_page": "Server error itinerary/failure Go to home",
+                "last_vision": {"kind": "error", "tap": ""},
+            }
+            plan = align_action("yes", state)
+            self.assertEqual(plan["do"], "book", current)
+            self.assertEqual(plan.get("tap") or "", "", current)
+
+    def test_error_reply_recommends_next_travel_site_without_auto_switch(self) -> None:
+        from app.search import next_bookable_seller
+        from app.travel_agent import _booking_page_reply, _seller_label
+
+        for current in ("cleartrip", "ixigo", "easemytrip"):
+            state = {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-12-04",
+                "seller": current,
+                "selected_hint": "10:45",
+            }
+            spoken = _booking_page_reply(
+                state,
+                "10:45",
+                "Server error",
+                type(
+                    "S",
+                    (),
+                    {
+                        "page": type(
+                            "P",
+                            (),
+                            {"url": f"https://www.{current}.com/flights/itinerary/failure"},
+                        )()
+                    },
+                )(),
+            )
+            nxt = next_bookable_seller(current)
+            self.assertEqual(state.get("pending_seller_switch"), nxt, current)
+            self.assertIn(_seller_label(nxt).lower(), spoken.lower(), spoken)
+            self.assertRegex(spoken.lower(), r"won.?t switch unless|reply yes")
+
+    def test_failure_url_is_not_a_resume_booking_link(self) -> None:
+        from app.kernel_otp import is_resume_booking_url
+
+        self.assertFalse(
+            is_resume_booking_url(
+                "https://www.cleartrip.com/flights/results/itinerary/failure",
+                "cleartrip",
+            )
+        )
+        self.assertTrue(
+            is_resume_booking_url(
+                "https://www.cleartrip.com/flights/itinerary/abc123/info",
+                "cleartrip",
+            )
+        )
+
+    def test_guest_booking_does_not_promise_otp_up_front(self) -> None:
+        import inspect
+
+        from app.travel_agent import handle_turn
+
+        src = inspect.getsource(handle_turn)
+        self.assertIn("kernel_awaiting_auth_mode", src)
+        self.assertIn("book as guest", src.lower())
+        self.assertIn('auth_mode == "guest"', src)
+        self.assertNotIn("If you're signed out, reply with the", src)
 
     def test_kernel_success_is_the_live_page(self) -> None:
         import inspect

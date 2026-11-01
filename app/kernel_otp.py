@@ -34,6 +34,14 @@ KERNEL_SELLERS = {"ixigo", "cleartrip"}
 _MID_BOOKING = {"passenger", "review", "addons", "pay", "login", "otp"}
 
 
+class _RetryBeginLogin(Exception):
+    """Leave sync_playwright, then call begin_login again with these kwargs."""
+
+    def __init__(self, kwargs: dict[str, Any]) -> None:
+        super().__init__("retry begin_login")
+        self.kwargs = kwargs
+
+
 def should_hunt_login(stage: str) -> bool:
     """Open a mobile field only when this sheet is login. Continue on extras is not login."""
     return stage in {"login", "otp"}
@@ -204,8 +212,10 @@ def _client():
 
 
 def is_resume_booking_url(url: str, seller: str = "") -> bool:
-    """A checkout link we can reopen. A fare-list URL is not one."""
+    """A checkout link we can reopen. A fare-list URL or failure page is not one."""
     raw = (url or "").strip()
+    if re.search(r"itinerary/failure|acting.?up|access.?denied", raw, re.I):
+        return False
     ixigo = bool(re.search(r"https?://(?:www\.)?ixigo\.com/flight/booking/\S+", raw, re.I))
     cleartrip = bool(
         re.search(r"https?://(?:www\.)?cleartrip\.com/\S*(?:itinerary|/flights/)\S*", raw, re.I)
@@ -537,6 +547,9 @@ def begin_login(
     if hint and len(national) != 10:
         return {"status": "bad_phone", "detail": "Need a 10-digit Indian mobile."}
     passenger = dict(profile or {})
+    auth_mode = str(passenger.pop("auth_mode", "") or "").strip().lower()
+    # Guest checkout must not hunt OTP. Login mode (or blank legacy) may request a code.
+    hunt_otp = auth_mode != "guest"
     client = _client()
     browser_profile = _profile(seller, whatsapp_phone)
     browser, reused = _connect_browser(client, browser_profile, session_id)
@@ -564,31 +577,40 @@ def begin_login(
             skip_tap = bool(re.search(r"skip add", chosen_tap or "", re.I))
             text, url = _read_visible(page)
             stage = classify_page(text, url, book_count=_book_count(page))
-            if (
+            dead_resume = bool(
                 reused
                 and session_id
-                and stage == "error"
                 and not re.search(r"go to home", chosen_tap or "", re.I)
-            ):
+                and (
+                    stage == "error"
+                    or site_error_page(text, url)
+                    or "failure" in (url or "").lower()
+                )
+            )
+            if dead_resume:
                 try:
                     pw.close()
                 except Exception:
                     pass
                 _drop(client, sid)
-                return begin_login(
-                    seller=seller,
-                    whatsapp_phone=whatsapp_phone,
-                    explicit=explicit,
-                    origin=origin,
-                    destination=destination,
-                    depart=depart,
-                    hint=hint,
-                    profile=profile,
-                    on_code_requested=on_code_requested,
-                    otp_wait_sec=otp_wait_sec,
-                    resume_url="",
-                    chosen_tap="",
-                    session_id="",
+                raise _RetryBeginLogin(
+                    {
+                        "seller": seller,
+                        "whatsapp_phone": whatsapp_phone,
+                        "explicit": explicit,
+                        "origin": origin,
+                        "destination": destination,
+                        "depart": depart,
+                        "hint": hint,
+                        "profile": {**dict(profile or {}), "auth_mode": auth_mode}
+                        if auth_mode
+                        else dict(profile or {}),
+                        "on_code_requested": on_code_requested,
+                        "otp_wait_sec": otp_wait_sec,
+                        "resume_url": "",
+                        "chosen_tap": "",
+                        "session_id": "",
+                    }
                 )
 
             def _checkout_now() -> None:
@@ -603,7 +625,11 @@ def begin_login(
                     expect_flight="IX1513" if hint == "1:15" else "",
                     allow_pay=False,
                     pause_on_auth=True,
-                    max_steps=6 if re.search(r"skip add", chosen_tap or "", re.I) else 16,
+                    max_steps=(
+                        6
+                        if re.search(r"skip add", chosen_tap or "", re.I)
+                        else (28 if seller == "cleartrip" else 16)
+                    ),
                     profile=passenger,
                     chosen_tap=chosen_tap,
                 )
@@ -720,7 +746,11 @@ def begin_login(
                         expect_flight="IX1513" if hint == "1:15" else "",
                         allow_pay=False,
                         pause_on_auth=True,
-                        max_steps=6 if re.search(r"skip add", chosen_tap or "", re.I) else 16,
+                        max_steps=(
+                            6
+                            if re.search(r"skip add", chosen_tap or "", re.I)
+                            else (28 if seller == "cleartrip" else 16)
+                        ),
                         profile=passenger,
                         chosen_tap=chosen_tap,
                     )
@@ -763,21 +793,23 @@ def begin_login(
                     except Exception:
                         pass
                     _drop(client, sid)
-                    return begin_login(
-                        seller=seller,
-                        whatsapp_phone=whatsapp_phone,
-                        explicit=explicit,
-                        origin=origin,
-                        destination=destination,
-                        depart=depart,
-                        hint=hint,
-                        profile=profile,
-                        on_code_requested=on_code_requested,
-                        otp_wait_sec=otp_wait_sec,
-                        resume_url="",
-                        chosen_tap="",
-                        session_id="",
-                        error_retry=error_retry + 1,
+                    raise _RetryBeginLogin(
+                        {
+                            "seller": seller,
+                            "whatsapp_phone": whatsapp_phone,
+                            "explicit": explicit,
+                            "origin": origin,
+                            "destination": destination,
+                            "depart": depart,
+                            "hint": hint,
+                            "profile": profile,
+                            "on_code_requested": on_code_requested,
+                            "otp_wait_sec": otp_wait_sec,
+                            "resume_url": "",
+                            "chosen_tap": "",
+                            "session_id": "",
+                            "error_retry": error_retry + 1,
+                        }
                     )
                 if stage == "error" or site_error_page(text, url):
                     outcome = {
@@ -813,38 +845,70 @@ def begin_login(
                         "url": url or "",
                     }
             ok = False
+            if outcome is None and should_hunt_login(stage) and not hunt_otp:
+                # Guest booking: leave the login/OTP sheet for WhatsApp; do not request a code.
+                text, url = _read_visible(page)
+                outcome = {
+                    "status": "held",
+                    "session_id": sid,
+                    "seller": seller,
+                    "screenshot": _shot(page, seller, sid, "held"),
+                    "page": (text or "")[:8000],
+                    "url": url or "",
+                    "notes": (checkout_notes + " | guest_skip_otp").strip(" |"),
+                }
             if outcome is None and should_hunt_login(stage):
                 ok = _otp_visible(page, seller)
             if outcome is None and should_hunt_login(stage) and not ok:
-                phone_box = _find(page, "phone", seller)
-                if not phone_box:
-                    shot = _shot(page, seller, sid, "otp-miss")
-                    try:
-                        pw.close()
-                    except Exception:
-                        pass
-                    _drop(client, sid)
-                    return {
-                        "status": "phone_miss",
-                        "detail": "Mobile field did not open.",
+                text, url = _read_visible(page)
+                stage = classify_page(text, url, book_count=_book_count(page))
+                from app.step_read import form_sheet
+
+                # Contact validation ("Please enter Mobile Number") is not the OTP login sheet.
+                if (
+                    stage not in {"login", "otp"}
+                    or form_sheet(text)
+                    or re.search(r"add contact details|email address|review traveller", text or "", re.I)
+                ):
+                    outcome = {
+                        "status": "held",
                         "session_id": sid,
                         "seller": seller,
-                        "screenshot": shot,
+                        "screenshot": _shot(page, seller, sid, "held"),
+                        "page": (text or "")[:8000],
+                        "url": url or "",
+                        "notes": checkout_notes,
                     }
-                _click(client, sid, page, phone_box)
-                page.wait_for_timeout(300)
-                client.browsers.computer.type_text(sid, text=national, delay=40)
-                page.wait_for_timeout(300)
-                send = _find(page, "send", seller)
-                if send:
-                    _click(client, sid, page, send)
-                client.browsers.computer.press_key(sid, keys=["Return"])
-                for _ in range(30):
-                    page = _latest(page)
-                    if _otp_visible(page, seller):
-                        ok = True
-                        break
-                    page.wait_for_timeout(400)
+                else:
+                    phone_box = _find(page, "phone", seller)
+                    if not phone_box:
+                        shot = _shot(page, seller, sid, "otp-miss")
+                        try:
+                            pw.close()
+                        except Exception:
+                            pass
+                        _drop(client, sid)
+                        return {
+                            "status": "phone_miss",
+                            "detail": "Mobile field did not open.",
+                            "session_id": sid,
+                            "seller": seller,
+                            "screenshot": shot,
+                        }
+                    _click(client, sid, page, phone_box)
+                    page.wait_for_timeout(300)
+                    client.browsers.computer.type_text(sid, text=national, delay=40)
+                    page.wait_for_timeout(300)
+                    send = _find(page, "send", seller)
+                    if send:
+                        _click(client, sid, page, send)
+                    client.browsers.computer.press_key(sid, keys=["Return"])
+                    for _ in range(30):
+                        page = _latest(page)
+                        if _otp_visible(page, seller):
+                            ok = True
+                            break
+                        page.wait_for_timeout(400)
             shot = ""
             if ok:
                 try:
@@ -949,10 +1013,35 @@ def begin_login(
         if not keep_kernel_browser(str(outcome.get("status") or "")):
             _drop(client, sid)
         return outcome
+    except _RetryBeginLogin as retry:
+        # Playwright context is closed; safe to open a fresh Kernel tab.
+        return begin_login(**retry.kwargs)
     except Exception as exc:
         cancel_live_otp(sid)
         _drop(client, sid)
-        return {"status": "error", "detail": f"{type(exc).__name__}: {str(exc)[:180]}"}
+        detail = f"{type(exc).__name__}: {str(exc)[:180]}"
+        # Transient Kernel/CDP or itinerary DNS failures: one clean reopen.
+        if error_retry < 1 and hint and seller == "cleartrip":
+            try:
+                return begin_login(
+                    seller=seller,
+                    whatsapp_phone=whatsapp_phone,
+                    explicit=explicit,
+                    origin=origin,
+                    destination=destination,
+                    depart=depart,
+                    hint=hint,
+                    profile=profile,
+                    on_code_requested=on_code_requested,
+                    otp_wait_sec=otp_wait_sec,
+                    resume_url="",
+                    chosen_tap="",
+                    session_id="",
+                    error_retry=error_retry + 1,
+                )
+            except Exception as retry_exc:
+                detail = f"{detail} | retry {type(retry_exc).__name__}: {str(retry_exc)[:120]}"
+        return {"status": "error", "detail": detail, "page": "", "url": "", "notes": detail}
 
 
 def _shot(page, seller: str, session_id: str, tag: str) -> str:

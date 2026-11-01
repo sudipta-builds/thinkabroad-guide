@@ -479,11 +479,16 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
             return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
         from app.search import named_seller
 
-        if named_seller(text) or clock:
-            # A new site or a flight time leaves the dead sheet. Do not press Go to home.
+        from app.search import seller_can_book
+
+        pending = str(state.get("pending_seller_switch") or "").strip().lower()
+        yes = bool(re.fullmatch(r"yes|yep|yeah|ok|okay|sure", (text or "").strip(), re.I))
+        # Accept the recommended bookable travel site — never silent switch.
+        if named_seller(text) or clock or (yes and seller_can_book(pending)):
             return {"do": "book", "kind": "book", "tap": "", "turn": turn, "reply": ""}
         home = safe_tap("Go to home", stuck_text) or safe_tap("Search Again", stuck_text)
         if intent in {"book", "select"} or goal in {"forward", "skip"}:
+            # Yes-without-pending stays on recovery controls; do not invent Ixigo.
             return {
                 "do": "book",
                 "kind": "book",

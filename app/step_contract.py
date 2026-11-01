@@ -155,10 +155,20 @@ def format_contract_stuck(contract: dict[str, Any], *, which: str = "that flight
 def left_addons(page: str, stage: str = "") -> bool:
     """True when Choose add-ons / seat map is no longer the step.
 
-    Page text wins over a stage name. Vision calling this sheet review does not mean it closed.
+    Page text wins over a stage name. A stepper label like Review your itinerary
+    on the same sheet as Skip add-ons does not mean extras are done.
     """
     hay = page or ""
-    if re.search(r"review your itinerary", hay, re.I):
+    # Live Skip / meals / luggage means we are still mid-extras.
+    if re.search(
+        r"skip add-?ons|choose add-ons|add seats|missed adding meal|add meals|add extra luggage",
+        hay,
+        re.I,
+    ):
+        return False
+    if re.search(r"review your itinerary", hay, re.I) and not re.search(
+        r"skip add-?ons|add meals|choose add-ons", hay, re.I
+    ):
         return True
     if re.search(r"choose add-ons|add seats|seat map|missed adding meal", hay, re.I):
         return False

@@ -193,6 +193,71 @@ def handle_turn(
     _save(phone, state)
     from app.kernel_otp import indian_national, kernel_configured, should_resume_kernel_otp
 
+    # Accept a recommended seller switch (error → next bookable travel site / yes).
+    pending_switch = str(state.get("pending_seller_switch") or "").strip().lower()
+    if pending_switch and str(state.get("stuck_kind") or "") == "error":
+        from app.search import seller_can_book
+
+        named_switch = named_seller_from(text)
+        yes_switch = bool(re.fullmatch(r"yes|yep|yeah|ok|okay|sure", (text or "").strip(), re.I))
+        named_pending = named_switch == pending_switch or (
+            pending_switch and re.search(rf"\b{re.escape(pending_switch)}\b", text or "", re.I)
+        )
+        if seller_can_book(pending_switch) and (named_pending or yes_switch):
+            from app.kernel_otp import release_saved_kernel
+
+            release_saved_kernel(str(state.get("kernel_session_id") or ""))
+            state["seller"] = pending_switch
+            state["preferred_seller"] = pending_switch
+            state["kernel_seller"] = pending_switch
+            state.pop("pending_seller_switch", None)
+            state.pop("kernel_session_id", None)
+            state.pop("kernel_logged_in", None)
+            state.pop("kernel_auth_mode", None)
+            state.pop("live", None)
+            state.pop("stuck_kind", None)
+            kind = "book"
+
+    if state.get("kernel_awaiting_auth_mode"):
+        raw_auth = (text or "").strip()
+        seller_id = str(state.get("kernel_seller") or state.get("seller") or "cleartrip")
+        if re.search(r"\bguest\b|without (?:an? )?(?:login|otp|signing)|as a guest", raw_auth, re.I):
+            state["kernel_auth_mode"] = "guest"
+            state["kernel_awaiting_auth_mode"] = False
+            state["seller"] = seller_id
+            state["preferred_seller"] = seller_id
+            state["busy_at"] = f"{time.time():.3f}"
+            _save(phone, state)
+            if message_sid:
+                remember_inbound(phone, message_sid)
+            threading.Thread(
+                target=_run_browse,
+                args=(phone, text, state.get("busy_at"), "book"),
+                name="guide-browse",
+                daemon=True,
+            ).start()
+            reply = (
+                f"Opening the {str(state.get('selected_hint') or 'flight')} on {_seller_label(seller_id)} as a guest. "
+                "If a login code screen appears I'll ask for the digits then. I'll stop before payment."
+            )
+            db.add_message(phone, "assistant", reply)
+            return Reply.of(reply, emoji="✈️")
+        if re.search(r"\b(?:log\s*in|sign\s*in|otp|with (?:an? )?otp|account)\b", raw_auth, re.I):
+            state["kernel_auth_mode"] = "login"
+            state["kernel_awaiting_auth_mode"] = False
+            state["seller"] = seller_id
+            state["preferred_seller"] = seller_id
+            _save(phone, state)
+            # Fall through: may still need a mobile, then browse.
+            kind = "book"
+        else:
+            reply = (
+                f"Reply guest to book without signing in on {_seller_label(seller_id)}, "
+                "or login to use an OTP. Nothing paid."
+            )
+            db.add_message(phone, "assistant", reply)
+            return Reply.of(reply, emoji="📱")
+
     if state.get("kernel_awaiting_phone"):
         national = indian_national(text)
         seller_id = str(state.get("kernel_seller") or state.get("seller") or "ixigo")
@@ -402,8 +467,20 @@ def handle_turn(
 
             chosen = str(state.get("selected_hint") or "").strip()
             signed_in = str(state.get("kernel_logged_in") or "") == book_seller
-            # Fares are public. Ask for a mobile only when a chosen flight needs a login code.
-            if chosen and not signed_in:
+            auth_mode = str(state.get("kernel_auth_mode") or "").strip().lower()
+            # Guest can book without OTP. Login needs a mobile. Ask once when neither is chosen.
+            if chosen and not signed_in and auth_mode not in {"guest", "login"}:
+                state["kernel_awaiting_auth_mode"] = True
+                state["kernel_seller"] = book_seller
+                state.pop("busy_at", None)
+                _save(phone, state)
+                reply = (
+                    f"For the {chosen} on {_seller_label(book_seller)}: book as guest, or log in with an OTP? "
+                    "Reply guest or login. Nothing paid."
+                )
+                db.add_message(phone, "assistant", reply)
+                return Reply.of(reply, emoji="📱")
+            if chosen and not signed_in and auth_mode == "login":
                 login = login_phone_for(phone, str(state.get("login_phone") or state.get("phone") or ""))
                 if not login and indian_national(text):
                     login = "+91" + indian_national(text)
@@ -422,6 +499,7 @@ def handle_turn(
                 state["kernel_awaiting_phone"] = False
             else:
                 state["kernel_awaiting_phone"] = False
+            state["kernel_awaiting_auth_mode"] = False
         state["busy_at"] = f"{time.time():.3f}"
         _save(phone, state)
         threading.Thread(
@@ -436,6 +514,7 @@ def handle_turn(
                 need = "4" if book_seller == "cleartrip" else "6"
                 chosen = str(state.get("selected_hint") or "").strip()
                 signed_in = str(state.get("kernel_logged_in") or "") == book_seller
+                auth_mode = str(state.get("kernel_auth_mode") or "").strip().lower()
                 trip = _spoken_trip(state)
                 if chosen and (resume_booking_url(state, text) or state.get("kernel_session_id")):
                     tap = str(state.get("chosen_tap") or "")
@@ -448,10 +527,20 @@ def handle_turn(
                         canned = _usable_reply(state, spoken, _mid_booking_ack(state, book_seller, chosen, text))
                 elif chosen and signed_in:
                     canned = f"Opening the {chosen} on {_seller_label(book_seller)}. I'll stop before payment."
+                elif chosen and auth_mode == "login":
+                    canned = (
+                        f"Opening the {chosen} on {_seller_label(book_seller)} with login. "
+                        f"I'll send the OTP screen, then reply with only the {need} digits. I'll stop before payment."
+                    )
+                elif chosen and auth_mode == "guest":
+                    canned = (
+                        f"Opening the {chosen} on {_seller_label(book_seller)} as a guest. "
+                        "If a login code appears I'll ask for it. I'll stop before payment."
+                    )
                 elif chosen:
                     canned = (
                         f"Opening the {chosen} on {_seller_label(book_seller)}. "
-                        f"If you're signed out, reply with the {need}-digit code. I'll stop before payment."
+                        "If a login code appears I'll ask for the digits. I'll stop before payment."
                     )
                 elif signed_in:
                     canned = f"You're already logged in on {_seller_label(book_seller)}. Checking {trip}."
@@ -1023,9 +1112,10 @@ def _booking_ack(state: dict[str, Any], kind: str, text: str = "") -> str:
     seller = _seller_label(seller_id)
     if kind == "select" and hint:
         return (
-            f"Got the {hint} on {trip}. I'll open that fare on {seller} and go through sign-in and the passenger form. "
+            f"Got the {hint} on {trip}. I'll open that fare on {seller}. "
             "Cleartrip can take a few minutes after Continue — I'll wait. "
-            "If the site needs your email, phone, or an OTP, I'll ask. I won't pay unless you tell me to."
+            "I can book as guest or with login OTP — I'll ask which. "
+            "I won't pay unless you tell me to."
         )
     if kind == "pay":
         held = state.get("payment_on_file") or "what you just sent"
@@ -2408,12 +2498,18 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             "reply with a departure time (or go on) and I'll Book that fare",
         )
     if shown == "error" or site_error_page(page, url) or "itinerary/failure" in url:
+        from app.search import next_bookable_seller
+
         state.pop("live", None)
         state["stuck_kind"] = "error"
         seller_id = str(state.get("seller") or "").lower()
-        other = "Ixigo" if seller_id == "cleartrip" else "Cleartrip"
+        other = next_bookable_seller(seller_id)
+        state["pending_seller_switch"] = other
         when = hint or str(state.get("selected_hint") or "")
-        rec = f"send {other} {when}".strip() + " and I'll open that same flight there"
+        rec = (
+            f"reply yes or send {_seller_label(other)} {when}".strip()
+            + " and I'll open that same flight there — I won't switch unless you say so"
+        )
         return _stuck_line(
             state,
             "error",
@@ -2428,6 +2524,9 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     needs_dob = bool(re.search(r"date of birth|\bdob\b", page, re.I) and contact)
     if shown == "otp" or re.search(r"enter otp|otp sent|verify your mobile", page, re.I):
         need = "4" if str(state.get("seller") or "") == "cleartrip" else "6"
+        state["kernel_awaiting_otp"] = True
+        if state.get("kernel_session_id"):
+            state["stage"] = "login"
         return _stuck_line(
             state,
             "otp",
@@ -2436,6 +2535,24 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             f"reply with only the {need} digits",
         )
     if needs_login or shown == "login":
+        # Kernel OTP login (mobile code) — not a password vault form.
+        if state.get("kernel_session_id") or str(state.get("seller") or "") in {"cleartrip", "ixigo"}:
+            need = "4" if str(state.get("seller") or "") == "cleartrip" else "6"
+            if str(state.get("kernel_auth_mode") or "") == "guest":
+                return _stuck_line(
+                    state,
+                    "login",
+                    f"{seller} sign-in appeared during guest booking",
+                    "the site opened login even though you chose guest",
+                    f"reply login and I'll request the {need}-digit OTP, or say skip if a Skip control is on screen",
+                )
+            return _stuck_line(
+                state,
+                "login",
+                f"{seller} sign-in",
+                "mobile OTP login, not the passenger form",
+                f"send the 10-digit mobile for the code, then reply with only the {need} digits",
+            )
         site = str(state.get("seller") or "cleartrip")
         return _stuck_line(
             state,
@@ -2802,10 +2919,11 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
     if site_error_page(text, page_url):
         shown = "error"
     if str(result.get("status") or "") in {"already_logged_in", "held"}:
-        if shown in {"home", "cookie"}:
+        if shown in {"home", "cookie", "login", "otp", "error"}:
             state.pop("kernel_logged_in", None)
         else:
             state["kernel_logged_in"] = seller
+    # OTP/login sheets arm awaiting inside _booking_page_reply; clear only when not those.
     state["kernel_awaiting_otp"] = False
     state["seller"] = seller
     held_sid = str(result.get("session_id") or "")
@@ -2975,8 +3093,11 @@ def _run_kernel_login(
             depart=depart,
             hint=hint,
             profile={
-                key: str(loaded.get(key) or "")
-                for key in ("name", "email", "phone", "dob", "gender")
+                **{
+                    key: str(loaded.get(key) or "")
+                    for key in ("name", "email", "phone", "dob", "gender")
+                },
+                "auth_mode": str(loaded.get("kernel_auth_mode") or ""),
             },
             on_code_requested=on_code_requested,
             resume_url=resume_booking_url(loaded, text),

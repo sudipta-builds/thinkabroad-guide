@@ -534,6 +534,32 @@ def begin_login(
             skip_tap = bool(re.search(r"skip add", chosen_tap or "", re.I))
             text, url = _read_visible(page)
             stage = classify_page(text, url, book_count=_book_count(page))
+            if (
+                reused
+                and session_id
+                and stage == "error"
+                and not re.search(r"go to home", chosen_tap or "", re.I)
+            ):
+                try:
+                    pw.close()
+                except Exception:
+                    pass
+                _drop(client, sid)
+                return begin_login(
+                    seller=seller,
+                    whatsapp_phone=whatsapp_phone,
+                    explicit=explicit,
+                    origin=origin,
+                    destination=destination,
+                    depart=depart,
+                    hint=hint,
+                    profile=profile,
+                    on_code_requested=on_code_requested,
+                    otp_wait_sec=otp_wait_sec,
+                    resume_url="",
+                    chosen_tap="",
+                    session_id="",
+                )
 
             def _checkout_now() -> None:
                 nonlocal checkout, checkout_notes, page, text, url, stage
@@ -569,8 +595,15 @@ def begin_login(
                 except Exception:
                     resume_kept = False
             elif reused and stage == "error":
-                chosen_tap = ""
-                skip_tap = False
+                if re.search(r"go to home", chosen_tap or "", re.I):
+                    try:
+                        _checkout_now()
+                    except Exception:
+                        pass
+                    resume_kept = True
+                else:
+                    chosen_tap = ""
+                    skip_tap = False
             # Saved checkout URL is a fallback when that tab is gone.
             if not resume_kept and hint and resume_url and is_resume_booking_url(resume_url, seller):
                 try:

@@ -1847,11 +1847,26 @@ class SellerChoiceAndProxy(unittest.TestCase):
             "last_vision": {"kind": "addons", "tap": "Skip add-ons"},
             "selected_hint": "18:20",
             "chosen_tap": "Skip add-ons",
+            "kernel_session_id": "dead-cleartrip-tab",
+            "kernel_seller": "cleartrip",
         }
         clear_checkout_memory(stale)
         self.assertNotIn("live", stale)
         self.assertNotIn("last_vision", stale)
         self.assertNotIn("chosen_tap", stale)
+        self.assertNotIn("kernel_session_id", stale)
+        self.assertNotIn("kernel_seller", stale)
+        self.assertEqual(
+            classify_page(
+                "First time flying with us Popular destinations Pay to complete your booking",
+                "https://www.cleartrip.com/",
+            ),
+            "home",
+        )
+        from app.page_agent import payment_sheet_open
+
+        home = "First time flying with us Popular destinations Pay to complete your booking"
+        self.assertFalse(payment_sheet_open(home, "pay"))
         self.assertEqual(
             classify_page("Server error Search again", "https://www.cleartrip.com/flights/itinerary/failure"),
             "error",

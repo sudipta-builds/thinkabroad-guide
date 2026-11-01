@@ -145,7 +145,7 @@ def wants_fresh_search(text: str) -> bool:
 
 
 def clear_checkout_memory(state: dict[str, Any]) -> None:
-    """Drop the saved itinerary and last screenshot so the next action can search."""
+    """Drop the saved itinerary, the last screenshot, and the Kernel tab."""
     for key in (
         "live",
         "last_shot",
@@ -156,6 +156,11 @@ def clear_checkout_memory(state: dict[str, Any]) -> None:
         "last_stuck",
         "chosen_tap",
         "options",
+        "kernel_session_id",
+        "kernel_seller",
+        "kernel_logged_in",
+        "kernel_awaiting_otp",
+        "kernel_awaiting_phone",
     ):
         state.pop(key, None)
 

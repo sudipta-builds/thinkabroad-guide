@@ -156,16 +156,30 @@ def handle_turn(
         state["preferred_seller"] = next_bookable_seller(str(state.get("seller") or state.get("preferred_seller") or ""))
         state["seller"] = state["preferred_seller"]
         state.pop("live", None)
+        state.pop("kernel_session_id", None)
+        state.pop("kernel_logged_in", None)
+        state.pop("kernel_seller", None)
         kind = "book"
     else:
         from app.search import NOT_BOOKABLE
 
         named = named_seller_from(text)
         if kind == "book" and named and named not in NOT_BOOKABLE:
-            if named != str(state.get("seller") or state.get("preferred_seller") or ""):
+            previous = str(state.get("kernel_seller") or state.get("seller") or state.get("preferred_seller") or "")
+            if named != previous:
                 state.pop("live", None)
+                state.pop("kernel_session_id", None)
+                state.pop("kernel_logged_in", None)
+                state.pop("kernel_seller", None)
             state["preferred_seller"] = named
             state["seller"] = named
+            state["kernel_seller"] = named
+    named_now = named_seller_from(text)
+    kernel_now = str(state.get("kernel_seller") or "")
+    if named_now and kernel_now and named_now != kernel_now:
+        state.pop("kernel_session_id", None)
+        state.pop("kernel_logged_in", None)
+        state.pop("kernel_seller", None)
     _apply_stage(state, text, kind)
     _save(phone, state)
     from app.kernel_otp import indian_national, kernel_configured, should_resume_kernel_otp
@@ -2858,7 +2872,7 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         )
     else:
         spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), text, _Session())  # type: ignore[arg-type]
-    if payment_sheet_open(text, shown):
+    if payment_sheet_open(text, shown) and shown == "pay":
         state.pop("stuck_kind", None)
         trip = _window_phrase(state)
         spoken = f"I stopped before payment for {trip} on {label}. Nothing paid. The screenshot is that page."

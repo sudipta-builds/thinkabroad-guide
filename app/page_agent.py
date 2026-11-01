@@ -219,8 +219,10 @@ def site_error_page(text: str, url: str = "") -> bool:
 
 
 def payment_sheet_open(hay: str, stage: str) -> bool:
-    """Payment wording counts only on a pay sheet, never on a site error."""
-    if stage in {"error", "home", "cookie", "loading", "results"}:
+    """Payment wording counts only on a pay sheet, never on a homepage or a site error."""
+    if re.search(r"first time flying|popular destinations|acting up|go to home", hay or "", re.I):
+        return False
+    if stage in {"error", "home", "cookie", "loading", "results", "review", "addons"}:
         return False
     if site_error_page(hay, ""):
         return False
@@ -248,6 +250,8 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         return "unavailable"
     if site_error_page(hay, url):
         return "error"
+    if re.search(r"first time flying|popular destinations", hay, re.I):
+        return "home"
     if re.search(
         r"enter otp|enter the otp|otp sent|otp received|verify your mobile|"
         r"one.?time password|resend otp|resend in \d+",

@@ -1741,12 +1741,25 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertNotIn("payment page", reply.lower())
         import inspect as _inspect
 
-        from app.page_agent import _confirm_fare, _reopen_cleartrip_results, run_checkout_agent
+        from app.page_agent import _confirm_fare, _reopen_cleartrip_results, classify_page, run_checkout_agent
+        from app.step_read import format_unknown_plan, ground_unknown_plan
 
+        home = (
+            "Where from? Where to? Enter departure and arrival airports / cities "
+            "Search Flights Payment options UPI Cards"
+        )
+        self.assertEqual(classify_page(home, "https://www.cleartrip.com/"), "home")
+        self.assertFalse(ground_unknown_plan(home, "", {}).get("handled"))
+        real_pay = ground_unknown_plan(
+            "Pay to complete your booking Enter card number Payment options", "", {}
+        )
+        self.assertEqual(real_pay.get("action"), "stop")
+        self.assertIn("payment page", format_unknown_plan(real_pay).lower())
         checkout_src = _inspect.getsource(run_checkout_agent)
         self.assertIn("leave_site_error", checkout_src)
         self.assertIn("_reopen_cleartrip_results", checkout_src)
         self.assertIn("error_rebook:results", _inspect.getsource(_reopen_cleartrip_results))
+        self.assertIn('left in {"error", "home", "cookie", "other"}', checkout_src)
         self.assertIn('outcome in {"denied", "error"}', _inspect.getsource(_confirm_fare))
         import inspect
 
@@ -1756,6 +1769,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("dead_error", src)
         self.assertLess(src.index("dead_error = True"), src.index("is_resume_booking_url"))
         self.assertIn("timeout=90_000", src)
+        self.assertIn("error_retry", src)
         self.assertIn(
             "browser didn't connect",
             kernel_failure_line("Cleartrip", "TimeoutError: BrowserType.connect_over_cdp: Timeout 180000ms exceeded"),

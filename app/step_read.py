@@ -549,7 +549,13 @@ def ground_unknown_plan(
 
     if site_error_page(hay, ""):
         return empty
-    if re.search(r"pay to complete|enter card number|payment options", hay, re.I):
+    # Search home footers say "Payment options" — that is not the pay sheet.
+    if re.search(r"where from|search flights|popular destinations", hay, re.I):
+        return empty
+    if re.search(r"pay to complete|enter card number", hay, re.I) or (
+        re.search(r"payment options", hay, re.I)
+        and re.search(r"pay to complete|enter card number|name on card|upi", hay, re.I)
+    ):
         return {
             "action": "stop",
             "tap": "",

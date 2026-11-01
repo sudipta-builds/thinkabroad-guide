@@ -522,6 +522,7 @@ def begin_login(
     resume_url: str = "",
     chosen_tap: str = "",
     session_id: str = "",
+    error_retry: int = 0,
 ) -> dict[str, str]:
     """Open the seller and request one OTP.
 
@@ -746,7 +747,50 @@ def begin_login(
             if outcome is None:
                 text, url = _read_visible(page)
                 stage = classify_page(text, url, book_count=_book_count(page))
-                if after_checkout_status(stage) == "held":
+                # Acting-up or empty search after a timed book is not a successful hold.
+                if (
+                    seller == "cleartrip"
+                    and hint
+                    and error_retry < 1
+                    and (
+                        stage == "error"
+                        or site_error_page(text, url)
+                        or stage == "home"
+                    )
+                ):
+                    try:
+                        pw.close()
+                    except Exception:
+                        pass
+                    _drop(client, sid)
+                    return begin_login(
+                        seller=seller,
+                        whatsapp_phone=whatsapp_phone,
+                        explicit=explicit,
+                        origin=origin,
+                        destination=destination,
+                        depart=depart,
+                        hint=hint,
+                        profile=profile,
+                        on_code_requested=on_code_requested,
+                        otp_wait_sec=otp_wait_sec,
+                        resume_url="",
+                        chosen_tap="",
+                        session_id="",
+                        error_retry=error_retry + 1,
+                    )
+                if stage == "error" or site_error_page(text, url):
+                    outcome = {
+                        "status": "error",
+                        "detail": "Cleartrip system error after booking that flight.",
+                        "session_id": sid,
+                        "seller": seller,
+                        "screenshot": _shot(page, seller, sid, "error"),
+                        "page": (text or "")[:8000],
+                        "url": url or "",
+                        "notes": checkout_notes,
+                    }
+                elif after_checkout_status(stage) == "held":
                     outcome = {
                         "status": "held",
                         "session_id": sid,
@@ -758,14 +802,16 @@ def begin_login(
                     }
             if outcome is None and _logged_in(page, seller) and not _otp_visible(page, seller):
                 text, url = _read_visible(page)
-                outcome = {
-                    "status": "already_logged_in" if not hint else "held",
-                    "session_id": sid,
-                    "seller": seller,
-                    "screenshot": _shot(page, seller, sid, "otp-after"),
-                    "page": (text or "")[:8000],
-                    "url": url or "",
-                }
+                stage = classify_page(text, url, book_count=_book_count(page))
+                if stage not in {"error", "home"} and not site_error_page(text, url):
+                    outcome = {
+                        "status": "already_logged_in" if not hint else "held",
+                        "session_id": sid,
+                        "seller": seller,
+                        "screenshot": _shot(page, seller, sid, "otp-after"),
+                        "page": (text or "")[:8000],
+                        "url": url or "",
+                    }
             ok = False
             if outcome is None and should_hunt_login(stage):
                 ok = _otp_visible(page, seller)
@@ -811,15 +857,28 @@ def begin_login(
                     shot = ""
             if outcome is None and not should_hunt_login(stage):
                 text, url = _read_visible(page)
-                outcome = {
-                    "status": "held",
-                    "session_id": sid,
-                    "seller": seller,
-                    "screenshot": _shot(page, seller, sid, "held"),
-                    "page": (text or "")[:8000],
-                    "url": url or "",
-                    "notes": checkout_notes,
-                }
+                stage = classify_page(text, url, book_count=_book_count(page))
+                if stage == "error" or site_error_page(text, url):
+                    outcome = {
+                        "status": "error",
+                        "detail": "Cleartrip system error after booking that flight.",
+                        "session_id": sid,
+                        "seller": seller,
+                        "screenshot": _shot(page, seller, sid, "error"),
+                        "page": (text or "")[:8000],
+                        "url": url or "",
+                        "notes": checkout_notes,
+                    }
+                else:
+                    outcome = {
+                        "status": "held",
+                        "session_id": sid,
+                        "seller": seller,
+                        "screenshot": _shot(page, seller, sid, "held"),
+                        "page": (text or "")[:8000],
+                        "url": url or "",
+                        "notes": checkout_notes,
+                    }
             if outcome is None and ok and on_code_requested is not None:
                 # Stay on this CDP connection through Verify. A second connection
                 # reaches the spinner and never becomes an Ixigo account.

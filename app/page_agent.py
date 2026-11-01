@@ -250,7 +250,8 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         return "unavailable"
     if site_error_page(hay, url):
         return "error"
-    if re.search(r"first time flying|popular destinations", hay, re.I):
+    # Empty Cleartrip/Ixigo search home — before pay. Footer "Payment options" is not checkout.
+    if re.search(r"first time flying|popular destinations|where from|search flights", hay, re.I):
         return "home"
     if re.search(
         r"enter otp|enter the otp|otp sent|otp received|verify your mobile|"
@@ -263,7 +264,11 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         r"continue|google", hay, re.I
     ):
         return "login"
-    if re.search(r"pay to complete your booking|name on card|enter card number|scan qr code|payment options", hay, re.I):
+    if re.search(r"pay to complete your booking|name on card|enter card number|scan qr code", hay, re.I):
+        return "pay"
+    if re.search(r"payment options", hay, re.I) and re.search(
+        r"pay to complete|enter card number|name on card|upi|net banking", hay, re.I
+    ):
         return "pay"
     if re.search(r"\bupi\b", hay, re.I) and re.search(r"pay now|card number|net banking", hay, re.I):
         return "pay"
@@ -310,7 +315,7 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         return "cookie"
     if _results_url(url):
         return "loading"
-    if re.search(r"one way|search flight|where from", hay, re.I):
+    if re.search(r"one way|search flight", hay, re.I):
         return "home"
     return "other"
 
@@ -3076,7 +3081,8 @@ def run_checkout_agent(
                 log.append(f"error_tap:{tapped or 'miss'}")
                 left = _wait_until(page, "error", rounds=6)
                 log.append(f"after_retry:{left}")
-                if left == "error" and seller == "cleartrip":
+                # Go to home often lands on empty search — still reopen fares and Book the hint.
+                if seller == "cleartrip" and left in {"error", "home", "cookie", "other"}:
                     if not _reopen_cleartrip_results(page, origin, destination, depart, log):
                         break
                 continue

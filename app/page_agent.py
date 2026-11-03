@@ -1959,14 +1959,28 @@ def _decline_cleartrip_protect(page) -> str:
 def _js_continue(page) -> bool:
     """Click Continue/Proceed/Confirm on a real button. Buttons only — no span/div scan.
 
-    Cleartrip traveller uses "Continue to payment" — that advances to the pay sheet
-    without charging. Refuse Pay now / Make payment only.
+    Cleartrip review uses "Continue with 1-step checkout"; traveller uses
+    "Continue to payment". Both advance without charging. Refuse Pay now only.
     """
     try:
         hit = page.evaluate(
             """() => {
-              const forward = /^(continue|proceed|confirm|continue booking|continue to payment)$/i;
               const payOnly = /^(pay now|pay to complete|make payment|complete payment|pay securely)$/i;
+              const isForward = (t) => {
+                const s = String(t || '').replace(/\\s+/g, ' ').trim();
+                if (!s || s.length > 56 || payOnly.test(s)) return false;
+                if (/^continue\\b/i.test(s)) return true;
+                return /^(proceed|confirm)$/i.test(s);
+              };
+              const rank = (t, travellerReady) => {
+                const s = String(t || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                if (/continue with 1-?step checkout/i.test(s)) return 0;
+                if (s === 'continue to payment') return travellerReady ? 0 : 4;
+                if (s === 'continue' || s === 'proceed' || s === 'confirm') return 1;
+                if (/^continue without\\b/i.test(s)) return 3;
+                if (/^continue\\b/i.test(s)) return 2;
+                return 5;
+              };
               const nodes = [...document.querySelectorAll('button,a,[role=button]')];
               const hits = [];
               const fakeEvt = (el) => ({
@@ -1991,7 +2005,7 @@ def _js_continue(page) -> bool:
               for (const el of nodes) {
                 const text = (el.innerText || el.getAttribute('aria-label') || '')
                   .replace(/\\s+/g, ' ').trim();
-                if (!forward.test(text) || payOnly.test(text)) continue;
+                if (!isForward(text)) continue;
                 if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
                 const style = window.getComputedStyle(el);
                 if (style.visibility === 'hidden' || style.display === 'none') continue;
@@ -2008,14 +2022,10 @@ def _js_continue(page) -> bool:
                 return t.length < 48 && /first\\s*&\\s*middle\\s*name|traveller name|last\\s*name/i.test(t);
               });
               hits.sort((a, b) => {
-                const ta = (a.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                const tb = (b.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                const pa = travellerReady && ta === 'continue to payment' ? 0
-                  : (!travellerReady && ta === 'continue to payment') ? 2
-                  : 1;
-                const pb = travellerReady && tb === 'continue to payment' ? 0
-                  : (!travellerReady && tb === 'continue to payment') ? 2
-                  : 1;
+                const ta = (a.innerText || '').replace(/\\s+/g, ' ').trim();
+                const tb = (b.innerText || '').replace(/\\s+/g, ' ').trim();
+                const pa = rank(ta, travellerReady);
+                const pb = rank(tb, travellerReady);
                 if (pa !== pb) return pa - pb;
                 const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
                 return (rb.top - ra.top) || ((ra.width * ra.height) - (rb.width * rb.height));
@@ -2043,8 +2053,13 @@ def _safe_continue(page) -> bool:
     try:
         point = page.evaluate(
             """() => {
-              const forward = /^(continue|confirm|proceed|continue to payment)$/i;
               const payOnly = /^(pay now|pay to complete|make payment|complete payment|pay securely)$/i;
+              const isForward = (t) => {
+                const s = String(t || '').replace(/\\s+/g, ' ').trim();
+                if (!s || s.length > 56 || payOnly.test(s)) return false;
+                if (/^continue\\b/i.test(s)) return true;
+                return /^(proceed|confirm)$/i.test(s);
+              };
               const nodes = [...document.querySelectorAll('button, a, [role=button]')];
               const hits = [];
               for (const el of nodes) {
@@ -2055,12 +2070,13 @@ def _safe_continue(page) -> bool:
                   .replace(/\\s+/g, ' ')
                   .trim();
                 const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-                const label = own || (text.length <= 40 ? text : '');
-                if (!forward.test(label) || payOnly.test(text)) continue;
+                const label = own || (text.length <= 56 ? text : '');
+                if (!isForward(label) && !isForward(text)) continue;
+                if (payOnly.test(text)) continue;
                 const style = window.getComputedStyle(el);
                 if (style.visibility === 'hidden' || style.display === 'none' || style.pointerEvents === 'none') continue;
                 const rect = el.getBoundingClientRect();
-                if (rect.width < 48 || rect.height < 28 || rect.width > 480) continue;
+                if (rect.width < 48 || rect.height < 28 || rect.width > 520) continue;
                 hits.push(el);
               }
               if (!hits.length) return null;
@@ -2092,9 +2108,12 @@ def _safe_continue(page) -> bool:
         except Exception:
             pass
     try:
-        btn = page.get_by_role("button", name=re.compile(r"^(Continue|Confirm|Proceed)$", re.I)).last
+        btn = page.get_by_role(
+            "button",
+            name=re.compile(r"^(Continue\b.*|Confirm|Proceed)$", re.I),
+        ).last
         label = (btn.inner_text(timeout=2000) or "").strip()
-        if re.search(r"\bpay\b", label, re.I):
+        if re.search(r"\bpay\b", label, re.I) and not re.search(r"continue to payment", label, re.I):
             return False
         box = btn.bounding_box()
         if box and box.get("width", 0) > 8 and box.get("height", 0) > 8:
@@ -3876,6 +3895,16 @@ def run_checkout_agent(
                 log.append(f"user_tap:{tap_pending}")
                 tap_pending = ""
                 _leave_addons(page, log, rounds=2)
+                continue
+            elif re.search(r"\bcontinue\b", tap_pending, re.I):
+                # Cleartrip Review uses "Continue with 1-step checkout" — exact "Continue" misses.
+                moved = _js_continue(page) or _safe_continue(page) or _click_label(page, tap_pending)
+                log.append(f"user_tap_continue:{int(bool(moved))}")
+                tap_pending = ""
+                try:
+                    page.wait_for_timeout(900)
+                except Exception:
+                    pass
                 continue
             elif _click_label(page, tap_pending):
                 log.append(f"user_tap:{tap_pending}")

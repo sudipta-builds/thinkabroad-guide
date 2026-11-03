@@ -3236,7 +3236,62 @@ def _run_kernel_login(
             # Never attach the stumped / wrong-url screenshot.
             _deliver(phone, spoken, None, secrets)
         else:
-            _deliver_signed_in_page(phone, seller, result, secrets)
+            # Review itinerary is not a WhatsApp ask — press Continue / 1-step checkout now.
+            for _ in range(2):
+                page_now = str(result.get("page") or "")
+                url_now = str(result.get("url") or "")
+                if not re.search(r"review your itinerary", page_now, re.I):
+                    break
+                if re.search(r"add traveller|first\s*&\s*middle|continue to payment", page_now, re.I):
+                    break
+                sid = str(result.get("session_id") or "")
+                if not sid:
+                    break
+                try:
+                    result = begin_login(
+                        seller=seller,
+                        whatsapp_phone=phone,
+                        explicit=str(loaded.get("login_phone") or loaded.get("phone") or ""),
+                        origin=origin,
+                        destination=destination,
+                        depart=depart,
+                        hint=hint,
+                        profile=profile,
+                        on_code_requested=on_code_requested,
+                        resume_url=url_now,
+                        chosen_tap="Continue",
+                        session_id=sid,
+                        fresh_browser=False,
+                    )
+                except Exception:
+                    logger.exception("Kernel review Continue failed")
+                    break
+                if str(result.get("status") or "") == "otp_sent" or announced:
+                    break
+                if _kernel_result_is_site_error(result):
+                    break
+            status = str(result.get("status") or "")
+            if status == "otp_sent" and not announced:
+                on_code_requested(result)
+            elif status in {"already_logged_in", "fares", "held"} and not announced:
+                if _kernel_result_is_site_error(result):
+                    state = _load(phone)
+                    state["kernel_awaiting_otp"] = False
+                    state.pop("kernel_session_id", None)
+                    release_saved_kernel(str(result.get("session_id") or ""))
+                    when = str(state.get("selected_hint") or hint or "go on")
+                    spoken = (
+                        f"Still opening the {when} — reply {when} and I'll start a clean browser. "
+                        "Nothing paid."
+                    )
+                    state["stuck_kind"] = "error"
+                    state["last_stuck"] = spoken
+                    _save(phone, state)
+                    _deliver(phone, spoken, None, secrets)
+                else:
+                    _deliver_signed_in_page(phone, seller, result, secrets)
+            elif not announced:
+                _deliver_signed_in_page(phone, seller, result, secrets)
     elif status == "resume_lost" and not announced:
         state = _load(phone)
         state["kernel_awaiting_otp"] = False

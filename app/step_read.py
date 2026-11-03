@@ -140,7 +140,13 @@ def is_name_confirm(page: str) -> bool:
 
 def forward_tap(page: str) -> str:
     """Confirm / Continue / Proceed when that label is on this sheet."""
-    for label in ("Confirm", "Continue", "Proceed"):
+    for label in (
+        "Continue with 1-step checkout",
+        "Continue to payment",
+        "Confirm",
+        "Continue",
+        "Proceed",
+    ):
         hit = safe_tap(label, page)
         if hit:
             return hit

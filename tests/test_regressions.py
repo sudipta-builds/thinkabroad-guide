@@ -1814,11 +1814,15 @@ class SellerChoiceAndProxy(unittest.TestCase):
             run_checkout_agent,
         )
 
-        self.assertIn("continue to payment", inspect.getsource(_js_continue).lower())
+        js_src = inspect.getsource(_js_continue).lower()
+        self.assertIn("continue to payment", js_src)
+        self.assertIn("1-step checkout", js_src)
+        self.assertIn("continue\\\\b", js_src)
         self.assertIn("traveller name", inspect.getsource(_fill_passenger_fields).lower())
         self.assertFalse(_PAY_REFUSE.search("Continue to payment"))
         refuse = inspect.getsource(run_checkout_agent)
         self.assertIn("continue to payment", refuse.lower())
+        self.assertIn("user_tap_continue", refuse)
         self.assertIn("_cleartrip_guest_sprint", refuse)
         sprint = inspect.getsource(_cleartrip_guest_sprint)
         self.assertIn("data-ct-fill", sprint)
@@ -1953,7 +1957,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
             text = page.inner_text("body")
             browser.close()
         self.assertIn("Review your itinerary", text)
-        self.assertTrue(any(line == "user_tap:Continue" for line in outcome.log), outcome.log)
+        self.assertTrue(any(line.startswith("user_tap_continue:1") for line in outcome.log), outcome.log)
         self.assertFalse(any("skip add" in line.lower() for line in outcome.log), outcome.log)
 
     def test_continue_on_review_opens_login(self) -> None:
@@ -2007,7 +2011,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
             text = page.inner_text("body")
             browser.close()
         self.assertIn("Enter mobile number", text)
-        self.assertTrue(any(line == "user_tap:Continue" for line in outcome.log), outcome.log)
+        self.assertTrue(any(line.startswith("user_tap_continue:1") for line in outcome.log), outcome.log)
         self.assertFalse(any("addons_fast" in line for line in outcome.log), outcome.log)
         self.assertFalse(any("Skip add-ons" in line for line in outcome.log), outcome.log)
 
@@ -2343,7 +2347,43 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn('alt = "ixigo"', run_src)
         self.assertIn("Never attach the stumped", run_src)
         self.assertIn("Still opening the", run_src)
+        self.assertIn("review your itinerary", run_src)
+        self.assertIn('chosen_tap="Continue"', run_src)
         self.assertNotIn("system error for the", run_src)
+
+    def test_cleartrip_one_step_checkout_continue_clicks(self) -> None:
+        from playwright.sync_api import sync_playwright
+
+        from app.page_agent import _js_continue
+        from app.step_read import forward_tap
+
+        page_text = (
+            "Review your itinerary Guwahati New Delhi Continue with 1-step checkout "
+            "Secure your trip Fare summary"
+        )
+        self.assertEqual(forward_tap(page_text), "Continue with 1-step checkout")
+        html = """<!doctype html><html><body>
+        <h1>Review your itinerary</h1>
+        <button id="go" style="width:260px;height:48px">Continue with 1-step checkout</button>
+        <script>
+          const btn = document.getElementById('go');
+          btn.__reactFiber$test = {
+            memoizedProps: {
+              onClick: () => {
+                document.body.innerHTML = '<h1>Add contact details</h1><p>Email address</p>';
+              }
+            }
+          };
+        </script></body></html>"""
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            page.set_content(html)
+            moved = _js_continue(page)
+            text = page.inner_text("body")
+            browser.close()
+        self.assertTrue(moved)
+        self.assertIn("Add contact details", text)
 
     def test_login_mode_error_asks_for_fresh_otp_not_seller_switch(self) -> None:
         from app.travel_agent import _booking_page_reply
@@ -3138,11 +3178,13 @@ class SellerChoiceAndProxy(unittest.TestCase):
         click = inspect.getsource(_safe_continue)
         self.assertIn("mouse.click", click)
         self.assertIn("elementFromPoint", click)
-        self.assertIn("continue|confirm|proceed", click)
+        self.assertIn("isForward", click)
+        self.assertIn("continue\\\\b", click)
         self.assertIn("_ixigo_buy_this_visible", click)
         # Deny-list real charge buttons; "Continue to payment" is allowed.
         self.assertIn("payOnly", click)
         self.assertIn("continue to payment", click.lower())
+        self.assertIn("Continue\\b.*", click)
         self.assertNotIn('name=re.compile(r"^(continue|confirm|proceed|pay now)', click.lower())
         opt = inspect.getsource(_ixigo_opt_out_cancellation)
         self.assertIn("buy this", opt.lower())

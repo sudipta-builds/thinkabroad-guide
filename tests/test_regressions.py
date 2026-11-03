@@ -1134,15 +1134,16 @@ class SellerChoiceAndProxy(unittest.TestCase):
             "Review your itinerary Add Meals Fruit Cake Skip add-ons "
             "Add Extra Luggage Continue Review contact details"
         )
-        self.assertEqual(_classify(meals, "https://www.cleartrip.com/flights/itinerary/x"), "addons")
+        # Review heading wins — flex meal Skip on Review is not Choose add-ons.
+        self.assertEqual(_classify(meals, "https://www.cleartrip.com/flights/itinerary/x"), "review")
         self.assertTrue(_addons(meals))
         from app.step_contract import left_addons as _left
 
-        self.assertFalse(_left(meals, "addons"))
+        self.assertFalse(_left(meals, "review"))
         self.assertFalse(
             _left(
                 "Review your itinerary Add Meals Skip add-ons Free Date Change Continue",
-                "addons",
+                "review",
             )
         )
         self.assertTrue(_left("Review your itinerary Fare summary Total amount Continue", "review"))
@@ -1754,6 +1755,114 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("Review", text)
         self.assertNotEqual(stage, "addons")
 
+    def test_cleartrip_skip_uses_react_fiber_onclick(self) -> None:
+        """Cleartrip Skip ignores el.click()/mouse — fiber onClick is what advances."""
+        import inspect
+
+        from playwright.sync_api import sync_playwright
+
+        from app.page_agent import _leave_addons, _skip_addons, classify_page
+
+        src = inspect.getsource(_skip_addons)
+        self.assertIn("__reactFiber$", src)
+        self.assertIn("memoizedProps", src)
+        html = """<!doctype html><html><body>
+        <h1>Choose add-ons</h1>
+        <p>No meal, additional check-in baggage and seats selected</p>
+        <button id="skip" style="width:180px;height:44px">Skip add-ons</button>
+        <script>
+          const btn = document.getElementById('skip');
+          // Pretend React fiber — real Cleartrip attaches the same shape.
+          btn.__reactFiber$test = {
+            memoizedProps: {
+              onClick: () => {
+                document.body.innerHTML =
+                  '<h1>Add Contact details</h1><p>+91 Email address Continue</p>' +
+                  '<p>Review traveller details</p>';
+              }
+            }
+          };
+        </script></body></html>"""
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            page.set_content(html)
+            log: list[str] = []
+            ok = _leave_addons(page, log, rounds=2)
+            text = page.inner_text("body")
+            stage = classify_page(text, "https://www.cleartrip.com/flights/itinerary/abc")
+            browser.close()
+        self.assertTrue(ok, log)
+        self.assertIn("Add Contact", text)
+        self.assertNotIn("Choose add-ons", text)
+        self.assertNotEqual(stage, "addons")
+
+    def test_continue_to_payment_is_traveller_handoff_not_charge(self) -> None:
+        """Cleartrip 'Continue to payment' advances the form; it is not Pay now."""
+        import inspect
+
+        from playwright.sync_api import sync_playwright
+
+        from app.page_agent import (
+            _PAY_REFUSE,
+            _cleartrip_guest_sprint,
+            _fill_passenger_fields,
+            _js_continue,
+            run_checkout_agent,
+        )
+
+        self.assertIn("continue to payment", inspect.getsource(_js_continue).lower())
+        self.assertIn("traveller name", inspect.getsource(_fill_passenger_fields).lower())
+        self.assertFalse(_PAY_REFUSE.search("Continue to payment"))
+        refuse = inspect.getsource(run_checkout_agent)
+        self.assertIn("continue to payment", refuse.lower())
+        self.assertIn("_cleartrip_guest_sprint", refuse)
+        sprint = inspect.getsource(_cleartrip_guest_sprint)
+        self.assertIn("data-ct-fill", sprint)
+        self.assertIn("_continue_to_payment", sprint)
+        html = """<!doctype html><html><body>
+        <h1>Add traveller details</h1>
+        <label>First &amp; middle name (Given name) <input id="fn" style="width:200px;height:36px" /></label>
+        <label>Last name (Surname) <input id="ln" style="width:200px;height:36px" /></label>
+        <button id="go" style="width:220px;height:48px">Continue to payment</button>
+        <script>
+          const btn = document.getElementById('go');
+          btn.__reactFiber$test = {
+            memoizedProps: {
+              onClick: () => {
+                const fn = document.getElementById('fn');
+                const ln = document.getElementById('ln');
+                if (!fn || !ln || !fn.value || !ln.value) {
+                  document.body.innerHTML = '<p>Please enter a valid last name</p>';
+                  return;
+                }
+                document.body.innerHTML =
+                  '<h1>Payment options</h1><p>Pay to complete your booking Enter card number</p>';
+              }
+            }
+          };
+        </script></body></html>"""
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            page.set_content(html)
+            notes = _fill_passenger_fields(
+                page, {"name": "Sudipta Saikia", "gender": "male", "email": "", "phone": "", "dob": ""}
+            )
+            vals = page.evaluate(
+                "() => ({fn: document.getElementById('fn').value, ln: document.getElementById('ln').value})"
+            )
+            moved = _js_continue(page)
+            text = page.inner_text("body")
+            browser.close()
+        self.assertIn("first:ok", " ".join(notes), notes)
+        self.assertIn("last:ok", " ".join(notes), notes)
+        self.assertEqual(vals.get("fn"), "Sudipta")
+        self.assertEqual(vals.get("ln"), "Saikia")
+        self.assertTrue(moved)
+        self.assertIn("Pay to complete", text)
+        self.assertNotIn("valid last name", text.lower())
+
     def test_continue_opens_review_when_skip_does_not_move(self) -> None:
         """Extras stay put on Skip. Continue is what opens Review your itinerary."""
         from playwright.sync_api import sync_playwright
@@ -2107,6 +2216,92 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("book as guest", src.lower())
         self.assertIn('auth_mode == "guest"', src)
         self.assertNotIn("If you're signed out, reply with the", src)
+
+    def test_cleartrip_create_exposes_itinerary_url(self) -> None:
+        from app.page_agent import (
+            _js_continue,
+            _safe_continue,
+            cleartrip_itinerary_url,
+            classify_page,
+            itinerary_id_from_create,
+            open_cleartrip_itinerary,
+            run_checkout_agent,
+        )
+        import inspect
+
+        body = '{"responseCode":200,"success":true,"data":{"itineraryId":"NIAH10abc"}}'
+        self.assertEqual(itinerary_id_from_create(body=body), "NIAH10abc")
+        self.assertEqual(
+            itinerary_id_from_create(payload={"data": {"itineraryId": "NIAH10xyz"}}),
+            "NIAH10xyz",
+        )
+        self.assertEqual(
+            cleartrip_itinerary_url("NIAH10abc"),
+            "https://www.cleartrip.com/flights/itinerary/NIAH10abc/info",
+        )
+        self.assertEqual(
+            cleartrip_itinerary_url("NIAH10abc", info=False),
+            "https://www.cleartrip.com/flights/itinerary/NIAH10abc",
+        )
+        open_src = inspect.getsource(open_cleartrip_itinerary)
+        self.assertIn("info=False", open_src)
+        self.assertIn("info=True", open_src)
+        src = inspect.getsource(__import__("app.page_agent", fromlist=["_confirm_fare"])._confirm_fare)
+        self.assertIn("open_cleartrip_itinerary", src)
+        self.assertIn("itinerary_id", src)
+        self.assertIn("open_cleartrip_itinerary", inspect.getsource(open_cleartrip_itinerary))
+        review = (
+            "Review your itinerary Guwahati → New Delhi IndiGo 6E-6150 14:20 "
+            "Make your journey fully flexible Free Date Change ₹329 Add Continue"
+        )
+        self.assertEqual(
+            classify_page(review, "https://www.cleartrip.com/flights/itinerary/NIAH1"),
+            "review",
+        )
+        checkout = inspect.getsource(run_checkout_agent)
+        self.assertIn("cleartrip_review", checkout)
+        self.assertIn("_js_continue", checkout)
+        self.assertIn("_decline_cleartrip_protect", checkout)
+        self.assertIn("ct_protect_decline", checkout)
+        self.assertIn("_js_continue", inspect.getsource(_safe_continue))
+        self.assertTrue(callable(_js_continue))
+        from app.page_agent import _decline_cleartrip_protect
+
+        self.assertIn("without trip protect", inspect.getsource(_decline_cleartrip_protect).lower())
+
+    def test_guest_cleartrip_error_stays_on_cleartrip(self) -> None:
+        from app.travel_agent import _booking_page_reply
+        from app.turn_loop import align_action
+
+        state = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "cleartrip",
+            "selected_hint": "2:20",
+            "kernel_auth_mode": "guest",
+        }
+        spoken = _booking_page_reply(
+            state,
+            "2:20",
+            "Server error",
+            type(
+                "S",
+                (),
+                {"page": type("P", (), {"url": "https://www.cleartrip.com/flights/itinerary/failure"})()},
+            )(),
+        )
+        self.assertNotIn("EaseMyTrip", spoken)
+        self.assertNotIn("Ixigo", spoken)
+        self.assertIsNone(state.get("pending_seller_switch"))
+        self.assertIn("try again", spoken.lower())
+        self.assertIn("cleartrip", spoken.lower())
+
+        state["stuck_kind"] = "error"
+        state["stuck_page"] = "Server error itinerary/failure"
+        plan = align_action("try again", state)
+        self.assertEqual(plan["do"], "book")
+        self.assertEqual(plan.get("tap") or "", "")
 
     def test_kernel_success_is_the_live_page(self) -> None:
         import inspect
@@ -2871,7 +3066,10 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("elementFromPoint", click)
         self.assertIn("continue|confirm|proceed", click)
         self.assertIn("_ixigo_buy_this_visible", click)
-        self.assertNotIn("pay now", click.lower())
+        # Deny-list real charge buttons; "Continue to payment" is allowed.
+        self.assertIn("payOnly", click)
+        self.assertIn("continue to payment", click.lower())
+        self.assertNotIn('name=re.compile(r"^(continue|confirm|proceed|pay now)', click.lower())
         opt = inspect.getsource(_ixigo_opt_out_cancellation)
         self.assertIn("buy this", opt.lower())
         self.assertIn("continue without", opt.lower())

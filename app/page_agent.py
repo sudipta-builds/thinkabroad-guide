@@ -203,7 +203,8 @@ def verify_trip_facts(
 
 
 _SITE_ERROR = re.compile(
-    r"acting up|system is acting|go to home|itinerary/failure|been disconnected|connection lost|server error",
+    r"acting up|system is acting|go to home|itinerary/failure|been disconnected|connection lost|server error|"
+    r"servers are stumped|wrong url|check your url|please check the url",
     re.I,
 )
 _PAY_SHEET = re.compile(
@@ -290,6 +291,9 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
     # Fare picker drawer can sit on top of a still-visible results list — detect it first.
     if _looks_like_fare_sheet(hay):
         return "fare_sheet"
+    # Cleartrip "Review your itinerary" (flex Add cards) is review — never Skip-addons.
+    if re.search(r"review your itinerary", hay, re.I):
+        return "review"
     # Live Skip / Choose add-ons beats a lone "Book" word left on the itinerary sheet.
     if re.search(r"choose add-ons|missed adding|skip add-?ons", hay, re.I):
         return "addons"
@@ -299,8 +303,6 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
     # Fare lists win over soft add-on marketing copy on Cleartrip/Ixigo results.
     if fare_list and not flight_unavailable(hay):
         return "results"
-    if re.search(r"review your itinerary", hay, re.I):
-        return "review"
     # Meals/luggage sheet without a review heading (Skip already handled above).
     if re.search(r"add seats|add meals|add extra luggage|choose your seat|add meal", hay, re.I):
         return "addons"
@@ -426,7 +428,12 @@ _SURFACE_JS = """() => {
   const frontRoot = () => {
     const cx = innerWidth / 2, cy = innerHeight / 2;
     const marked = [...document.querySelectorAll('[role=dialog],[aria-modal=true]')].filter(vis);
-    const panels = [...document.querySelectorAll('div,section,aside')].filter((el) => {
+    // Do NOT query every div/section — Cleartrip seat maps stall Kernel CDP for minutes.
+    const candidates = [...document.querySelectorAll(
+      '[role=dialog],[aria-modal=true],aside,[data-testid*="modal"],[class*="modal"],[class*="drawer"],[class*="overlay"]'
+    )].filter(vis);
+    const panels = candidates.filter((el) => {
+      if (marked.includes(el)) return false;
       const s = getComputedStyle(el);
       if (s.position !== 'fixed' && s.position !== 'absolute') return false;
       const r = el.getBoundingClientRect();
@@ -901,6 +908,55 @@ def interpret_itinerary_create(status: int | None, body: str = "") -> str:
     return "unknown"
 
 
+def itinerary_id_from_create(body: str = "", payload: dict | None = None) -> str:
+    """Cleartrip create returns data.itineraryId even when the fare drawer never navigates."""
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, dict):
+            raw = str(data.get("itineraryId") or data.get("itinId") or "").strip()
+            if raw:
+                return raw
+    text = body or ""
+    match = re.search(r'"itineraryId"\s*:\s*"([^"]+)"', text)
+    if match:
+        return str(match.group(1) or "").strip()
+    match = re.search(r'"itinId"\s*:\s*"([^"]+)"', text)
+    return str(match.group(1) or "").strip() if match else ""
+
+
+def cleartrip_itinerary_url(itinerary_id: str, *, info: bool = True) -> str:
+    """Guest checkout page for a created itinerary."""
+    iid = (itinerary_id or "").strip()
+    if not iid:
+        return ""
+    base = f"https://www.cleartrip.com/flights/itinerary/{iid}"
+    return f"{base}/info" if info else base
+
+
+def open_cleartrip_itinerary(page, itinerary_id: str) -> bool:
+    """Force the SPA onto the created itinerary when Continue left the results URL open."""
+    iid = (itinerary_id or "").strip()
+    if not iid:
+        return False
+    # Bare /itinerary/{id} often works when /info returns Cleartrip's "wrong url" shell.
+    for dest in (cleartrip_itinerary_url(iid, info=False), cleartrip_itinerary_url(iid, info=True)):
+        try:
+            page.goto(dest, wait_until="domcontentloaded", timeout=90000)
+            page.wait_for_timeout(1200)
+        except Exception:
+            continue
+        try:
+            text, url = _read(page)
+            stage = classify_page(text, url, book_count=_book_count(page))
+        except Exception:
+            continue
+        if stage == "error" or site_error_page(text, url) or "itinerary/failure" in (url or "").lower():
+            continue
+        if "itinerary" in (url or "").lower() and "/results" not in (url or "").lower():
+            return True
+    return False
+
+
 def _advance_after_book(page, hint: str, log: list[str]) -> bool:
     """After Book on a results row: open/confirm the fare drawer instead of asking.
 
@@ -1007,18 +1063,35 @@ def _confirm_fare(page) -> bool:
 
     Cleartrip's Continue posts to /itin/v7/itinerary/create. A mouse click that
     returns without navigation is not success — Akamai often replies 403 Access
-    Denied and the sheet stays open.
+    Denied and the sheet stays open. A 200 with itineraryId still counts when the
+    SPA leaves the drawer closed on the results URL — open /itinerary/{id}/info.
     """
-    create: dict[str, object] = {"status": None, "body": ""}
+    create: dict[str, object] = {"status": None, "body": "", "itinerary_id": ""}
 
     def on_response(res) -> None:
         if _ITINERARY_CREATE not in (res.url or ""):
             return
         create["status"] = res.status
+        payload = None
         try:
-            create["body"] = (res.text() or "")[:2000]
+            payload = res.json()
         except Exception:
-            create["body"] = ""
+            payload = None
+        if isinstance(payload, dict):
+            create["itinerary_id"] = itinerary_id_from_create(payload=payload)
+            try:
+                import json as _json
+
+                create["body"] = _json.dumps(payload)[:8000]
+            except Exception:
+                create["body"] = str(payload)[:8000]
+            return
+        try:
+            body = res.text() or ""
+        except Exception:
+            body = ""
+        create["body"] = body[:8000]
+        create["itinerary_id"] = itinerary_id_from_create(body=body)
 
     try:
         page.on("response", on_response)
@@ -1112,27 +1185,33 @@ def _confirm_fare(page) -> bool:
         create["status"] if isinstance(create["status"], int) else None,
         str(create.get("body") or ""),
     )
+    itinerary_id = str(create.get("itinerary_id") or itinerary_id_from_create(str(create.get("body") or "")))
     logger.info(
-        "Continue create status=%s outcome=%s",
+        "Continue create status=%s outcome=%s itinerary_id=%s",
         create.get("status"),
         outcome,
+        itinerary_id[:40],
     )
     # A 403 or server error is a rejected booking even if the URL changes to the beach-chair page.
     if outcome in {"denied", "error"}:
         return False
-    left = _wait_until(page, "fare_sheet", rounds=16)
+    # Guest holds expire in ~20s — navigate the instant we have itineraryId.
+    # Do not burn the TTL polling the fare drawer.
+    try:
+        if "itinerary" in (page.url or "") and "/results" not in (page.url or ""):
+            return True
+    except Exception:
+        pass
+    if outcome == "ok" and itinerary_id and open_cleartrip_itinerary(page, itinerary_id):
+        left = classify_page(*_read(page), book_count=_book_count(page))
+        return left not in {"error", "fare_sheet", "results", "home"}
+    left = _wait_until(page, "fare_sheet", rounds=8)
     if left == "error":
         return False
     if left in {"addons", "review", "passenger", "pay", "login", "otp", "other"}:
         return True
     if left != "fare_sheet":
         return True
-    try:
-        # Kernel can miss the XHR body while the tab already opened itinerary.
-        if "itinerary" in (page.url or "") and "/results" not in (page.url or ""):
-            return True
-    except Exception:
-        pass
     # Click ran; Cleartrip did not accept the booking step.
     return False
 
@@ -1200,7 +1279,8 @@ _AIM_JS = """(label) => {
   const seen = new Set();
   const out = [];
   for (const root of roots) {
-    const nodes = [...root.querySelectorAll('button,a,[role=button],input[type=submit],label,span,div')];
+    // Prefer real controls. Scanning every span/div on Cleartrip seat maps stalls Kernel.
+    const nodes = [...root.querySelectorAll('button,a,[role=button],input[type=submit],label')];
     for (const el of nodes) {
       if (textOf(el) !== want) continue;
       const rough = el.getBoundingClientRect();
@@ -1355,7 +1435,8 @@ def _skip_addons(page) -> str:
     """Leave Cleartrip/Ixigo optional extras, including the missed meals/seats nag.
 
     Scrolls to find Skip when the seat map fills the viewport. Returns the label
-    clicked, or empty when nothing matched.
+    clicked, or empty when nothing matched. Cleartrip Skip ignores el.click() and
+    CDP/mouse — invoke React fiber onClick instead (verified live on Kernel).
     """
     labels = (
         "Skip add-ons",
@@ -1367,8 +1448,107 @@ def _skip_addons(page) -> str:
         "Skip",
     )
 
+    def _js_skip() -> str:
+        try:
+            # Buttons only — scanning every span/div on Cleartrip's seat map stalls Kernel CDP.
+            hit = page.evaluate(
+                """(labels) => {
+                  const nodes = [...document.querySelectorAll('button,a,[role=button]')];
+                  const fakeEvt = (el) => ({
+                    preventDefault() {},
+                    stopPropagation() {},
+                    nativeEvent: { isTrusted: true },
+                    target: el,
+                    currentTarget: el,
+                    type: 'click',
+                    bubbles: true,
+                    cancelable: true,
+                  });
+                  const fireReact = (el) => {
+                    // Prefer fiber memoizedProps — Cleartrip also sets a DOM onclick that only
+                    // fires analytics (FB pixel) and leaves Choose add-ons open.
+                    const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+                    let fiber = fiberKey ? el[fiberKey] : null;
+                    for (let i = 0; i < 12 && fiber; i++) {
+                      const props = fiber.memoizedProps || fiber.pendingProps;
+                      if (props && typeof props.onClick === 'function') {
+                        props.onClick(fakeEvt(el));
+                        return 'fiber:' + i;
+                      }
+                      fiber = fiber.return;
+                    }
+                    const propsKey = Object.keys(el).find(k => k.startsWith('__reactProps$'));
+                    if (propsKey && el[propsKey] && typeof el[propsKey].onClick === 'function') {
+                      el[propsKey].onClick(fakeEvt(el));
+                      return 'props';
+                    }
+                    if (typeof el.onclick === 'function') {
+                      el.onclick(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                      return 'dom';
+                    }
+                    return '';
+                  };
+                  for (const want of labels) {
+                    const el = nodes.find(n => {
+                      const t = (n.innerText || n.getAttribute('aria-label') || '').replace(/\\s+/g,' ').trim();
+                      return t && t.length < 48 && t.toLowerCase() === String(want).toLowerCase();
+                    });
+                    if (!el) continue;
+                    // Footer sits inside .oy-scroll — scroll that first or Skip stays below the fold.
+                    let p = el.parentElement;
+                    while (p) {
+                      const s = getComputedStyle(p);
+                      if (/(auto|scroll)/.test(s.overflowY) && p.scrollHeight > p.clientHeight + 20) {
+                        p.scrollTop = p.scrollHeight;
+                      }
+                      p = p.parentElement;
+                    }
+                    el.scrollIntoView({block:'center', inline:'nearest'});
+                    if (fireReact(el)) return want;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 8 || r.height < 8) continue;
+                    if (r.top < 0 || r.bottom > innerHeight) continue;
+                    return {
+                      label: want,
+                      x: r.x + r.width / 2,
+                      y: r.y + r.height / 2,
+                    };
+                  }
+                  return null;
+                }""",
+                list(labels),
+            )
+            if isinstance(hit, str) and hit:
+                return hit
+            if isinstance(hit, dict) and hit.get("x") is not None:
+                try:
+                    page.mouse.click(float(hit["x"]), float(hit["y"]))
+                    return str(hit.get("label") or "Skip add-ons")
+                except Exception:
+                    pass
+            return ""
+        except Exception:
+            return ""
+
+    def _playwright_skip() -> str:
+        for label in ("Skip add-ons", "Skip add ons", "Continue without add-ons"):
+            try:
+                btn = page.get_by_role("button", name=re.compile(rf"^{re.escape(label)}$", re.I)).last
+                btn.scroll_into_view_if_needed(timeout=3000)
+                btn.click(timeout=5000, force=True)
+                return label
+            except Exception:
+                continue
+        return ""
+
     def _try() -> str:
+        # Fiber/React first — Playwright force often times out on Cleartrip's unstable seat map.
+        hit = _js_skip() or _playwright_skip()
+        if hit:
+            return hit
         for label in labels:
+            if label == "Skip":
+                continue
             if _click_label(page, label):
                 return label
         return ""
@@ -1398,14 +1578,22 @@ def _skip_addons(page) -> str:
     except Exception:
         hay = ""
     if re.search(r"missed adding|skip add-?ons|okay,?\s*let me add", hay, re.I):
-        for label in ("Skip add-ons", "Skip add ons", "Skip"):
-            if _click_label(page, label):
-                clicked = label
-                try:
-                    page.wait_for_timeout(600)
-                except Exception:
-                    pass
-                break
+        again = _js_skip()
+        if again:
+            clicked = again
+            try:
+                page.wait_for_timeout(600)
+            except Exception:
+                pass
+        else:
+            for label in ("Skip add-ons", "Skip add ons"):
+                if _click_label(page, label):
+                    clicked = label
+                    try:
+                        page.wait_for_timeout(600)
+                    except Exception:
+                        pass
+                    break
     return clicked
 
 
@@ -1413,10 +1601,13 @@ def settle_visible_sheet(page, budget_ms: int = 8000) -> None:
     """Wait until Choose add-ons has painted Skip, and scroll that control into view.
 
     A gray skeleton is not a screenshot. Header and fare rail can be ready while Skip is still missing.
+    Cleartrip's seat map keeps growing — Skip's React handler no-ops until scrollHeight settles.
     """
     from app.step_read import addons_sheet
 
     deadline = time.monotonic() + max(0.5, budget_ms / 1000)
+    last_sh = -1
+    stable = 0
     while time.monotonic() < deadline:
         try:
             text, _url = _read(page)
@@ -1427,24 +1618,43 @@ def settle_visible_sheet(page, budget_ms: int = 8000) -> None:
         try:
             found = page.evaluate(
                 """() => {
-                  const nodes = [...document.querySelectorAll('button, a, [role="button"], span, div')];
+                  // Buttons only — span/div scans on Cleartrip seat maps stall Kernel CDP.
+                  const nodes = [...document.querySelectorAll('button, a, [role="button"]')];
                   const hit = nodes.find(n => /skip add-?ons|continue without add-?ons/i.test((n.innerText || '').trim())
                     && (n.innerText || '').trim().length < 40);
-                  if (!hit) return false;
+                  if (!hit) return {ok:false, sh:0};
+                  let p = hit.parentElement;
+                  let sh = 0;
+                  while (p) {
+                    const s = getComputedStyle(p);
+                    if (/(auto|scroll)/.test(s.overflowY) && p.scrollHeight > p.clientHeight + 20) {
+                      p.scrollTop = p.scrollHeight;
+                      sh = Math.max(sh, p.scrollHeight);
+                    }
+                    p = p.parentElement;
+                  }
                   hit.scrollIntoView({block: 'center', inline: 'nearest'});
-                  return true;
+                  return {ok:true, sh: sh || document.body.scrollHeight};
                 }"""
             )
         except Exception:
             return
-        if found:
-            try:
-                page.wait_for_timeout(350)
-            except Exception:
-                pass
-            return
+        if isinstance(found, dict) and found.get("ok"):
+            sh = int(found.get("sh") or 0)
+            if sh == last_sh and sh > 0:
+                stable += 1
+            else:
+                stable = 0
+            last_sh = sh
+            # One stable paint is enough — waiting for seat-map growth burns TTL.
+            if stable >= 1 or sh > 0:
+                try:
+                    page.wait_for_timeout(250)
+                except Exception:
+                    pass
+                return
         try:
-            page.wait_for_timeout(400)
+            page.wait_for_timeout(350)
         except Exception:
             return
 
@@ -1453,11 +1663,16 @@ def _leave_addons(page, log: list[str], *, rounds: int = 3) -> bool:
     """Outcome loop: skip extras until Choose add-ons is gone."""
     from app.step_contract import left_addons
 
+    deadline = time.monotonic() + 28
     try:
-        settle_visible_sheet(page)
+        # Skip paints quickly; long settle burns Cleartrip's short itinerary TTL.
+        settle_visible_sheet(page, budget_ms=4000)
     except Exception:
         log.append("addons_settle_err")
     for i in range(rounds):
+        if time.monotonic() > deadline:
+            log.append("addons_deadline")
+            return False
         text, url = _read(page)
         try:
             surface = read_surface(page)
@@ -1471,7 +1686,8 @@ def _leave_addons(page, log: list[str], *, rounds: int = 3) -> bool:
         hit = _skip_addons(page)
         log.append(f"addons_skip:{hit or 'miss'}:{i}")
         try:
-            page.wait_for_timeout(900)
+            # Fiber Skip navigates to contact; keep this short — itineraries expire fast.
+            page.wait_for_timeout(700)
         except Exception:
             pass
         text, url = _read(page)
@@ -1500,8 +1716,13 @@ def _leave_addons(page, log: list[str], *, rounds: int = 3) -> bool:
                 page.wait_for_timeout(300)
             except Exception:
                 pass
-            moved = _safe_continue(page)
+            # On Cleartrip Choose add-ons, Continue (same footer as Skip) often advances.
+            moved = _js_continue(page) or _safe_continue(page)
             log.append(f"review_continue:{int(bool(moved))}:{i}")
+            try:
+                page.wait_for_timeout(1200)
+            except Exception:
+                pass
         _poll_ready(
             page,
             {"review", "passenger", "pay", "login", "otp", "error", "unavailable", "other"},
@@ -1709,21 +1930,122 @@ def _ixigo_opt_out_cancellation(page) -> str:
     return "optout_miss"
 
 
-def _safe_continue(page) -> bool:
-    """One mouse click on the visible Continue, Confirm, or Proceed control.
+def _decline_cleartrip_protect(page) -> str:
+    """Cleartrip Trip Protect sits above Continue — decline it or Continue is a no-op."""
+    try:
+        hit = page.evaluate(
+            """() => {
+              const nodes = [...document.querySelectorAll('button,a,[role=button]')];
+              const el = nodes.find(n => {
+                const t = (n.innerText || n.getAttribute('aria-label') || '')
+                  .replace(/\\s+/g, ' ').trim();
+                return t.length > 8 && t.length < 120 && (
+                  /no,?\\s*i will continue without/i.test(t)
+                  || /continue without(?:\\s+trip)?\\s+protect/i.test(t)
+                  || /without trip protect/i.test(t)
+                );
+              });
+              if (!el) return '';
+              el.scrollIntoView({block: 'center', inline: 'nearest'});
+              el.click();
+              return (el.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 80);
+            }"""
+        )
+        return str(hit or "")
+    except Exception:
+        return ""
 
-    The target is the smallest on-screen control with that exact label, never a
-    Pay button and never a parent that merely contains the word. The center is
-    checked with elementFromPoint so the click lands on that control.
+
+def _js_continue(page) -> bool:
+    """Click Continue/Proceed/Confirm on a real button. Buttons only — no span/div scan.
+
+    Cleartrip traveller uses "Continue to payment" — that advances to the pay sheet
+    without charging. Refuse Pay now / Make payment only.
+    """
+    try:
+        hit = page.evaluate(
+            """() => {
+              const forward = /^(continue|proceed|confirm|continue booking|continue to payment)$/i;
+              const payOnly = /^(pay now|pay to complete|make payment|complete payment|pay securely)$/i;
+              const nodes = [...document.querySelectorAll('button,a,[role=button]')];
+              const hits = [];
+              const fakeEvt = (el) => ({
+                preventDefault() {}, stopPropagation() {},
+                nativeEvent: { isTrusted: true }, target: el, currentTarget: el,
+                type: 'click', bubbles: true, cancelable: true,
+              });
+              const fire = (el) => {
+                const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+                let fiber = fiberKey ? el[fiberKey] : null;
+                for (let i = 0; i < 12 && fiber; i++) {
+                  const props = fiber.memoizedProps || fiber.pendingProps;
+                  if (props && typeof props.onClick === 'function') {
+                    props.onClick(fakeEvt(el));
+                    return true;
+                  }
+                  fiber = fiber.return;
+                }
+                el.click();
+                return true;
+              };
+              for (const el of nodes) {
+                const text = (el.innerText || el.getAttribute('aria-label') || '')
+                  .replace(/\\s+/g, ' ').trim();
+                if (!forward.test(text) || payOnly.test(text)) continue;
+                if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
+                const style = window.getComputedStyle(el);
+                if (style.visibility === 'hidden' || style.display === 'none') continue;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 40 || rect.height < 24) continue;
+                hits.push(el);
+              }
+              if (!hits.length) return false;
+              // Prefer Continue to payment only once traveller name fields exist.
+              // On the contact step CTP is already in the DOM as step 4 — clicking it
+              // early no-ops / burns the hold before names are filled.
+              const travellerReady = [...document.querySelectorAll('label,h4,p')].some(el => {
+                const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                return t.length < 48 && /first\\s*&\\s*middle\\s*name|traveller name|last\\s*name/i.test(t);
+              });
+              hits.sort((a, b) => {
+                const ta = (a.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const tb = (b.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const pa = travellerReady && ta === 'continue to payment' ? 0
+                  : (!travellerReady && ta === 'continue to payment') ? 2
+                  : 1;
+                const pb = travellerReady && tb === 'continue to payment' ? 0
+                  : (!travellerReady && tb === 'continue to payment') ? 2
+                  : 1;
+                if (pa !== pb) return pa - pb;
+                const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+                return (rb.top - ra.top) || ((ra.width * ra.height) - (rb.width * rb.height));
+              });
+              const btn = hits[0];
+              btn.scrollIntoView({block: 'center', inline: 'nearest'});
+              return fire(btn);
+            }"""
+        )
+        return bool(hit)
+    except Exception:
+        return False
+
+
+def _safe_continue(page) -> bool:
+    """One click on the visible Continue, Confirm, or Proceed control.
+
+    Prefer a button JS click first — scanning every div/span on Cleartrip stalls Kernel.
     Buy This is an add-on purchase, not Continue, and it covers the real button.
     """
     if _ixigo_buy_this_visible(page):
         return False
+    if _js_continue(page):
+        return True
     try:
         point = page.evaluate(
             """() => {
-              const forward = /^(continue|confirm|proceed)$/i;
-              const nodes = [...document.querySelectorAll('button, a, [role=button], div, span')];
+              const forward = /^(continue|confirm|proceed|continue to payment)$/i;
+              const payOnly = /^(pay now|pay to complete|make payment|complete payment|pay securely)$/i;
+              const nodes = [...document.querySelectorAll('button, a, [role=button]')];
               const hits = [];
               for (const el of nodes) {
                 const own = [...el.childNodes]
@@ -1733,8 +2055,8 @@ def _safe_continue(page) -> bool:
                   .replace(/\\s+/g, ' ')
                   .trim();
                 const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-                const label = own || (text.length <= 24 ? text : '');
-                if (!forward.test(label) || /\\bpay\\b/i.test(text)) continue;
+                const label = own || (text.length <= 40 ? text : '');
+                if (!forward.test(label) || payOnly.test(text)) continue;
                 const style = window.getComputedStyle(el);
                 if (style.visibility === 'hidden' || style.display === 'none' || style.pointerEvents === 'none') continue;
                 const rect = el.getBoundingClientRect();
@@ -2396,33 +2718,200 @@ def _set_box(page, index: int, value: str) -> str:
         return "miss"
 
 
+def _type_near_label(page, label_re: str, value: str) -> str:
+    """Fill the input nearest a visible label. Cleartrip labels often lack htmlFor."""
+    if not value:
+        return "skip"
+    try:
+        stuck = page.evaluate(
+            """({labelRe, value}) => {
+              const re = new RegExp(labelRe, 'i');
+              const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 4 && r.height > 4 && s.visibility !== 'hidden'
+                  && s.display !== 'none' && s.opacity !== '0';
+              };
+              // Exact-ish short labels only — avoid home-page / fat wrappers.
+              // No span scan — Cleartrip seat maps make span queries hang Kernel CDP.
+              const labs = [...document.querySelectorAll('label,h4,h3,p')]
+                .filter(vis)
+                .filter(el => {
+                  const own = [...el.childNodes]
+                    .filter(n => n.nodeType === 3)
+                    .map(n => n.textContent || '')
+                    .join(' ')
+                    .replace(/\\s+/g, ' ')
+                    .trim();
+                  const t = own || (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                  return t.length > 3 && t.length < 48 && re.test(t);
+                });
+              labs.sort((a, b) => {
+                const ta = (a.innerText || '').replace(/\\s+/g, ' ').trim().length;
+                const tb = (b.innerText || '').replace(/\\s+/g, ' ').trim().length;
+                return ta - tb;
+              });
+              const lab = labs[0];
+              if (!lab) return {status: 'none'};
+              const lr = lab.getBoundingClientRect();
+              const inputs = [...document.querySelectorAll('input,textarea')]
+                .filter(vis)
+                .filter(el => {
+                  const type = (el.getAttribute('type') || '').toLowerCase();
+                  return !/hidden|radio|checkbox|submit|button|email|tel/.test(type);
+                });
+              let el = inputs.find(inp => lab.contains(inp));
+              if (!el) {
+                const wantLast = /last|surname/i.test(String(labelRe || ''));
+                const wantFirst = /first|given|middle|traveller/i.test(String(labelRe || ''));
+                const scored = inputs.map(inp => {
+                  const r = inp.getBoundingClientRect();
+                  const dy = Math.abs(r.top - lr.top);
+                  if (dy > 56) return {el: inp, score: 99999};
+                  const gap = Math.abs((r.left + r.width / 2) - (lr.left + lr.width / 2));
+                  let score = dy * 20 + gap;
+                  if (wantLast && r.left < lr.left - 40) score += 800;
+                  if (wantFirst && r.left > lr.right + 40) score += 800;
+                  return {el: inp, score};
+                }).filter(x => x.score < 99999)
+                  .sort((a, b) => a.score - b.score);
+                el = scored.length ? scored[0].el : null;
+              }
+              if (!el) return {status: 'none'};
+              el.scrollIntoView({block: 'center'});
+              const r = el.getBoundingClientRect();
+              return {
+                status: 'aim',
+                x: r.x + r.width / 2,
+                y: r.y + r.height / 2,
+                label: (lab.innerText || '').trim().slice(0, 60),
+              };
+            }""",
+            {"labelRe": label_re, "value": value},
+        )
+    except Exception:
+        return "miss"
+    if not isinstance(stuck, dict):
+        return "miss"
+    if stuck.get("status") == "none":
+        return "none"
+    if stuck.get("status") == "aim" and stuck.get("x") is not None:
+        try:
+            page.mouse.click(float(stuck["x"]), float(stuck["y"]))
+            page.keyboard.press("Control+A")
+            page.keyboard.insert_text(value)
+            page.wait_for_timeout(200)
+        except Exception:
+            return "miss"
+        # Re-read via near-label aim target value.
+        try:
+            got = page.evaluate(
+                """(labelRe) => {
+                  const re = new RegExp(labelRe, 'i');
+                  const vis = (el) => {
+                    const r = el.getBoundingClientRect();
+                    const s = getComputedStyle(el);
+                    return r.width > 4 && r.height > 4 && s.visibility !== 'hidden' && s.display !== 'none';
+                  };
+                  const labs = [...document.querySelectorAll('label,h4,h3,p,span')]
+                    .filter(vis)
+                    .filter(el => {
+                      const own = [...el.childNodes].filter(n => n.nodeType === 3)
+                        .map(n => n.textContent || '').join(' ').replace(/\\s+/g, ' ').trim();
+                      const t = own || (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                      return t.length > 3 && t.length < 48 && re.test(t);
+                    });
+                  labs.sort((a, b) => ((a.innerText||'').length - (b.innerText||'').length));
+                  const lab = labs[0];
+                  if (!lab) return '';
+                  const lr = lab.getBoundingClientRect();
+                  const inputs = [...document.querySelectorAll('input')].filter(vis);
+                  const hit = inputs
+                    .map(el => {
+                      const r = el.getBoundingClientRect();
+                      return {el, dy: Math.abs(r.top - lr.top), gap: Math.abs((r.left+r.width/2)-(lr.left+lr.width/2))};
+                    })
+                    .filter(x => x.dy <= 56)
+                    .sort((a, b) => (a.dy - b.dy) || (a.gap - b.gap));
+                  return hit.length ? (hit[0].el.value || '') : '';
+                }""",
+                label_re,
+            )
+        except Exception:
+            got = ""
+        if _box_keeps(str(got or ""), value):
+            return "ok"
+        return "miss"
+    if _box_keeps(str(stuck.get("value") or ""), value):
+        return "ok"
+    return "miss"
+
+
 def _type_labeled(page, labels: tuple[str, ...], value: str, *, optional: bool = False) -> str:
-    """Type into the box whose wrapper text matches this label (exact or contains)."""
+    """Type into the box whose wrapper text matches this label (exact or contains).
+
+    Cleartrip traveller labels have no htmlFor — find the label node, then the
+    nearest input (first/last sit side by side on one row).
+    """
     if not value:
         return "skip"
     wanted = {item.lower() for item in labels}
+    last_want = any(re.search(r"last|surname", w) for w in wanted)
+    first_want = any(re.search(r"first|given|middle|traveller name", w) for w in wanted) and not last_want
+
+    if last_want:
+        near = _type_near_label(page, r"last\s*name|surname", value)
+        if near in {"ok", "typed"}:
+            return near
+    elif first_want:
+        near = _type_near_label(
+            page,
+            r"first\s*(?:&|and)?\s*middle\s*name|given\s*name|first\s*name|traveller\s*name",
+            value,
+        )
+        if near in {"ok", "typed"}:
+            return near
+
+    def _blob(row: dict) -> str:
+        return " ".join(
+            [
+                str(row.get("label") or ""),
+                str(row.get("placeholder") or ""),
+                str(row.get("name") or ""),
+            ]
+        ).strip().lower()
+
+    def _score(row: dict) -> int:
+        if _is_email_box(row):
+            return -1
+        blob = _blob(row)
+        if not blob:
+            return -1
+        if last_want and re.search(r"first|given|middle|traveller name", blob) and not re.search(
+            r"last name|surname", blob
+        ):
+            return -1
+        if first_want and re.search(r"last name|surname", blob) and not re.search(
+            r"first|given|middle|traveller name", blob
+        ):
+            return -1
+        label = str(row.get("label") or "").strip().lower()
+        best = -1
+        for w in wanted:
+            if label == w:
+                best = max(best, 200 - len(label))
+            elif w in label and len(label) < 48:
+                best = max(best, 120 - len(label))
+            elif w in blob and len(blob) < 48:
+                best = max(best, 60 - len(blob))
+        return best
+
     boxes = _field_boxes(page)
-    match = next((row for row in boxes if str(row.get("label") or "").strip().lower() in wanted), None)
-    if match is None:
-        match = next(
-            (
-                row
-                for row in boxes
-                if any(w in str(row.get("label") or "").strip().lower() for w in wanted)
-                and not _is_email_box(row)
-            ),
-            None,
-        )
-    if match is None:
-        # Placeholder-only Cleartrip boxes (Given name / Surname).
-        match = next(
-            (
-                row
-                for row in boxes
-                if any(w in str(row.get("placeholder") or "").strip().lower() for w in wanted)
-            ),
-            None,
-        )
+    ranked = sorted(
+        ((_score(row), row) for row in boxes),
+        key=lambda item: (-item[0], len(str(item[1].get("label") or ""))),
+    )
+    match = next((row for score, row in ranked if score >= 40), None)
     if match is None:
         return "none" if optional else "miss"
     if str(match.get("value") or "").strip() == value.strip():
@@ -2431,23 +2920,27 @@ def _type_labeled(page, labels: tuple[str, ...], value: str, *, optional: bool =
 
 
 def _pick_gender(page, gender: str) -> str:
-    """Cleartrip shows Male/Female toggles instead of a Title dropdown."""
+    """Cleartrip shows Male/Female toggles instead of a Title dropdown.
+
+    Do not use click_verified — selecting Male does not change the sheet mark, so
+    verified clicks stall for seconds and burn the itinerary TTL.
+    """
     wanted = (gender or "").strip().lower()
     label = "Female" if wanted in {"female", "f", "ms", "mrs"} else "Male"
-    if _click_label(page, label):
-        return "ok"
     try:
         hit = page.evaluate(
             """(label) => {
-              const nodes = [...document.querySelectorAll('button,div,span,label,[role=button]')];
+              // Exact short chips only — Playwright get_by_text is slow on seat-map DOM.
+              const nodes = [...document.querySelectorAll('button,[role=button],label,div')];
               const el = nodes.find((n) => {
+                if (n.children.length > 2) return false;
                 const t = (n.innerText || '').replace(/\\s+/g, ' ').trim();
-                return new RegExp('^' + label + '$', 'i').test(t) && t.length < 12;
+                return t.toLowerCase() === String(label).toLowerCase();
               });
-              if (!el) return null;
+              if (!el) return '';
               el.scrollIntoView({block:'center'});
               el.click();
-              return true;
+              return 'dom';
             }""",
             label,
         )
@@ -2570,11 +3063,12 @@ def reveal_form_step(page) -> bool:
         return bool(
             page.evaluate(
                 """() => {
-                  const nodes = [...document.querySelectorAll('h1,h2,h3,h4,label,legend,p,div,span,button')];
+                  // Headings/labels only — scanning every div/span on Cleartrip stalls Kernel.
+                  const nodes = [...document.querySelectorAll('h1,h2,h3,h4,label,legend,button')];
                   const hit = nodes.find((node) => {
                     const text = (node.innerText || '').replace(/\\s+/g, ' ').trim();
                     return text.length > 3 && text.length < 80
-                      && /add contact|contact details|email address|mobile number|first name/i.test(text);
+                      && /add contact|contact details|email address|mobile number|first name|traveller name|traveller details|add traveller/i.test(text);
                   });
                   if (!hit) return false;
                   hit.scrollIntoView({block: 'center'});
@@ -2756,6 +3250,31 @@ def fill_profile_slots(page, profile: dict, *, keys: tuple[str, ...] = ("email",
                 notes[key] = "ok"
                 continue
             status = _set_box(page, int(row["index"]), value)
+            # Cleartrip contact email often reports ok then shows "Please enter Email".
+            # Always reinforce email/phone with keyboard insert into the aimed box.
+            if key in {"email", "phone"}:
+                try:
+                    page.mouse.click(float(row["x"]) + 8, float(row["y"]) + 8)
+                    page.keyboard.press("Control+A")
+                    page.keyboard.insert_text(value)
+                    page.wait_for_timeout(250)
+                    again = _targets().get(key)
+                    if again is not None and _value_stuck(str(again.get("value") or ""), value, key):
+                        status = "ok"
+                    elif key == "email":
+                        # Prefer the live type=email value over a stale index read.
+                        live = page.evaluate(
+                            """(email) => {
+                              const el = document.querySelector('input[type=email]');
+                              return el ? (el.value || '') : '';
+                            }"""
+                        )
+                        if _value_stuck(str(live or ""), value, "email"):
+                            status = "ok"
+                        else:
+                            status = "miss"
+                except Exception:
+                    pass
             if status == "ok":
                 notes[key] = "ok"
                 continue
@@ -2890,6 +3409,96 @@ def _apply_unknown_plan(page, plan: dict) -> list[str]:
     return notes
 
 
+def _fill_cleartrip_name_pair(page, first: str, last: str) -> tuple[str, str]:
+    """Fill Cleartrip's side-by-side First & middle / Last name via keyboard.
+
+    Synthetic value sets report ok but React drops them; insert_text sticks.
+    """
+    if not first and not last:
+        return "skip", "skip"
+    try:
+        aimed = page.evaluate(
+            """() => {
+              const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 4 && r.height > 4 && s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              const textOf = (el) => (el.innerText || '').replace(/\\s+/g, ' ').trim();
+              // Labels only — span scans stall Kernel on leftover seat-map DOM.
+              const findLab = (re) => [...document.querySelectorAll('label,p,h4')]
+                .filter(vis)
+                .find(el => {
+                  const own = [...el.childNodes].filter(n => n.nodeType === 3)
+                    .map(n => n.textContent || '').join('').replace(/\\s+/g,' ').trim();
+                  const t = own || textOf(el);
+                  return t.length > 3 && t.length < 48 && re.test(t);
+                });
+              const firstLab = findLab(/first\\s*&\\s*middle\\s*name|given\\s*name/i);
+              const lastLab = findLab(/^last\\s*name|surname/i);
+              const inputs = [...document.querySelectorAll('input')].filter(vis).filter(el => {
+                const type = (el.type || '').toLowerCase();
+                return !/hidden|radio|checkbox|submit|button|email|tel/.test(type);
+              });
+              const near = (lab) => {
+                if (!lab) return null;
+                const lr = lab.getBoundingClientRect();
+                return inputs
+                  .map(el => {
+                    const r = el.getBoundingClientRect();
+                    return {el, dy: Math.abs(r.top - lr.top), gap: Math.abs((r.left+r.width/2)-(lr.left+lr.width/2)), x: r.left};
+                  })
+                  .filter(x => x.dy <= 60)
+                  .sort((a,b) => (a.dy - b.dy) || (a.gap - b.gap))[0] || null;
+              };
+              let firstHit = near(firstLab);
+              let lastHit = near(lastLab);
+              if (!firstHit || !lastHit || firstHit.el === lastHit.el) {
+                const rows = {};
+                for (const el of inputs) {
+                  const y = Math.round(el.getBoundingClientRect().top / 8) * 8;
+                  (rows[y] = rows[y] || []).push(el);
+                }
+                const pair = Object.values(rows)
+                  .map(list => list.sort((a,b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left))
+                  .find(list => list.length === 2);
+                if (pair) {
+                  firstHit = {el: pair[0], x: pair[0].getBoundingClientRect().left};
+                  lastHit = {el: pair[1], x: pair[1].getBoundingClientRect().left};
+                }
+              }
+              const point = (hit) => {
+                if (!hit || !hit.el) return null;
+                const r = hit.el.getBoundingClientRect();
+                return {x: r.x + r.width/2, y: r.y + r.height/2};
+              };
+              return {first: point(firstHit), last: point(lastHit)};
+            }"""
+        )
+    except Exception:
+        return "miss", "miss" if last else "skip"
+    first_status, last_status = "miss", "miss" if last else "skip"
+
+    def _type_at(point: dict | None, value: str) -> str:
+        if not value:
+            return "skip"
+        if not isinstance(point, dict) or point.get("x") is None:
+            return "miss"
+        try:
+            page.mouse.click(float(point["x"]), float(point["y"]))
+            page.keyboard.press("Control+A")
+            page.keyboard.insert_text(value)
+            page.wait_for_timeout(200)
+            return "ok"
+        except Exception:
+            return "miss"
+
+    if isinstance(aimed, dict):
+        first_status = _type_at(aimed.get("first"), first)
+        last_status = _type_at(aimed.get("last"), last) if last else "skip"
+    return first_status, last_status
+
+
 def _fill_passenger_fields(page, profile: dict[str, str]) -> list[str]:
     """Type every traveller box we have. A label match is that box only, not a neighbour."""
     name = (profile.get("name") or "").strip()
@@ -2906,11 +3515,19 @@ def _fill_passenger_fields(page, profile: dict[str, str]) -> list[str]:
     gender_status = "skip"
     if title_status in {"none", "skip"} and (gender or name):
         gender_status = _pick_gender(page, gender or "male")
+    # Cleartrip side-by-side name row needs keyboard typing (React drops synthetic sets).
+    first_status, last_status = _fill_cleartrip_name_pair(page, first, last)
+    if first_status != "ok":
+        first_status = _type_labeled(
+            page, ("first & middle name", "first name", "given name", "traveller name"), first
+        )
+    if last and last_status != "ok":
+        last_status = _type_labeled(page, ("last name", "surname", "last name (surname)"), last)
     notes = [
         f"title:{title_status}",
         f"gender:{gender_status}",
-        f"first:{_type_labeled(page, ('first & middle name', 'first name', 'given name'), first)}",
-        f"last:{_type_labeled(page, ('last name', 'surname'), last)}",
+        f"first:{first_status}",
+        f"last:{last_status}",
         # Contact email/phone are often already saved; traveller sheet may not show them.
         f"email:{_type_labeled(page, ('email',), profile.get('email') or '', optional=True)}",
         f"phone:{_type_labeled(page, ('mobile number',), phone, optional=True)}",
@@ -2922,6 +3539,200 @@ def _fill_passenger_fields(page, profile: dict[str, str]) -> list[str]:
 
 
 _PAY_REFUSE = re.compile(r"pay now|pay to complete|make payment|complete payment|pay securely", re.I)
+
+
+def _cleartrip_guest_sprint(page, profile: dict, log: list[str]) -> str:
+    """Contact → traveller → Continue to payment as fast as possible.
+
+    Cleartrip guest itineraries expire in ~20s after create. Returns
+    pay|passenger|expired|miss.
+    """
+    email = str((profile or {}).get("email") or "").strip()
+    phone = re.sub(r"\D", "", str((profile or {}).get("phone") or ""))
+    if phone.startswith("91") and len(phone) == 12:
+        phone = phone[2:]
+    name = str((profile or {}).get("name") or "").strip()
+    parts = name.split()
+    first, last = (parts[0], " ".join(parts[1:])) if len(parts) >= 2 else (name, "")
+    gender = str((profile or {}).get("gender") or "male").strip()
+
+    try:
+        page.evaluate(
+            """() => {
+              document.querySelectorAll('[data-ct-fill]').forEach(el => el.removeAttribute('data-ct-fill'));
+              const emailEl = document.querySelector('input[type=email]');
+              if (emailEl) emailEl.setAttribute('data-ct-fill', 'email');
+              if (emailEl) {
+                const er = emailEl.getBoundingClientRect();
+                const phoneEl = [...document.querySelectorAll('input')].find(el => {
+                  const r = el.getBoundingClientRect();
+                  return el !== emailEl && (el.type || '') !== 'hidden' && r.width > 4
+                    && Math.abs(r.top - er.top) < 40 && r.left < er.left;
+                });
+                if (phoneEl) phoneEl.setAttribute('data-ct-fill', 'phone');
+              }
+            }"""
+        )
+        if phone:
+            try:
+                page.locator("[data-ct-fill=phone]").fill(phone, timeout=3000)
+            except Exception:
+                pass
+        if email:
+            try:
+                page.locator("[data-ct-fill=email]").fill(email, timeout=3000)
+            except Exception:
+                pass
+        page.get_by_role("button", name=re.compile(r"^Continue$", re.I)).last.click(
+            timeout=3000, force=True
+        )
+        log.append("ct_contact_continue:1")
+    except Exception:
+        log.append("ct_contact_continue:0")
+        return "miss"
+
+    try:
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+    # Traveller fields
+    gender_status = _pick_gender(page, gender or "male")
+    log.append(f"ct_gender:{gender_status}")
+    try:
+        page.evaluate(
+            """() => {
+              document.querySelectorAll('[data-ct-fill]').forEach(el => el.removeAttribute('data-ct-fill'));
+              const textOf = (el) => (el.innerText || '').replace(/\\s+/g, ' ').trim();
+              const findLab = (re) => [...document.querySelectorAll('label,p,h4')]
+                .find(el => { const t = textOf(el); return t.length > 3 && t.length < 48 && re.test(t); });
+              const firstLab = findLab(/first\\s*&\\s*middle\\s*name|given\\s*name/i);
+              const lastLab = findLab(/^last\\s*name|surname/i);
+              const inputs = [...document.querySelectorAll('input')].filter(el => {
+                const r = el.getBoundingClientRect();
+                return r.width > 4 && r.height > 4 && !/hidden|email|tel/i.test(el.type || '');
+              });
+              const near = (lab) => {
+                if (!lab) return null;
+                const lr = lab.getBoundingClientRect();
+                return inputs
+                  .map(el => {
+                    const r = el.getBoundingClientRect();
+                    return {el, dy: Math.abs(r.top - lr.top), gap: Math.abs((r.left + r.width / 2) - (lr.left + lr.width / 2))};
+                  })
+                  .filter(x => x.dy <= 60)
+                  .sort((a, b) => (a.dy - b.dy) || (a.gap - b.gap))[0];
+              };
+              const f = near(firstLab); const l = near(lastLab);
+              if (f && f.el) f.el.setAttribute('data-ct-fill', 'first');
+              if (l && l.el) l.el.setAttribute('data-ct-fill', 'last');
+            }"""
+        )
+        if first:
+            page.locator("[data-ct-fill=first]").fill(first, timeout=2500)
+            log.append("ct_first:ok")
+        if last:
+            page.locator("[data-ct-fill=last]").fill(last, timeout=2500)
+            log.append("ct_last:ok")
+    except Exception:
+        first_s, last_s = _fill_cleartrip_name_pair(page, first, last)
+        log.append(f"ct_first:{first_s}")
+        log.append(f"ct_last:{last_s}")
+
+    ctp = _continue_to_payment(page)
+    log.append(f"continue_to_payment:{ctp}")
+    if ctp == "expired":
+        return "expired"
+    try:
+        page.wait_for_timeout(1200)
+    except Exception:
+        pass
+    text, url = _read(page)
+    stage = classify_page(text, url, book_count=_book_count(page))
+    if stage == "pay" or payment_sheet_open(text, stage):
+        return "pay"
+    if stage == "passenger" or re.search(r"add traveller|continue to payment", text or "", re.I):
+        return "passenger"
+    return "miss" if ctp == "miss" else "passenger"
+
+
+def _continue_to_payment(page) -> str:
+    """Press Cleartrip's traveller handoff. Returns ok, miss, or expired."""
+    update: dict[str, object] = {"code": None, "failure": ""}
+
+    def on_resp(res) -> None:
+        if "itinerary/update" not in (res.url or ""):
+            return
+        try:
+            data = res.json()
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        update["code"] = data.get("responseCode")
+        err = data.get("error") if isinstance(data.get("error"), dict) else {}
+        update["failure"] = str((err or {}).get("failureType") or "")
+
+    try:
+        page.on("response", on_resp)
+    except Exception:
+        pass
+    moved = False
+    try:
+        moved = bool(
+            page.evaluate(
+                """() => {
+                  const el = [...document.querySelectorAll('button,a,[role=button]')]
+                    .find(n => /^continue to payment$/i.test((n.innerText||'').replace(/\\s+/g,' ').trim()));
+                  if (!el || el.disabled) return false;
+                  el.scrollIntoView({block:'center'});
+                  const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+                  let fiber = fiberKey ? el[fiberKey] : null;
+                  const evt = {
+                    preventDefault() {}, stopPropagation() {},
+                    nativeEvent: { isTrusted: true }, target: el, currentTarget: el, type: 'click',
+                  };
+                  for (let i = 0; i < 12 && fiber; i++) {
+                    const props = fiber.memoizedProps || fiber.pendingProps;
+                    if (props && typeof props.onClick === 'function') {
+                      props.onClick(evt);
+                      return true;
+                    }
+                    fiber = fiber.return;
+                  }
+                  el.click();
+                  return true;
+                }"""
+            )
+        )
+    except Exception:
+        moved = False
+    if not moved:
+        try:
+            page.get_by_role("button", name=re.compile(r"^Continue to payment$", re.I)).last.click(
+                timeout=4000, force=True
+            )
+            moved = True
+        except Exception:
+            moved = _js_continue(page) or _safe_continue(page)
+    for _ in range(20):
+        if update["code"] is not None or update["failure"]:
+            break
+        try:
+            page.wait_for_timeout(250)
+        except Exception:
+            break
+    try:
+        page.remove_listener("response", on_resp)
+    except Exception:
+        pass
+    failure = str(update.get("failure") or "")
+    code = update.get("code")
+    if "EXPIRED" in failure.upper() or code in {4004, "4004"}:
+        return "expired"
+    if moved:
+        return "ok"
+    return "miss"
 
 
 def _ask_model(snapshot: str) -> dict[str, str] | None:
@@ -3003,17 +3814,31 @@ def run_checkout_agent(
     origin_code = "GAU" if re.search(r"guwahati|gau", origin or "", re.I) else ""
     dest_code = "DEL" if re.search(r"delhi|del", destination or "", re.I) else ""
     tap_pending = (chosen_tap or "").strip()
+    # Guest Cleartrip: recover a dead itinerary on the same site — never hop sellers here.
+    max_recovers = 2 if seller == "cleartrip" else 1
     # Book → meals Skip → contact → traveller → pay needs a long Cleartrip pass.
     deadline = time.monotonic() + (240 if seller == "cleartrip" else 90)
     vision_down = False
+    try:
+        page.set_default_timeout(20_000)
+        page.set_default_navigation_timeout(90_000)
+    except Exception:
+        pass
 
     def _snapshot() -> tuple[str, str, str, dict[str, str]]:
         t, u = _read(page)
-        try:
-            surface = read_surface(page)
-            t = apply_front_text(t, surface)
-        except Exception:
-            pass
+        # Past Cleartrip create, skip heavy overlay scans — they can stall Kernel on seat maps.
+        on_ct_itin = (
+            "cleartrip.com" in (u or "").lower()
+            and re.search(r"/flights/itinerary/[A-Za-z0-9_-]+", u or "")
+            and "failure" not in (u or "").lower()
+        )
+        if not on_ct_itin:
+            try:
+                surface = read_surface(page)
+                t = apply_front_text(t, surface)
+            except Exception:
+                pass
         s = classify_page(t, u, book_count=_book_count(page))
         f = extract_trip_facts(t, u)
         return t, u, s, f
@@ -3021,7 +3846,13 @@ def run_checkout_agent(
     for step in range(max_steps):
         page = _latest(page)
         text, url, stage, facts = _snapshot()
-        if "reveal_form" not in log and stage in {"other", "passenger", "review"}:
+        log.append(f"{step}:stage:{stage}")
+        # Skip reveal on Cleartrip review — the flex sheet has no contact block yet, and
+        # a full-DOM scroll search can stall Kernel for minutes.
+        skip_reveal = stage == "review" and (
+            seller == "cleartrip" or "cleartrip.com" in (url or "").lower()
+        )
+        if not skip_reveal and "reveal_form" not in log and stage in {"other", "passenger", "review"}:
             log.append("reveal_form")
             if reveal_form_step(page):
                 continue
@@ -3040,6 +3871,12 @@ def run_checkout_agent(
             elif re.search(r"pay now|pay to complete|make payment", tap_pending, re.I) and not allow_pay:
                 log.append("user_tap_refused")
                 tap_pending = ""
+            elif re.search(r"skip add", tap_pending, re.I):
+                # click_verified on Skip can stall Kernel CDP; use the add-ons outcome loop.
+                log.append(f"user_tap:{tap_pending}")
+                tap_pending = ""
+                _leave_addons(page, log, rounds=2)
+                continue
             elif _click_label(page, tap_pending):
                 log.append(f"user_tap:{tap_pending}")
                 tap_pending = ""
@@ -3054,15 +3891,19 @@ def run_checkout_agent(
         from app.step_read import on_review_itinerary
 
         # Add-ons skip is an outcome loop, not a 16-step vision tour. Reply within ~20s.
-        # Never treat a fare list's marketing copy ("Add meals") as the itinerary extras sheet.
-        skip_now = stage == "addons" or (
-            "itinerary" in (url or "").lower()
-            and stage not in {"results", "fare_sheet", "loading", "home", "error", "review"}
-            and bool(
-                re.search(
-                    r"choose add-ons|skip add-?ons|add seats|missed adding meal|add meals|add extra luggage",
-                    text or "",
-                    re.I,
+        # Never treat Review-your-itinerary flex "Add" upsells as Choose add-ons / Skip.
+        skip_now = (
+            stage == "addons"
+            or (
+                "itinerary" in (url or "").lower()
+                and stage not in {"results", "fare_sheet", "loading", "home", "error", "review"}
+                and not re.search(r"review your itinerary", text or "", re.I)
+                and bool(
+                    re.search(
+                        r"choose add-ons|skip add-?ons|add seats|missed adding meal|add meals|add extra luggage",
+                        text or "",
+                        re.I,
+                    )
                 )
             )
         )
@@ -3105,6 +3946,16 @@ def run_checkout_agent(
                 continue
         # Vision on every step: screenshot overrides a wrong DOM toast / sold-out miss.
         # One network miss disables vision for the rest of this checkout (avoids 28s×N hangs).
+        # Past Cleartrip create, DOM Skip/fill is enough — Kernel screenshots can stall guest checkout.
+        if (
+            not vision_down
+            and "cleartrip.com" in (url or "").lower()
+            and re.search(r"/flights/itinerary/[A-Za-z0-9_-]+", url or "")
+            and "failure" not in (url or "").lower()
+            and stage in {"addons", "passenger", "review", "pay", "other", "login", "otp"}
+        ):
+            vision_down = True
+            log.append("vision_skip_cleartrip_itin")
         try:
             from app.vision_agent import capture_page_shot, classify_with_vision, vision_enabled
 
@@ -3197,7 +4048,7 @@ def run_checkout_agent(
                     checks=checks,
                     handoff="Stopped: on-screen itinerary did not match the requested flight.",
                 )
-        if stage == "error" and recovers >= 1:
+        if stage == "error" and recovers >= max_recovers:
             log.append(f"{step}:error:stop")
             break
         signature = f"{stage}|{url}|{text[:180]}"
@@ -3239,6 +4090,28 @@ def run_checkout_agent(
             if form_sheet(text):
                 from app.step_read import format_unknown_plan
 
+                # Cleartrip guest holds die in ~20s — sprint contact→traveller→pay.
+                if seller == "cleartrip" or "cleartrip.com" in (url or "").lower():
+                    log.append(f"contact_try:{contact_tries + 1}")
+                    sprint = _cleartrip_guest_sprint(page, profile, log)
+                    text, url, stage, facts = _snapshot()
+                    if sprint == "pay" or stage == "pay" or payment_sheet_open(text, stage):
+                        handoff = (
+                            f"Payment page ready. Flight {facts.get('flight') or '?'} "
+                            f"{facts.get('depart_time') or hint} "
+                            f"{facts.get('origin')}-{facts.get('destination')} "
+                            f"total {facts.get('total') or '?'}. Link: {url}. No payment clicked."
+                        )
+                        return CheckoutOutcome("pay", text, url, log, facts=facts, checks=checks, handoff=handoff)
+                    if sprint == "expired" and recovers < max_recovers and hint:
+                        recovers += 1
+                        if _reopen_cleartrip_results(page, origin, destination, depart, log):
+                            log.append("expired_rebook")
+                            continue
+                    if sprint == "passenger":
+                        continue
+                    tap_pending = ""
+                    continue
                 plan = plan_unknown_step(text, control_digest(page), profile, intent="give_facts", use_model=False)
                 if plan.get("handled") and plan.get("action") == "ask":
                     return CheckoutOutcome(
@@ -3319,60 +4192,89 @@ def run_checkout_agent(
             # Escape closes the Ixigo review sheet, so the Continue control disappears.
             # Conscience reads the covering sheet; rails never pay.
             # If meals/Skip is actually on screen, leave add-ons — do not Continue past them.
-            if re.search(r"skip add-?ons|add meals|choose add-ons|add extra luggage", text or "", re.I):
+            # Cleartrip flex "Add ₹329" cards are NOT Choose add-ons — Continue past them.
+            real_addons = bool(
+                re.search(r"skip add-?ons|choose add-ons|add seats|missed adding meal", text or "", re.I)
+            ) and not re.search(r"review your itinerary", text or "", re.I)
+            if real_addons:
                 log.append("review_was_addons")
                 left = _leave_addons(page, log, rounds=4)
                 text, url, stage, facts = _snapshot()
                 log.append(f"review_addons_left:{int(bool(left))}:{stage}")
                 continue
-            surface = read_surface(page)
-            if surface.get("overlay") or _ixigo_buy_this_visible(page):
-                note = _clear_front_sheet(page, chosen_tap, seller=seller, hint=hint)
-                log.append(note or "front_clear_miss")
-                if note.startswith("front_tap:"):
-                    continue
-                return _pause_unknown(
-                    page,
-                    seller=seller,
-                    hint=hint,
-                    text=text,
-                    url=url,
-                    log=log,
-                    facts=facts,
-                    checks=checks,
-                    step=step,
-                    chosen_tap=chosen_tap,
-                )
-            # Tick one saved person and leave extras off before Continue. Do not add another.
-            log.append(_ixigo_opt_out_cancellation(page))
-            log.append(_select_saved_traveller(page, str(profile.get("name") or "")))
-            try:
-                page.wait_for_timeout(400)
-            except Exception:
-                pass
+            cleartrip_review = "cleartrip.com" in (url or "").lower() or seller == "cleartrip"
+            if cleartrip_review:
+                try:
+                    page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                    page.wait_for_timeout(500)
+                except Exception:
+                    pass
+                declined = _decline_cleartrip_protect(page)
+                if declined:
+                    log.append(f"ct_protect_decline:{declined}")
+                    try:
+                        page.wait_for_timeout(900)
+                    except Exception:
+                        pass
+            else:
+                surface = read_surface(page)
+                if surface.get("overlay") or _ixigo_buy_this_visible(page):
+                    note = _clear_front_sheet(page, chosen_tap, seller=seller, hint=hint)
+                    log.append(note or "front_clear_miss")
+                    if note.startswith("front_tap:"):
+                        continue
+                    return _pause_unknown(
+                        page,
+                        seller=seller,
+                        hint=hint,
+                        text=text,
+                        url=url,
+                        log=log,
+                        facts=facts,
+                        checks=checks,
+                        step=step,
+                        chosen_tap=chosen_tap,
+                    )
+                # Tick one saved person and leave extras off before Continue. Do not add another.
+                log.append(_ixigo_opt_out_cancellation(page))
+                log.append(_select_saved_traveller(page, str(profile.get("name") or "")))
+                try:
+                    page.wait_for_timeout(400)
+                except Exception:
+                    pass
             # One accurate click per attempt. A miss can be retried; Pay is never clicked.
-            log.append(f"continue_click:{_safe_continue(page)}")
+            moved = _js_continue(page) or _safe_continue(page)
+            log.append(f"continue_click:{int(bool(moved))}")
+            if not moved:
+                try:
+                    page.mouse.wheel(0, 1200)
+                    page.wait_for_timeout(400)
+                except Exception:
+                    pass
+                moved = _js_continue(page) or _safe_continue(page)
+                log.append(f"continue_click_scroll:{int(bool(moved))}")
             _poll_ready(
                 page,
-                {"login", "otp", "passenger", "addons", "pay", "error"},
-                budget_ms=6000,
+                {"login", "otp", "passenger", "addons", "pay", "error", "other", "review"},
+                budget_ms=8000,
             )
-            # Continue often opens a name Confirm sheet — conscience clears it.
-            after = _clear_front_sheet(page, seller=seller, hint=hint)
-            if after and after.startswith("front_tap:"):
-                log.append(after)
-            elif after == "front_ask":
-                return _pause_unknown(
-                    page,
-                    seller=seller,
-                    hint=hint,
-                    text=text,
-                    url=url,
-                    log=log,
-                    facts=facts,
-                    checks=checks,
-                    step=step,
-                )
+            if not cleartrip_review:
+                # Continue often opens a name Confirm sheet — conscience clears it.
+                after = _clear_front_sheet(page, seller=seller, hint=hint)
+                if after and after.startswith("front_tap:"):
+                    log.append(after)
+                elif after == "front_ask":
+                    return _pause_unknown(
+                        page,
+                        seller=seller,
+                        hint=hint,
+                        text=text,
+                        url=url,
+                        log=log,
+                        facts=facts,
+                        checks=checks,
+                        step=step,
+                    )
             continue
         if kind == "login_phone":
             # Do not press Escape here — it closes the Ixigo login drawer.
@@ -3502,9 +4404,35 @@ def run_checkout_agent(
                     + " did not stick. Nothing paid."
                 )
                 return CheckoutOutcome("passenger", text, url, log, facts=facts, checks=checks, handoff=handoff)
-            if not _safe_continue(page):
+            # Cleartrip traveller uses Continue to payment; plain Continue is the contact leftover.
+            ctp = _continue_to_payment(page)
+            log.append(f"continue_to_payment:{ctp}")
+            if ctp == "expired":
+                log.append("itinerary_expired")
+                # Guest holds die in ~60s — one same-session rebook, then race to pay.
+                if seller == "cleartrip" and recovers < max_recovers and hint:
+                    recovers += 1
+                    if _reopen_cleartrip_results(page, origin, destination, depart, log):
+                        log.append("expired_rebook")
+                        continue
+                handoff = (
+                    "Cleartrip's hold expired before payment. "
+                    "Say the time again and I'll reopen the fare. Nothing paid."
+                )
+                text, url, stage, facts = _snapshot()
+                return CheckoutOutcome("error", text, url, log, facts=facts, checks=checks, handoff=handoff)
+            if ctp == "miss" and not _safe_continue(page):
                 log.append("passenger_continue_miss")
-            _poll_ready(page, {"addons", "review", "pay", "passenger", "error"}, budget_ms=3000)
+            _poll_ready(page, {"addons", "review", "pay", "passenger", "error"}, budget_ms=4000)
+            text, url, stage, facts = _snapshot()
+            if stage == "pay" or payment_sheet_open(text, stage):
+                log.append(f"pay_handoff:{stage}")
+                handoff = (
+                    f"Payment page ready. Flight {facts.get('flight') or '?'} "
+                    f"{facts.get('depart_time') or hint} {facts.get('origin')}-{facts.get('destination')} "
+                    f"total {facts.get('total') or '?'}. Link: {url}. No payment clicked."
+                )
+                return CheckoutOutcome("pay", text, url, log, facts=facts, checks=checks, handoff=handoff)
             after = _clear_front_sheet(page)
             if after:
                 log.append(after)
@@ -3554,7 +4482,7 @@ def run_checkout_agent(
                         return CheckoutOutcome("wrong_flight", after, after_url, log, checks=checks)
                 ok = _confirm_fare(page)
                 log.append(f"confirm_fare:{ok}")
-                if not ok and seller == "cleartrip" and recovers < 1:
+                if not ok and seller == "cleartrip" and recovers < max_recovers:
                     recovers += 1
                     log.append("confirm_fare_rebook")
                     if _reopen_cleartrip_results(page, origin, destination, depart, log):
@@ -3589,7 +4517,12 @@ def run_checkout_agent(
             continue
         if kind == "click":
             target = action.get("target") or ""
-            if _PAY_REFUSE.search(target) or (not allow_pay and re.search(r"\bpay\b", target, re.I)):
+            # "Continue to payment" is Cleartrip's traveller handoff — not a charge click.
+            if _PAY_REFUSE.search(target) or (
+                not allow_pay
+                and re.search(r"\bpay\b", target, re.I)
+                and not re.search(r"continue to payment", target, re.I)
+            ):
                 handoff = f"Refused pay control '{target}'. Link: {url}"
                 return CheckoutOutcome(stage, text, url, log, facts=facts, checks=checks, handoff=handoff)
             if re.search(r"search again", target, re.I):
@@ -3617,7 +4550,7 @@ def run_checkout_agent(
                 log.append(f"after_continue:{left}")
                 if not ok and left in {"fare_sheet", "error"}:
                     log.append("continue_blocked")
-                    if seller == "cleartrip" and recovers < 1:
+                    if seller == "cleartrip" and recovers < max_recovers:
                         recovers += 1
                         if _reopen_cleartrip_results(page, origin, destination, depart, log):
                             continue
@@ -3633,6 +4566,11 @@ def run_checkout_agent(
                 if seller == "cleartrip" and left in {"error", "home", "cookie", "other"}:
                     if not _reopen_cleartrip_results(page, origin, destination, depart, log):
                         break
+                    continue
+                if seller == "cleartrip" and left in {"results", "loading", "fare_sheet"}:
+                    continue
+                if recovers >= max_recovers:
+                    break
                 continue
             _click_label(page, target)
             _poll_ready(

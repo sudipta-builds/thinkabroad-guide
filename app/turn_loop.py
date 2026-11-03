@@ -483,6 +483,12 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
 
         pending = str(state.get("pending_seller_switch") or "").strip().lower()
         yes = bool(re.fullmatch(r"yes|yep|yeah|ok|okay|sure", (text or "").strip(), re.I))
+        guest = str(state.get("kernel_auth_mode") or "").strip().lower() == "guest"
+        # Guest Cleartrip: "try again" reopens the same flight — never a seller hop.
+        if guest and re.search(r"\btry again\b|\bagain\b", text or "", re.I) and not named_seller(text):
+            state.pop("kernel_session_id", None)
+            state.pop("pending_seller_switch", None)
+            return {"do": "book", "kind": "book", "tap": "", "turn": turn, "reply": ""}
         # Accept the recommended bookable travel site — never silent switch.
         if named_seller(text) or clock or (yes and seller_can_book(pending)):
             return {"do": "book", "kind": "book", "tap": "", "turn": turn, "reply": ""}

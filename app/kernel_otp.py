@@ -550,6 +550,9 @@ def begin_login(
     auth_mode = str(passenger.pop("auth_mode", "") or "").strip().lower()
     # Guest checkout must not hunt OTP. Login mode (or blank legacy) may request a code.
     hunt_otp = auth_mode != "guest"
+    # Bad Cleartrip sessions: drop the Kernel tab and reopen on the same seller (guest stays guest).
+    max_error_retry = 2 if (seller == "cleartrip" and auth_mode == "guest") else 1
+    guest_profile = {**dict(profile or {}), "auth_mode": auth_mode} if auth_mode else dict(profile or {})
     client = _client()
     browser_profile = _profile(seller, whatsapp_phone)
     browser, reused = _connect_browser(client, browser_profile, session_id)
@@ -602,14 +605,13 @@ def begin_login(
                         "destination": destination,
                         "depart": depart,
                         "hint": hint,
-                        "profile": {**dict(profile or {}), "auth_mode": auth_mode}
-                        if auth_mode
-                        else dict(profile or {}),
+                        "profile": guest_profile,
                         "on_code_requested": on_code_requested,
                         "otp_wait_sec": otp_wait_sec,
                         "resume_url": "",
                         "chosen_tap": "",
                         "session_id": "",
+                        "error_retry": error_retry,
                     }
                 )
 
@@ -723,6 +725,36 @@ def begin_login(
                     if _book_count(page) >= 2:
                         break
                     page.wait_for_timeout(400)
+                # Empty Cleartrip shell = bad browser session. Fresh Kernel tab, same guest trip.
+                if (
+                    hint
+                    and seller == "cleartrip"
+                    and _book_count(page) < 2
+                    and error_retry < max_error_retry
+                ):
+                    try:
+                        pw.close()
+                    except Exception:
+                        pass
+                    _drop(client, sid)
+                    raise _RetryBeginLogin(
+                        {
+                            "seller": seller,
+                            "whatsapp_phone": whatsapp_phone,
+                            "explicit": explicit,
+                            "origin": origin,
+                            "destination": destination,
+                            "depart": depart,
+                            "hint": hint,
+                            "profile": guest_profile,
+                            "on_code_requested": on_code_requested,
+                            "otp_wait_sec": otp_wait_sec,
+                            "resume_url": "",
+                            "chosen_tap": "",
+                            "session_id": "",
+                            "error_retry": error_retry + 1,
+                        }
+                    )
                 if not hint:
                     # Leave the results alone. Clicking Log in here texts a code
                     # before the traveller has chosen a flight.
@@ -781,7 +813,7 @@ def begin_login(
                 if (
                     seller == "cleartrip"
                     and hint
-                    and error_retry < 1
+                    and error_retry < max_error_retry
                     and (
                         stage == "error"
                         or site_error_page(text, url)
@@ -802,7 +834,7 @@ def begin_login(
                             "destination": destination,
                             "depart": depart,
                             "hint": hint,
-                            "profile": profile,
+                            "profile": guest_profile,
                             "on_code_requested": on_code_requested,
                             "otp_wait_sec": otp_wait_sec,
                             "resume_url": "",
@@ -1020,8 +1052,8 @@ def begin_login(
         cancel_live_otp(sid)
         _drop(client, sid)
         detail = f"{type(exc).__name__}: {str(exc)[:180]}"
-        # Transient Kernel/CDP or itinerary DNS failures: one clean reopen.
-        if error_retry < 1 and hint and seller == "cleartrip":
+        # Transient Kernel/CDP or itinerary DNS failures: clean reopen on Cleartrip only.
+        if error_retry < max_error_retry and hint and seller == "cleartrip":
             try:
                 return begin_login(
                     seller=seller,
@@ -1031,7 +1063,7 @@ def begin_login(
                     destination=destination,
                     depart=depart,
                     hint=hint,
-                    profile=profile,
+                    profile=guest_profile,
                     on_code_requested=on_code_requested,
                     otp_wait_sec=otp_wait_sec,
                     resume_url="",

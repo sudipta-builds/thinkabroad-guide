@@ -2503,9 +2503,24 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         state.pop("live", None)
         state["stuck_kind"] = "error"
         seller_id = str(state.get("seller") or "").lower()
+        when = hint or str(state.get("selected_hint") or "")
+        guest = str(state.get("kernel_auth_mode") or "").strip().lower() == "guest"
+        # Guest Cleartrip: stay on the same site. No EaseMyTrip/Ixigo pitch.
+        if guest and seller_id in {"cleartrip", ""}:
+            state.pop("pending_seller_switch", None)
+            rec = (
+                f"reply try again or send {when}".strip()
+                + " and I'll open a fresh Cleartrip guest session for that flight — I won't switch sites"
+            )
+            return _stuck_line(
+                state,
+                "error",
+                f"{seller} system error for the {which} on {trip}",
+                "the site rejected this itinerary; recovering on Cleartrip only",
+                rec,
+            )
         other = next_bookable_seller(seller_id)
         state["pending_seller_switch"] = other
-        when = hint or str(state.get("selected_hint") or "")
         rec = (
             f"reply yes or send {_seller_label(other)} {when}".strip()
             + " and I'll open that same flight there — I won't switch unless you say so"

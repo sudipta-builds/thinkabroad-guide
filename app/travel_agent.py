@@ -2505,18 +2505,31 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         seller_id = str(state.get("seller") or "").lower()
         when = hint or str(state.get("selected_hint") or "")
         guest = str(state.get("kernel_auth_mode") or "").strip().lower() == "guest"
-        # Guest Cleartrip: stay on the same site. No EaseMyTrip/Ixigo pitch.
-        if guest and seller_id in {"cleartrip", ""}:
+        login_mode = str(state.get("kernel_auth_mode") or "").strip().lower() == "login"
+        # Kernel guest/login: do not narrate the dead sheet — a fresh session is the fix.
+        if guest or login_mode or state.get("kernel_session_id"):
             state.pop("pending_seller_switch", None)
+            if login_mode:
+                rec = (
+                    f"reply {when or 'go on'}".strip()
+                    + " and I'll open a new browser and send a fresh OTP when login opens"
+                )
+                return _stuck_line(
+                    state,
+                    "error",
+                    f"reopening the {which} on {seller}",
+                    "previous tab died; new session needs your OTP again",
+                    rec,
+                )
             rec = (
-                f"reply try again or send {when}".strip()
-                + " and I'll open a fresh Cleartrip guest session for that flight — I won't switch sites"
+                f"reply {when or 'go on'}".strip()
+                + " and I'll reopen that flight in a fresh browser — nothing to fix on your side"
             )
             return _stuck_line(
                 state,
                 "error",
-                f"{seller} system error for the {which} on {trip}",
-                "the site rejected this itinerary; recovering on Cleartrip only",
+                f"reopening the {which} on {seller}",
+                "starting a clean session for the same flight",
                 rec,
             )
         other = next_bookable_seller(seller_id)
@@ -2528,8 +2541,8 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         return _stuck_line(
             state,
             "error",
-            f"{seller} system error for the {which} on {trip}",
-            "the site rejected this itinerary after one fresh search",
+            f"{seller} could not hold the {which} on {trip}",
+            "that tab died after one fresh search",
             rec,
         )
     needs_login = bool(re.search(r"\bpassword\b", page, re.I) and re.search(r"log ?in|sign in|sign up", page, re.I))
@@ -2989,18 +3002,26 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
 
         remember_shot(state, shot)
     if shown == "error" or site_error_page(text, page_url):
+        # Prefer silent reopen from _run_kernel_login; never WhatsApp the stumped sheet.
         state.pop("live", None)
         state["last_vision"] = {
             "kind": "error",
-            "what": f"{label} system error",
+            "what": f"reopening on {label}",
             "tap": "",
-            "recommend": "start fresh or search again",
+            "recommend": "fresh session",
             "facts": [],
-            "shot": str(state.get("last_shot") or ""),
+            "shot": "",
         }
-        spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), text, _Session())  # type: ignore[arg-type]
+        when = str(state.get("selected_hint") or "go on")
+        spoken = (
+            f"Still opening the {when} — reply {when} and I'll start a clean browser. "
+            "Nothing paid."
+        )
+        state["stuck_kind"] = "error"
+        state["last_stuck"] = spoken
+        state.pop("pending_seller_switch", None)
         _save(phone, state)
-        _deliver(phone, spoken, None, secrets, shot_paths=shots)
+        _deliver(phone, spoken, None, secrets)
         return
     first_note = notes.split(" | ")[0].strip()
     if first_note and re.search(r"did not (open|leave)|click did not", first_note, re.I):
@@ -3071,6 +3092,24 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
     _deliver(phone, spoken, None, secrets, shot_paths=shots)
 
 
+def _kernel_result_is_site_error(result: dict[str, Any]) -> bool:
+    """True when the Kernel tab died on a recoverable site error (not a block)."""
+    from app.page_agent import site_error_page
+
+    page = str(result.get("page") or "")
+    url = str(result.get("url") or "")
+    detail = str(result.get("detail") or "")
+    if site_error_page(page, url) or "itinerary/failure" in url.lower():
+        return True
+    if str(result.get("status") or "") == "error" and re.search(
+        r"site_error_recoverable|system error|stumped|acting up|Timeout|connect_over_cdp",
+        detail,
+        re.I,
+    ):
+        return True
+    return False
+
+
 def _run_kernel_login(
     phone: str,
     text: str,
@@ -3079,7 +3118,7 @@ def _run_kernel_login(
     started_at: float | None,
     release_lock=None,
 ) -> None:
-    from app.kernel_otp import begin_login
+    from app.kernel_otp import begin_login, release_saved_kernel
 
     seller = str(loaded.get("seller") or loaded.get("preferred_seller") or "cleartrip")
     if seller not in {"ixigo", "cleartrip"}:
@@ -3098,42 +3137,106 @@ def _run_kernel_login(
         if release_lock is not None:
             release_lock()
 
-    try:
-        result = begin_login(
-            seller=seller,
-            whatsapp_phone=phone,
-            explicit=str(loaded.get("login_phone") or loaded.get("phone") or ""),
-            origin=origin,
-            destination=destination,
-            depart=depart,
-            hint=hint,
-            profile={
-                **{
-                    key: str(loaded.get(key) or "")
-                    for key in ("name", "email", "phone", "dob", "gender")
-                },
-                "auth_mode": str(loaded.get("kernel_auth_mode") or ""),
-            },
-            on_code_requested=on_code_requested,
-            resume_url=resume_booking_url(loaded, text),
-            chosen_tap=chosen_tap,
-            session_id=str(loaded.get("kernel_session_id") or ""),
-        )
-    except Exception:
-        logger.exception("Kernel booking failed")
-        _deliver(
-            phone,
-            f"{_seller_label(seller)} didn't finish that step. Nothing paid. Say skip again if you're still on add-ons.",
-            None,
-            secrets,
-        )
-        _clear_busy(phone, started_at)
-        return
+    profile = {
+        **{
+            key: str(loaded.get(key) or "")
+            for key in ("name", "email", "phone", "dob", "gender")
+        },
+        "auth_mode": str(loaded.get("kernel_auth_mode") or ""),
+    }
+    auth_mode = str(loaded.get("kernel_auth_mode") or "").strip().lower()
+    resume = resume_booking_url(loaded, text)
+    session_id = str(loaded.get("kernel_session_id") or "")
+    result: dict[str, Any] = {}
+    # Guest: Cleartrip×3 cookieless, then Ixigo once. Login: same seller, fresh OTP.
+    sellers_to_try = [seller]
+    if auth_mode == "guest":
+        alt = "ixigo" if seller == "cleartrip" else ("cleartrip" if seller == "ixigo" else "")
+        if alt:
+            sellers_to_try = [seller, seller, seller, alt]
+        else:
+            sellers_to_try = [seller, seller, seller]
+    else:
+        sellers_to_try = [seller, seller, seller]
+
+    for attempt, try_seller in enumerate(sellers_to_try):
+        seller = try_seller
+        try:
+            result = begin_login(
+                seller=seller,
+                whatsapp_phone=phone,
+                explicit=str(loaded.get("login_phone") or loaded.get("phone") or ""),
+                origin=origin,
+                destination=destination,
+                depart=depart,
+                hint=hint,
+                profile=profile,
+                on_code_requested=on_code_requested,
+                resume_url=resume if attempt == 0 else "",
+                chosen_tap=chosen_tap if attempt == 0 else "",
+                session_id=session_id if attempt == 0 else "",
+                fresh_browser=attempt > 0,
+            )
+        except Exception:
+            logger.exception("Kernel booking failed")
+            if attempt + 1 < len(sellers_to_try):
+                release_saved_kernel(str((result or {}).get("session_id") or ""))
+                session_id = ""
+                resume = ""
+                chosen_tap = ""
+                continue
+            _deliver(
+                phone,
+                f"{_seller_label(seller)} didn't finish that step. Nothing paid. Say the flight time again and I'll reopen it.",
+                None,
+                secrets,
+            )
+            _clear_busy(phone, started_at)
+            return
+        status = str(result.get("status") or "")
+        if status == "otp_sent" or announced:
+            break
+        if status == "resume_lost":
+            break
+        if status in {"already_logged_in", "fares", "held"} and not _kernel_result_is_site_error(result):
+            # Persist whichever Kernel seller actually worked.
+            state = _load(phone)
+            state["seller"] = seller
+            state["preferred_seller"] = seller
+            state["kernel_seller"] = seller
+            _save(phone, state)
+            break
+        if _kernel_result_is_site_error(result) and attempt + 1 < len(sellers_to_try):
+            release_saved_kernel(str(result.get("session_id") or ""))
+            loaded.pop("kernel_session_id", None)
+            session_id = ""
+            resume = ""
+            chosen_tap = ""
+            # No WhatsApp, no error screenshot — next cookieless tab (or other Kernel seller).
+            continue
+        break
     status = str(result.get("status") or "")
     if status == "otp_sent" and not announced:
         on_code_requested(result)
     elif status in {"already_logged_in", "fares", "held"} and not announced:
-        _deliver_signed_in_page(phone, seller, result, secrets)
+        if _kernel_result_is_site_error(result):
+            state = _load(phone)
+            state["kernel_awaiting_otp"] = False
+            state.pop("kernel_session_id", None)
+            release_saved_kernel(str(result.get("session_id") or ""))
+            when = str(state.get("selected_hint") or hint or "go on")
+            spoken = (
+                f"Still opening the {when} — reply {when} and I'll start a clean browser. "
+                "Nothing paid."
+            )
+            state["stuck_kind"] = "error"
+            state["last_stuck"] = spoken
+            state.pop("pending_seller_switch", None)
+            _save(phone, state)
+            # Never attach the stumped / wrong-url screenshot.
+            _deliver(phone, spoken, None, secrets)
+        else:
+            _deliver_signed_in_page(phone, seller, result, secrets)
     elif status == "resume_lost" and not announced:
         state = _load(phone)
         state["kernel_awaiting_otp"] = False
@@ -3146,19 +3249,35 @@ def _run_kernel_login(
         state["last_stuck"] = spoken
         state["stuck_kind"] = "addons"
         _save(phone, state)
-        shots = [result["screenshot"]] if result.get("screenshot") else None
-        _deliver(phone, spoken, None, secrets, shot_paths=shots)
+        _deliver(phone, spoken, None, secrets)
     elif not announced:
         state = _load(phone)
         state["kernel_awaiting_otp"] = False
         state.pop("kernel_session_id", None)
+        release_saved_kernel(str(result.get("session_id") or ""))
         _save(phone, state)
         page = str(result.get("page") or "")
         detail = str(result.get("detail") or result.get("status") or "login didn't open")
-        if page and not re.search(r"enter mobile|otp|log in to ixigo", page, re.I):
+        from app.page_agent import site_error_page as _site_err
+
+        if _kernel_result_is_site_error(result) or _site_err(page, str(result.get("url") or "")):
+            when = str(state.get("selected_hint") or hint or "go on")
+            spoken = (
+                f"Still opening the {when} — reply {when} and I'll start a clean browser. "
+                "Nothing paid."
+            )
+            state["stuck_kind"] = "error"
+            state["last_stuck"] = spoken
+            state.pop("pending_seller_switch", None)
+            _save(phone, state)
+            _deliver(phone, spoken, None, secrets)
+        elif page and not re.search(r"enter mobile|otp|log in to ixigo", page, re.I):
             spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), page, type("S", (), {"page": None})())
-            shots = [result["screenshot"]] if result.get("screenshot") else None
-            _deliver(phone, spoken, None, secrets, shot_paths=shots)
+            if _site_err(page, str(result.get("url") or "")):
+                _deliver(phone, spoken, None, secrets)
+            else:
+                shots = [result["screenshot"]] if result.get("screenshot") else None
+                _deliver(phone, spoken, None, secrets, shot_paths=shots)
         else:
             from app.kernel_otp import kernel_failure_line
 

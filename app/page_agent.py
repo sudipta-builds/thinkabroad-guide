@@ -1403,10 +1403,10 @@ def _click_label(page, label: str) -> bool:
 
 
 def leave_site_error(page) -> str:
-    """Click the control Cleartrip actually shows on the acting-up sheet."""
+    """Click the control Cleartrip actually shows on the acting-up / stumped sheet."""
     text, _url = _read(page)
-    for label in ("Go to home", "Search Again", "Try again"):
-        if not re.search(re.escape(label), text or "", re.I):
+    for label in ("Go to home", "Search Again", "Try again", "Home"):
+        if not re.search(rf"(?<![A-Za-z]){re.escape(label)}(?![A-Za-z])", text or "", re.I):
             continue
         if _click_label(page, label):
             return label

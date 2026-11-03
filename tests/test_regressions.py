@@ -557,7 +557,9 @@ class DateAndMemory(unittest.TestCase):
         self.assertIn("passenger = dict(profile or {})", source)
         self.assertIn("browser_profile = _profile(", source)
         self.assertIn("profile=passenger", source)
-        self.assertIn("_connect_browser(client, browser_profile, session_id)", source)
+        self.assertIn("_connect_browser(", source)
+        self.assertIn("ephemeral=ephemeral", source)
+        self.assertIn('"" if ephemeral else session_id', source)
 
     def test_a_second_route_does_not_delete_the_first(self) -> None:
         state = _recover_trip({}, [], "guwahati to delhi, 1st week of december")
@@ -1595,7 +1597,8 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn('status == "resume_lost"', agent)
         self.assertIn("fresh fare list", agent)
         self.assertIn("did not open login", agent)
-        self.assertIn("session_id=str(loaded.get(\"kernel_session_id\") or \"\")", agent)
+        self.assertIn('session_id=session_id if attempt == 0 else ""', agent)
+        self.assertIn("fresh_browser=attempt > 0", agent)
 
     def test_fare_drawer_over_results_is_fare_sheet(self) -> None:
         from app.page_agent import _looks_like_fare_sheet
@@ -2055,7 +2058,8 @@ class SellerChoiceAndProxy(unittest.TestCase):
             "selected_hint": "10:45",
         }
         reply = _booking_page_reply(state, "10:45", err, type("S", (), {"page": None})())
-        self.assertIn("system error", reply.lower())
+        self.assertNotIn("server error", reply.lower())
+        self.assertNotIn("servers are stumped", reply.lower())
         self.assertIn("EaseMyTrip 10:45", reply)
         self.assertNotIn("I'll press Go to home", reply)
         self.assertNotIn("Ready to pay", reply)
@@ -2284,7 +2288,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
         spoken = _booking_page_reply(
             state,
             "2:20",
-            "Server error",
+            "Sorry our servers are stumped with your request. Please check your url. Home",
             type(
                 "S",
                 (),
@@ -2293,13 +2297,83 @@ class SellerChoiceAndProxy(unittest.TestCase):
         )
         self.assertNotIn("EaseMyTrip", spoken)
         self.assertNotIn("Ixigo", spoken)
+        self.assertNotIn("server error", spoken.lower())
+        self.assertNotIn("servers are stumped", spoken.lower())
         self.assertIsNone(state.get("pending_seller_switch"))
-        self.assertIn("try again", spoken.lower())
+        self.assertIn("reopen", spoken.lower())
         self.assertIn("cleartrip", spoken.lower())
 
         state["stuck_kind"] = "error"
-        state["stuck_page"] = "Server error itinerary/failure"
-        plan = align_action("try again", state)
+        state["stuck_page"] = "Sorry our servers are stumped Home"
+        plan = align_action("go on", state)
+        self.assertEqual(plan["do"], "book")
+        self.assertEqual(plan.get("tap") or "", "")
+
+    def test_kernel_site_error_reopens_fresh_browser(self) -> None:
+        import inspect
+
+        from app.kernel_otp import begin_login, _open_browser
+        from app.page_agent import leave_site_error, site_error_page
+        from app.travel_agent import _kernel_result_is_site_error, _run_kernel_login
+
+        stumped = (
+            "Sorry our servers are stumped with your request. Please check your url. "
+            "Looks like you've entered a wrong url Home"
+        )
+        self.assertTrue(site_error_page(stumped, "https://www.cleartrip.com/flights/itinerary/x"))
+        self.assertIn("Home", inspect.getsource(leave_site_error))
+        src = inspect.getsource(begin_login)
+        self.assertIn("fresh_browser", src)
+        self.assertIn("site_error_recoverable", src)
+        self.assertIn("ephemeral", inspect.getsource(_open_browser))
+        self.assertTrue(
+            _kernel_result_is_site_error(
+                {
+                    "status": "error",
+                    "detail": "site_error_recoverable",
+                    "page": stumped,
+                    "url": "https://www.cleartrip.com/flights/itinerary/failure",
+                }
+            )
+        )
+        run_src = inspect.getsource(_run_kernel_login)
+        self.assertIn("fresh_browser=attempt > 0", run_src)
+        self.assertIn("_kernel_result_is_site_error", run_src)
+        self.assertIn("sellers_to_try", run_src)
+        self.assertIn('alt = "ixigo"', run_src)
+        self.assertIn("Never attach the stumped", run_src)
+        self.assertIn("Still opening the", run_src)
+        self.assertNotIn("system error for the", run_src)
+
+    def test_login_mode_error_asks_for_fresh_otp_not_seller_switch(self) -> None:
+        from app.travel_agent import _booking_page_reply
+        from app.turn_loop import align_action
+
+        state = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "cleartrip",
+            "selected_hint": "2:20",
+            "kernel_auth_mode": "login",
+        }
+        spoken = _booking_page_reply(
+            state,
+            "2:20",
+            "Sorry our servers are stumped Home",
+            type(
+                "S",
+                (),
+                {"page": type("P", (), {"url": "https://www.cleartrip.com/flights/itinerary/failure"})()},
+            )(),
+        )
+        self.assertNotIn("EaseMyTrip", spoken)
+        self.assertNotIn("server error", spoken.lower())
+        self.assertIn("otp", spoken.lower())
+        self.assertIsNone(state.get("pending_seller_switch"))
+        state["stuck_kind"] = "error"
+        state["stuck_page"] = "servers are stumped Home"
+        plan = align_action("2:20", state)
         self.assertEqual(plan["do"], "book")
         self.assertEqual(plan.get("tap") or "", "")
 

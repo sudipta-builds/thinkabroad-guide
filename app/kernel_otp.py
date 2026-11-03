@@ -227,9 +227,12 @@ def is_resume_booking_url(url: str, seller: str = "") -> bool:
     return ixigo or cleartrip
 
 
-def _profile(seller: str, whatsapp_phone: str) -> str:
+def _profile(seller: str, whatsapp_phone: str, *, nonce: str = "") -> str:
     digits = re.sub(r"\D", "", whatsapp_phone or "")[-12:] or "user"
-    return f"wa-{seller}-{digits}"[:60]
+    base = f"wa-{seller}-{digits}"
+    if nonce:
+        return f"{base}-e{nonce}"[:60]
+    return base[:60]
 
 
 def _metrics(page) -> dict[str, float]:
@@ -393,7 +396,7 @@ def _reload_booking_without_login_visible(page) -> None:
         pass
 
 
-def _open_browser(client, profile: str):
+def _open_browser(client, profile: str, *, ephemeral: bool = False):
     try:
         client.profiles.create(name=profile)
     except Exception:
@@ -403,20 +406,21 @@ def _open_browser(client, profile: str):
         kiosk_mode=True,
         viewport={"width": 1280, "height": 800, "refresh_rate": 25},
         timeout_seconds=1000,
-        profile={"name": profile, "save_changes": True},
+        # Ephemeral profiles skip cookie reuse after a dead itinerary / stumped page.
+        profile={"name": profile, "save_changes": not ephemeral},
     )
 
 
-def _connect_browser(client, profile: str, session_id: str = ""):
+def _connect_browser(client, profile: str, session_id: str = "", *, ephemeral: bool = False):
     """Reuse the open Kernel tab when WhatsApp is still on the same booking."""
-    if session_id:
+    if session_id and not ephemeral:
         try:
             browser = client.browsers.retrieve(session_id)
             if browser is not None:
                 return browser, True
         except Exception:
             pass
-    return _open_browser(client, profile), False
+    return _open_browser(client, profile, ephemeral=ephemeral), False
 
 
 def _drop(client, session_id: str) -> None:
@@ -533,11 +537,14 @@ def begin_login(
     chosen_tap: str = "",
     session_id: str = "",
     error_retry: int = 0,
+    fresh_browser: bool = False,
 ) -> dict[str, str]:
     """Open the seller and request one OTP.
 
     With on_code_requested, the same CDP connection waits for the WhatsApp code,
     types it, and clicks Verify. That is the path that produced an Ixigo account.
+    Site error / expired itinerary pages reopen on a fresh Kernel tab (no cookies)
+    instead of surfacing the dead sheet to WhatsApp.
     """
     if seller not in KERNEL_SELLERS:
         return {"status": "unsupported", "detail": seller}
@@ -550,12 +557,19 @@ def begin_login(
     auth_mode = str(passenger.pop("auth_mode", "") or "").strip().lower()
     # Guest checkout must not hunt OTP. Login mode (or blank legacy) may request a code.
     hunt_otp = auth_mode != "guest"
-    # Bad Cleartrip sessions: drop the Kernel tab and reopen on the same seller (guest stays guest).
-    max_error_retry = 2 if (seller == "cleartrip" and auth_mode == "guest") else 1
+    # Stumped / expired / empty shell: drop the tab and reopen cookieless. Same seller.
+    max_error_retry = 2 if hint else 0
     guest_profile = {**dict(profile or {}), "auth_mode": auth_mode} if auth_mode else dict(profile or {})
     client = _client()
-    browser_profile = _profile(seller, whatsapp_phone)
-    browser, reused = _connect_browser(client, browser_profile, session_id)
+    ephemeral = bool(fresh_browser or error_retry > 0)
+    browser_profile = _profile(
+        seller,
+        whatsapp_phone,
+        nonce=f"{error_retry}{int(time.time()) % 100000}" if ephemeral else "",
+    )
+    browser, reused = _connect_browser(
+        client, browser_profile, "" if ephemeral else session_id, ephemeral=ephemeral
+    )
     sid = browser.session_id
     os.environ["IXIGO_OTPLESS_BRIDGE"] = "0"
     try:
@@ -590,30 +604,33 @@ def begin_login(
                     or "failure" in (url or "").lower()
                 )
             )
+            def _fresh_kwargs(*, bump: bool) -> dict[str, Any]:
+                return {
+                    "seller": seller,
+                    "whatsapp_phone": whatsapp_phone,
+                    "explicit": explicit,
+                    "origin": origin,
+                    "destination": destination,
+                    "depart": depart,
+                    "hint": hint,
+                    "profile": guest_profile,
+                    "on_code_requested": on_code_requested,
+                    "otp_wait_sec": otp_wait_sec,
+                    "resume_url": "",
+                    "chosen_tap": "",
+                    "session_id": "",
+                    "error_retry": error_retry + (1 if bump else 0),
+                    "fresh_browser": True,
+                }
+
             if dead_resume:
                 try:
                     pw.close()
                 except Exception:
                     pass
                 _drop(client, sid)
-                raise _RetryBeginLogin(
-                    {
-                        "seller": seller,
-                        "whatsapp_phone": whatsapp_phone,
-                        "explicit": explicit,
-                        "origin": origin,
-                        "destination": destination,
-                        "depart": depart,
-                        "hint": hint,
-                        "profile": guest_profile,
-                        "on_code_requested": on_code_requested,
-                        "otp_wait_sec": otp_wait_sec,
-                        "resume_url": "",
-                        "chosen_tap": "",
-                        "session_id": "",
-                        "error_retry": error_retry,
-                    }
-                )
+                # Dead tab on resume — same retry budget, always cookieless reopen.
+                raise _RetryBeginLogin(_fresh_kwargs(bump=False))
 
             def _checkout_now() -> None:
                 nonlocal checkout, checkout_notes, page, text, url, stage
@@ -725,36 +742,14 @@ def begin_login(
                     if _book_count(page) >= 2:
                         break
                     page.wait_for_timeout(400)
-                # Empty Cleartrip shell = bad browser session. Fresh Kernel tab, same guest trip.
-                if (
-                    hint
-                    and seller == "cleartrip"
-                    and _book_count(page) < 2
-                    and error_retry < max_error_retry
-                ):
+                # Empty fare shell = bad browser session. Fresh Kernel tab, same trip.
+                if hint and _book_count(page) < 2 and error_retry < max_error_retry:
                     try:
                         pw.close()
                     except Exception:
                         pass
                     _drop(client, sid)
-                    raise _RetryBeginLogin(
-                        {
-                            "seller": seller,
-                            "whatsapp_phone": whatsapp_phone,
-                            "explicit": explicit,
-                            "origin": origin,
-                            "destination": destination,
-                            "depart": depart,
-                            "hint": hint,
-                            "profile": guest_profile,
-                            "on_code_requested": on_code_requested,
-                            "otp_wait_sec": otp_wait_sec,
-                            "resume_url": "",
-                            "chosen_tap": "",
-                            "session_id": "",
-                            "error_retry": error_retry + 1,
-                        }
-                    )
+                    raise _RetryBeginLogin(_fresh_kwargs(bump=True))
                 if not hint:
                     # Leave the results alone. Clicking Log in here texts a code
                     # before the traveller has chosen a flight.
@@ -809,44 +804,20 @@ def begin_login(
             if outcome is None:
                 text, url = _read_visible(page)
                 stage = classify_page(text, url, book_count=_book_count(page))
-                # Acting-up or empty search after a timed book is not a successful hold.
-                if (
-                    seller == "cleartrip"
-                    and hint
-                    and error_retry < max_error_retry
-                    and (
-                        stage == "error"
-                        or site_error_page(text, url)
-                        or stage == "home"
-                    )
+                # Acting-up / stumped / empty home after a timed book is not a hold.
+                if hint and error_retry < max_error_retry and (
+                    stage == "error" or site_error_page(text, url) or stage == "home"
                 ):
                     try:
                         pw.close()
                     except Exception:
                         pass
                     _drop(client, sid)
-                    raise _RetryBeginLogin(
-                        {
-                            "seller": seller,
-                            "whatsapp_phone": whatsapp_phone,
-                            "explicit": explicit,
-                            "origin": origin,
-                            "destination": destination,
-                            "depart": depart,
-                            "hint": hint,
-                            "profile": guest_profile,
-                            "on_code_requested": on_code_requested,
-                            "otp_wait_sec": otp_wait_sec,
-                            "resume_url": "",
-                            "chosen_tap": "",
-                            "session_id": "",
-                            "error_retry": error_retry + 1,
-                        }
-                    )
+                    raise _RetryBeginLogin(_fresh_kwargs(bump=True))
                 if stage == "error" or site_error_page(text, url):
                     outcome = {
                         "status": "error",
-                        "detail": "Cleartrip system error after booking that flight.",
+                        "detail": "site_error_recoverable",
                         "session_id": sid,
                         "seller": seller,
                         "screenshot": _shot(page, seller, sid, "error"),
@@ -955,9 +926,16 @@ def begin_login(
                 text, url = _read_visible(page)
                 stage = classify_page(text, url, book_count=_book_count(page))
                 if stage == "error" or site_error_page(text, url):
+                    if hint and error_retry < max_error_retry:
+                        try:
+                            pw.close()
+                        except Exception:
+                            pass
+                        _drop(client, sid)
+                        raise _RetryBeginLogin(_fresh_kwargs(bump=True))
                     outcome = {
                         "status": "error",
-                        "detail": "Cleartrip system error after booking that flight.",
+                        "detail": "site_error_recoverable",
                         "session_id": sid,
                         "seller": seller,
                         "screenshot": _shot(page, seller, sid, "error"),
@@ -1052,8 +1030,8 @@ def begin_login(
         cancel_live_otp(sid)
         _drop(client, sid)
         detail = f"{type(exc).__name__}: {str(exc)[:180]}"
-        # Transient Kernel/CDP or itinerary DNS failures: clean reopen on Cleartrip only.
-        if error_retry < max_error_retry and hint and seller == "cleartrip":
+        # Transient Kernel/CDP failures: cookieless reopen on the same seller.
+        if error_retry < max_error_retry and hint:
             try:
                 return begin_login(
                     seller=seller,
@@ -1070,6 +1048,7 @@ def begin_login(
                     chosen_tap="",
                     session_id="",
                     error_retry=error_retry + 1,
+                    fresh_browser=True,
                 )
             except Exception as retry_exc:
                 detail = f"{detail} | retry {type(retry_exc).__name__}: {str(retry_exc)[:120]}"

@@ -211,7 +211,13 @@ def _local_turn(text: str, page: str, state: dict[str, Any]) -> dict[str, Any]:
             "facts": list(vision.get("facts") or []),
             "source": "local",
         }
-    looks_details = bool(re.search(r"@|\bmale\b|\bfemale\b|\bother\b|\d{1,2}/\d{1,2}/\d{2,4}", raw, re.I))
+    from app.kernel_otp import indian_national
+
+    looks_details = bool(
+        re.search(r"@|\bmale\b|\bfemale\b|\bother\b|\d{1,2}/\d{1,2}/\d{2,4}", raw, re.I)
+        or indian_national(raw)
+        or re.search(r"\b(?:use|fill)\b.+\b(?:mobile|phone)\b", raw, re.I)
+    )
     if looks_details and kind in {"addons", "upsell", "review", "fare_sheet"}:
         label = tap or ("Skip add-ons" if kind == "addons" or re.search(r"skip add", hay, re.I) else "Continue")
         return {
@@ -543,6 +549,24 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
             elif not tap:
                 tap = "Continue"
         return {"do": "book", "kind": "book", "tap": tap, "turn": turn, "reply": ""}
+
+    # Stale "pay" vision while contact is still open — treat as form, not payment handoff.
+    stuck_page = str(state.get("stuck_page") or "")
+    if sheet == "pay" and (
+        re.search(r"add contact|please enter mobile|please enter email", stuck_page, re.I)
+        or re.search(r"add contact|please enter mobile", str(vision.get("what") or ""), re.I)
+    ):
+        sheet = "form"
+        state.pop("stuck_kind", None)
+
+    from app.kernel_otp import indian_national as _nat_mobile
+
+    if _nat_mobile(text or "") and (
+        sheet in {"form", "passenger", "pay", "other", ""}
+        or intent == "details"
+        or str(state.get("stuck_kind") or "") in {"form", "pay", "passenger"}
+    ):
+        intent = "details"
 
     if sheet in {"form", "passenger"} or intent == "details":
         if sheet in {"addons", "upsell", "review", "fare_sheet"}:

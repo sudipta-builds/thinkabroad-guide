@@ -486,8 +486,33 @@ def handle_turn(
         from app.step_read import form_sheet
 
         open_page = str(state.get("stuck_page") or "")
-        if form_sheet(open_page):
-            state["chosen_tap"] = tap or "Continue"
+        from app.kernel_otp import indian_national as _fill_mobile
+
+        contactish = bool(
+            form_sheet(open_page)
+            or str(state.get("stuck_kind") or "") in {"form", "pay", "passenger"}
+            or re.search(r"add contact|please enter mobile", open_page, re.I)
+            or _fill_mobile(text)
+        )
+        # Contact form: fill first. Do not advertise Continue until mobile sticks.
+        if contactish:
+            state["chosen_tap"] = "Continue"
+            state.pop("stuck_kind", None)  # drop stale "pay" from contact false-positive
+            if _fill_mobile(text) or state.get("phone"):
+                spoken = (
+                    f"Typing your mobile into {_seller_label(str(state.get('seller') or 'cleartrip'))} contact. "
+                    "I won't Continue until that field sticks. Nothing paid."
+                )
+                state["busy_at"] = f"{time.time():.3f}"
+                _save(phone, state)
+                threading.Thread(
+                    target=_run_browse,
+                    args=(phone, text, state.get("busy_at"), "details"),
+                    name="guide-browse",
+                    daemon=True,
+                ).start()
+                db.add_message(phone, "assistant", spoken)
+                return Reply.of(spoken, emoji="✈️")
         else:
             state["chosen_tap"] = tap or str(state.get("chosen_tap") or "Skip add-ons")
         _save(phone, state)
@@ -879,6 +904,18 @@ def infer_intent(state: dict[str, Any], text: str) -> str:
         return "pay"
     if re.search(r"\b(log ?in|sign ?in|password)\b", raw, re.I):
         return "login"
+    # Bare 10-digit Indian mobile while on (or stuck on) a booking form is contact details.
+    from app.kernel_otp import indian_national
+
+    if indian_national(raw) and (
+        _mid_booking(state)
+        or str(state.get("stuck_kind") or "") in {"form", "passenger", "login"}
+        or str(state.get("stage") or "") in {"booking", "passenger", "login", "review", "addons", "payment"}
+        or re.search(r"\b(?:mobile|phone|for mobile|use .+ for mobile)\b", raw, re.I)
+    ):
+        return "details"
+    if re.search(r"\b(?:use|fill)\b.+\b(?:mobile|phone)\b", raw, re.I) and indian_national(raw):
+        return "details"
     if _EMAIL.search(raw) or _NAME.search(raw) or _DOB.search(raw):
         return "details"
     if re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}", raw) and str(state.get("stage") or "") in {
@@ -1465,6 +1502,16 @@ def _coerce_kind(text: str, kind: str, state: dict[str, Any] | None = None) -> s
         or str(state.get("stuck_kind") or "") == "pay"
         or str((state.get("last_vision") or {}).get("kind") or "") == "pay"
     )
+    # False "pay" after contact: a mobile number is form fill, not payment handoff.
+    from app.kernel_otp import indian_national as _indian_m
+
+    if on_pay and _indian_m(text or "") and (
+        str(state.get("stuck_kind") or "") == "pay"
+        or re.search(r"add contact|please enter mobile", str(state.get("stuck_page") or ""), re.I)
+    ):
+        if state is not None:
+            state.pop("stuck_kind", None)
+        return "details"
     # From payment: another site / time / login must leave the pay sheet.
     if on_pay and _wants_kernel_login(text):
         return "login" if kind == "login" else "book"
@@ -3272,6 +3319,14 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
                 )
         except Exception:
             pass
+    # Contact sheet wins over a vision/text "pay" false positive (sidebar Payment options).
+    from app.page_agent import _CONTACT_SHEET
+    from app.step_read import form_sheet as _is_form_sheet
+
+    if _CONTACT_SHEET.search(text or "") or _is_form_sheet(text or ""):
+        shown = "other"
+        if str(state.get("stuck_kind") or "") == "pay":
+            state.pop("stuck_kind", None)
     if site_error_page(text, page_url):
         shown = "error"
     if str(result.get("status") or "") in {"already_logged_in", "held"}:

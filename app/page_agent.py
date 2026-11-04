@@ -207,8 +207,14 @@ _SITE_ERROR = re.compile(
     r"servers are stumped|wrong url|check your url|please check the url",
     re.I,
 )
+# Real checkout pay sheet — not Cleartrip contact sidebar "Payment options" marketing.
 _PAY_SHEET = re.compile(
-    r"pay to complete your booking|name on card|enter card number|scan qr code|payment options",
+    r"pay to complete your booking|name on card|enter card number|scan qr code|"
+    r"pay now|upi id|net banking|card number",
+    re.I,
+)
+_CONTACT_SHEET = re.compile(
+    r"add contact details|please enter mobile number|please enter email",
     re.I,
 )
 
@@ -222,6 +228,12 @@ def site_error_page(text: str, url: str = "") -> bool:
 def payment_sheet_open(hay: str, stage: str) -> bool:
     """Payment wording counts only on a pay sheet, never on a homepage or a site error."""
     if re.search(r"first time flying|popular destinations|acting up|go to home", hay or "", re.I):
+        return False
+    # Contact / traveller contact is never pay — sidebar "Payment options" used to false-trigger.
+    if _CONTACT_SHEET.search(hay or "") or (
+        re.search(r"add contact|email address", hay or "", re.I)
+        and re.search(r"\+91|mobile number|please enter mobile", hay or "", re.I)
+    ):
         return False
     if stage in {"error", "home", "cookie", "loading", "results", "review", "addons"}:
         return False
@@ -276,6 +288,11 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         and not re.search(r"add contact|email address|review traveller", hay, re.I)
     ):
         return "login"
+    # Contact with empty mobile must never become pay (sidebar "Payment options" is marketing).
+    if _CONTACT_SHEET.search(hay) or (
+        re.search(r"add contact details", hay, re.I) and re.search(r"\+91|mobile", hay, re.I)
+    ):
+        return "other"
     if re.search(r"pay to complete your booking|name on card|enter card number|scan qr code", hay, re.I):
         return "pay"
     if re.search(r"payment options", hay, re.I) and re.search(
@@ -3560,21 +3577,42 @@ def _fill_passenger_fields(page, profile: dict[str, str]) -> list[str]:
 _PAY_REFUSE = re.compile(r"pay now|pay to complete|make payment|complete payment|pay securely", re.I)
 
 
-def _cleartrip_guest_sprint(page, profile: dict, log: list[str]) -> str:
-    """Contact → traveller → Continue to payment as fast as possible.
+def _cleartrip_phone_stuck(page, national: str) -> bool:
+    """True when a non-email input holds the 10-digit mobile."""
+    digits = re.sub(r"\D", "", national or "")[-10:]
+    if len(digits) != 10:
+        return False
+    try:
+        return bool(
+            page.evaluate(
+                """(national) => {
+                  const deep = [];
+                  const walk = (root) => {
+                    if (!root || !root.querySelectorAll) return;
+                    for (const el of root.querySelectorAll('input')) deep.push(el);
+                    for (const el of root.querySelectorAll('*')) {
+                      if (el.shadowRoot) walk(el.shadowRoot);
+                    }
+                  };
+                  walk(document);
+                  return deep.some((el) => {
+                    const type = (el.type || '').toLowerCase();
+                    const ph = (el.placeholder || '') + (el.name || '') + (el.getAttribute('aria-label') || '');
+                    if (type === 'email' || /e-?mail/i.test(ph)) return false;
+                    const val = (el.value || '').replace(/\\D/g, '');
+                    return val.includes(national);
+                  });
+                }""",
+                digits,
+            )
+        )
+    except Exception:
+        return False
 
-    Cleartrip guest itineraries expire in ~20s after create. Returns
-    pay|passenger|expired|miss.
-    """
-    email = str((profile or {}).get("email") or "").strip()
-    phone = re.sub(r"\D", "", str((profile or {}).get("phone") or ""))
-    if phone.startswith("91") and len(phone) == 12:
-        phone = phone[2:]
-    name = str((profile or {}).get("name") or "").strip()
-    parts = name.split()
-    first, last = (parts[0], " ".join(parts[1:])) if len(parts) >= 2 else (name, "")
-    gender = str((profile or {}).get("gender") or "male").strip()
 
+def _cleartrip_fill_contact_phone(page, phone: str, email: str, log: list[str]) -> bool:
+    """Type mobile into Cleartrip contact. Never Continue until digits stick (or phone empty)."""
+    national = re.sub(r"\D", "", phone or "")[-10:] if phone else ""
     try:
         page.evaluate(
             """() => {
@@ -3592,16 +3630,63 @@ def _cleartrip_guest_sprint(page, profile: dict, log: list[str]) -> str:
               }
             }"""
         )
-        if phone:
-            try:
-                page.locator("[data-ct-fill=phone]").fill(phone, timeout=3000)
-            except Exception:
-                pass
-        if email:
-            try:
-                page.locator("[data-ct-fill=email]").fill(email, timeout=3000)
-            except Exception:
-                pass
+    except Exception:
+        pass
+    if email:
+        try:
+            page.locator("[data-ct-fill=email]").fill(email, timeout=3000)
+        except Exception:
+            pass
+    if not national:
+        log.append("ct_phone:none")
+        return True
+    stuck = False
+    try:
+        page.locator("[data-ct-fill=phone]").fill(national, timeout=3000)
+        stuck = _cleartrip_phone_stuck(page, national)
+    except Exception:
+        stuck = False
+    if not stuck:
+        stuck = _type_phone_after_prefix(page, national)
+    if not stuck:
+        notes = fill_profile_slots(page, {"phone": national, "email": email}, keys=("phone", "email"))
+        stuck = _field_state(notes, "phone") == "ok" or _cleartrip_phone_stuck(page, national)
+    log.append(f"ct_phone:{'ok' if stuck else 'miss'}")
+    return stuck
+
+
+def _cleartrip_guest_sprint(page, profile: dict, log: list[str]) -> str:
+    """Contact → traveller → Continue to payment as fast as possible.
+
+    Cleartrip guest itineraries expire in ~20s after create. Returns
+    pay|passenger|expired|miss.
+    """
+    email = str((profile or {}).get("email") or "").strip()
+    phone = re.sub(r"\D", "", str((profile or {}).get("phone") or ""))
+    if phone.startswith("91") and len(phone) == 12:
+        phone = phone[2:]
+    name = str((profile or {}).get("name") or "").strip()
+    parts = name.split()
+    first, last = (parts[0], " ".join(parts[1:])) if len(parts) >= 2 else (name, "")
+    gender = str((profile or {}).get("gender") or "male").strip()
+
+    try:
+        text0, _url0 = _read(page)
+    except Exception:
+        text0 = ""
+    needs_mobile = bool(
+        re.search(r"add contact|please enter mobile|mobile number", text0 or "", re.I)
+        or re.search(r"\+91", text0 or "")
+    )
+    phone_ok = _cleartrip_fill_contact_phone(page, phone, email, log)
+    if needs_mobile and phone and not phone_ok:
+        # Do not click Continue on an empty mobile — WhatsApp must send digits again.
+        log.append("ct_contact_continue:0")
+        return "miss"
+    if needs_mobile and not phone:
+        log.append("ct_contact_continue:0")
+        return "miss"
+    try:
         page.get_by_role("button", name=re.compile(r"^Continue$", re.I)).last.click(
             timeout=3000, force=True
         )
@@ -3614,6 +3699,13 @@ def _cleartrip_guest_sprint(page, profile: dict, log: list[str]) -> str:
         page.wait_for_timeout(500)
     except Exception:
         pass
+    try:
+        text_after, _ = _read(page)
+    except Exception:
+        text_after = ""
+    if re.search(r"please enter mobile number", text_after or "", re.I):
+        log.append("ct_phone:still_empty")
+        return "miss"
 
     # Traveller fields
     gender_status = _pick_gender(page, gender or "male")
@@ -3668,6 +3760,9 @@ def _cleartrip_guest_sprint(page, profile: dict, log: list[str]) -> str:
         pass
     text, url = _read(page)
     stage = classify_page(text, url, book_count=_book_count(page))
+    # Contact / empty mobile is never pay — even if sidebar says Payment options.
+    if _CONTACT_SHEET.search(text or "") or re.search(r"please enter mobile", text or "", re.I):
+        return "miss"
     if stage == "pay" or payment_sheet_open(text, stage):
         return "pay"
     if stage == "passenger" or re.search(r"add traveller|continue to payment", text or "", re.I):
@@ -4124,7 +4219,13 @@ def run_checkout_agent(
                     log.append(f"contact_try:{contact_tries + 1}")
                     sprint = _cleartrip_guest_sprint(page, profile, log)
                     text, url, stage, facts = _snapshot()
-                    if sprint == "pay" or stage == "pay" or payment_sheet_open(text, stage):
+                    # Never announce pay while contact / empty mobile is still on screen.
+                    if _CONTACT_SHEET.search(text or "") or re.search(
+                        r"please enter mobile number", text or "", re.I
+                    ):
+                        sprint = "miss"
+                        stage = "other"
+                    if sprint == "pay" and stage == "pay" and payment_sheet_open(text, stage):
                         handoff = (
                             f"Payment page ready. Flight {facts.get('flight') or '?'} "
                             f"{facts.get('depart_time') or hint} "
@@ -4139,6 +4240,30 @@ def run_checkout_agent(
                             continue
                     if sprint == "passenger":
                         continue
+                    if sprint == "miss":
+                        ask = plan_unknown_step(
+                            text, control_digest(page), profile, intent="give_facts", use_model=False
+                        )
+                        if ask.get("handled") and ask.get("action") == "ask":
+                            return CheckoutOutcome(
+                                "passenger",
+                                text,
+                                url,
+                                log,
+                                facts=facts,
+                                checks=checks,
+                                handoff=format_unknown_plan(ask)
+                                or "Send an Indian mobile (+91) for contact. Nothing paid.",
+                            )
+                        return CheckoutOutcome(
+                            "passenger",
+                            text,
+                            url,
+                            log,
+                            facts=facts,
+                            checks=checks,
+                            handoff="Contact still needs an Indian mobile (+91). Send the 10 digits. Nothing paid.",
+                        )
                     tap_pending = ""
                     continue
                 plan = plan_unknown_step(text, control_digest(page), profile, intent="give_facts", use_model=False)

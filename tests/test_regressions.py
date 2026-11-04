@@ -2757,6 +2757,59 @@ class SellerChoiceAndProxy(unittest.TestCase):
 
         home = "First time flying with us Popular destinations Pay to complete your booking"
         self.assertFalse(payment_sheet_open(home, "pay"))
+        # Contact + sidebar Payment options must never be treated as the pay sheet.
+        contact = (
+            "Add Contact details Please enter Mobile Number +91 Email address Continue "
+            "Payment options Unlock price Base fare Taxes Apply coupon"
+        )
+        self.assertEqual(classify_page(contact, "https://www.cleartrip.com/flights/itinerary/x"), "other")
+        self.assertFalse(payment_sheet_open(contact, "other"))
+        self.assertFalse(payment_sheet_open(contact, "pay"))
+        from app.travel_agent import infer_intent
+
+        self.assertEqual(
+            infer_intent(
+                {
+                    "stage": "booking",
+                    "stuck_kind": "form",
+                    "origin": "Guwahati",
+                    "destination": "Delhi",
+                    "depart": "2026-12-04",
+                    "seller": "cleartrip",
+                    "selected_hint": "2:20",
+                },
+                "8876233052",
+            ),
+            "details",
+        )
+        self.assertEqual(
+            infer_intent(
+                {"stage": "booking", "stuck_kind": "pay", "stuck_page": contact, "seller": "cleartrip"},
+                "use 8876233052 for mobile",
+            ),
+            "details",
+        )
+        from app.turn_loop import align_action
+
+        pay_lie = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "cleartrip",
+            "stage": "booking",
+            "stuck_kind": "pay",
+            "stuck_page": contact,
+            "last_vision": {"kind": "pay", "what": "payment page"},
+            "selected_hint": "2:20",
+        }
+        plan = align_action("8876233052", pay_lie)
+        self.assertEqual(plan.get("do"), "details")
+        self.assertEqual(plan.get("kind"), "details")
+        sprint_src = inspect.getsource(
+            __import__("app.page_agent", fromlist=["_cleartrip_guest_sprint"])._cleartrip_guest_sprint
+        )
+        self.assertIn("ct_phone", sprint_src)
+        self.assertIn("please enter mobile number", sprint_src.lower())
         self.assertEqual(
             classify_page("Server error Search again", "https://www.cleartrip.com/flights/itinerary/failure"),
             "error",

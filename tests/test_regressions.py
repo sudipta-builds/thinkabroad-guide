@@ -2931,6 +2931,73 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("no longer available", spoken.lower())
         self.assertNotIn("Filled your details", spoken)
 
+    def test_checkout_brain_rails_contact_not_pay_and_ready_fill(self) -> None:
+        from unittest.mock import patch
+
+        from app.checkout_brain import decide_checkout, rules_brain
+
+        contact = (
+            "Add Contact details Please enter Mobile Number +91 Email address Continue "
+            "Payment options Unlock price Base fare Taxes Apply coupon"
+        )
+        rules = rules_brain(
+            contact,
+            url="https://www.cleartrip.com/flights/itinerary/x",
+            seller="Cleartrip",
+            profile={"email": "a@b.com"},
+        )
+        self.assertEqual(rules["kind"], "form")
+        self.assertEqual(rules["action"], "ask")
+        self.assertNotEqual(rules["kind"], "pay")
+
+        ready = "Add Contact details +91 Email address Mobile number Continue"
+        ready_rules = rules_brain(
+            ready,
+            url="https://www.cleartrip.com/flights/itinerary/x",
+            profile={"email": "a@b.com", "phone": "8638586171"},
+        )
+        self.assertEqual(ready_rules["action"], "fill")
+        self.assertEqual(ready_rules["tap"], "Continue")
+
+        fake_llm = {
+            "kind": "form",
+            "action": "ask",
+            "tap": "",
+            "recommend": "ask for name",
+            "reply": "Please share your full name. Nothing paid.",
+            "source": "llm",
+        }
+        with patch("app.checkout_brain.llm_brain", return_value=fake_llm):
+            out = decide_checkout(
+                ready,
+                url="https://www.cleartrip.com/flights/itinerary/x",
+                profile={"email": "a@b.com", "phone": "8638586171"},
+                prefer_llm=True,
+            )
+        self.assertEqual(out["action"], "fill")
+        self.assertEqual(out["tap"], "Continue")
+        self.assertEqual(out["source"], "llm")
+        self.assertIn("Nothing paid", out["reply"])
+
+        fake_pay = {
+            "kind": "pay",
+            "action": "stop",
+            "tap": "Pay now",
+            "recommend": "pay",
+            "reply": "Ready to pay. Nothing paid.",
+            "source": "llm",
+        }
+        with patch("app.checkout_brain.llm_brain", return_value=fake_pay):
+            clamped = decide_checkout(
+                contact,
+                url="https://www.cleartrip.com/flights/itinerary/x",
+                profile={"email": "a@b.com"},
+                prefer_llm=True,
+            )
+        self.assertEqual(clamped["kind"], "form")
+        self.assertEqual(clamped["action"], "ask")
+        self.assertEqual(clamped["tap"], "")
+
     def test_vision_agent_module_wires_checkout(self) -> None:
         import inspect
 

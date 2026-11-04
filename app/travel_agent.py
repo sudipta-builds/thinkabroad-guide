@@ -2988,6 +2988,44 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         intent = "give_facts" if state.get("email") or state.get("phone") or state.get("name") else ""
         if re.fullmatch(r"continue|go on|yes", str(state.get("chosen_tap") or ""), re.I):
             intent = "agree"
+        # LLM/vision brain on live browser sheets; FakeSession unit tests stay on rules.
+        brain = None
+        live_browser = bool(session.page is not None and hasattr(session.page, "screenshot"))
+        try:
+            from app.checkout_brain import decide_checkout
+            from app.config import get_settings
+
+            if get_settings().checkout_brain_ready and (live_browser or state.get("force_checkout_brain")):
+                brain = decide_checkout(
+                    f"{page or ''}\n{controls}",
+                    url=url,
+                    seller=seller,
+                    hint=which,
+                    trip=trip,
+                    profile=state,
+                    image_path=str(state.get("last_shot") or ""),
+                    prefer_llm=True,
+                )
+                state["last_brain"] = {
+                    "kind": brain.get("kind"),
+                    "action": brain.get("action"),
+                    "tap": brain.get("tap"),
+                    "recommend": brain.get("recommend"),
+                    "source": brain.get("source"),
+                    "rules_kind": brain.get("rules_kind"),
+                }
+        except Exception:
+            brain = None
+        if brain and brain.get("source") in {"llm", "llm_vision"} and brain.get("reply"):
+            spoken = str(brain["reply"])
+            action = str(brain.get("action") or "ask")
+            tap = str(brain.get("tap") or "")
+            if action in {"fill", "click"} and tap:
+                state["chosen_tap"] = tap
+                arm_pending_step(state, page, "form", tap=tap)
+            state["stuck_kind"] = "pay" if action == "stop" or brain.get("kind") == "pay" else "form"
+            state["last_stuck"] = spoken
+            return spoken
         plan = plan_unknown_step(
             f"{page or ''}\n{controls}",
             controls,

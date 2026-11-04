@@ -4244,6 +4244,25 @@ def run_checkout_agent(
                         ask = plan_unknown_step(
                             text, control_digest(page), profile, intent="give_facts", use_model=False
                         )
+                        handoff = ""
+                        try:
+                            from app.checkout_brain import decide_checkout
+                            from app.config import get_settings
+
+                            if get_settings().checkout_brain_ready:
+                                brain = decide_checkout(
+                                    text,
+                                    url=url,
+                                    seller="Cleartrip",
+                                    hint=hint,
+                                    profile=profile,
+                                    prefer_llm=True,
+                                )
+                                if brain.get("source") in {"llm", "llm_vision"} and brain.get("reply"):
+                                    handoff = str(brain["reply"])
+                                    log.append(f"brain:{brain.get('kind')}:{brain.get('action')}")
+                        except Exception:
+                            handoff = ""
                         if ask.get("handled") and ask.get("action") == "ask":
                             return CheckoutOutcome(
                                 "passenger",
@@ -4252,7 +4271,8 @@ def run_checkout_agent(
                                 log,
                                 facts=facts,
                                 checks=checks,
-                                handoff=format_unknown_plan(ask)
+                                handoff=handoff
+                                or format_unknown_plan(ask)
                                 or "Send an Indian mobile (+91) for contact. Nothing paid.",
                             )
                         return CheckoutOutcome(
@@ -4262,7 +4282,8 @@ def run_checkout_agent(
                             log,
                             facts=facts,
                             checks=checks,
-                            handoff="Contact still needs an Indian mobile (+91). Send the 10 digits. Nothing paid.",
+                            handoff=handoff
+                            or "Contact still needs an Indian mobile (+91). Send the 10 digits. Nothing paid.",
                         )
                     tap_pending = ""
                     continue

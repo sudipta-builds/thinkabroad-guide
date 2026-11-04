@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-flash-lite-latest"
     # Vision on every booking step when Gemini is set. GUIDE_VISION=0 to disable.
     guide_vision: bool = Field(default=True, validation_alias=AliasChoices("GUIDE_VISION"))
+    # LLM/vision checkout brain for form/unknown replies. GUIDE_CHECKOUT_BRAIN=0 to force rules only.
+    guide_checkout_brain: bool = Field(default=True, validation_alias=AliasChoices("GUIDE_CHECKOUT_BRAIN"))
 
     vault_secret_key: str = ""
     log_level: str = "INFO"
@@ -105,6 +107,14 @@ class Settings(BaseSettings):
     def vision_ready(self) -> bool:
         """Screenshot → Gemini for every booking step (default on when key exists)."""
         return bool(self.guide_vision and self.gemini_api_key)
+
+    @property
+    def checkout_brain_ready(self) -> bool:
+        """LLM/vision may own form/unknown checkout replies when keys exist."""
+        return bool(
+            self.guide_checkout_brain
+            and (self.gemini_api_key or self.llm_ready or self.vision_ready)
+        )
 
     @property
     def vault_ready(self) -> bool:

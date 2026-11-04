@@ -2655,9 +2655,38 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(align_action("10:45", state)["do"], "book")
         self.assertEqual(_booking_seller_id(state, "10:45"), default_bookable_seller())
         spoken = _options_reply(state, state["options"], seller="google")
-        self.assertIn("can't take the booking", spoken)
-        self.assertIn(_seller_label(default_bookable_seller()), spoken)
+        self.assertIn("Checking Cleartrip", spoken)
+        self.assertIn("Ixigo", spoken)
+        self.assertIn("recommend where to book", spoken.lower())
         self.assertNotRegex(spoken.lower(), r"where are you flying")
+        # Book-site quote formatter picks the cheapest bookable seller.
+        from app.book_quotes import format_book_quotes, is_gau_del, price_for_hint, quote_sellers_for_route
+        from app.search import indigo_results_url, named_seller, seller_can_book as can_book
+
+        self.assertTrue(is_gau_del("Guwahati", "Delhi"))
+        self.assertFalse(is_gau_del("Mumbai", "Delhi"))
+        self.assertIn("indigo", quote_sellers_for_route("Guwahati", "Delhi"))
+        self.assertNotIn("indigo", quote_sellers_for_route("Mumbai", "Delhi"))
+        self.assertIn("GAU", indigo_results_url("Guwahati", "Delhi", "2026-12-04"))
+        self.assertEqual(indigo_results_url("Mumbai", "Delhi", "2026-12-04"), "")
+        self.assertFalse(can_book("indigo"))
+        self.assertEqual(named_seller("check indigo"), "indigo")
+        hit = price_for_hint(
+            [{"depart": "10:45", "price_n": 9812}, {"depart": "18:20", "price_n": 7000}],
+            "10:45",
+        )
+        self.assertEqual(hit["price_n"], 9812)
+        spoken_q = format_book_quotes(
+            [
+                {"label": "Cleartrip", "price_n": 9950, "bookable": True},
+                {"label": "Ixigo", "price_n": 9812, "bookable": True},
+            ],
+            hint="10:45",
+            trip="Guwahati to Delhi on 4 Dec",
+        )
+        self.assertIn("Ixigo ₹9,812", spoken_q)
+        self.assertIn("Cheapest to book is Ixigo", spoken_q)
+        self.assertEqual(_seller_label(default_bookable_seller()), "Cleartrip")
 
     def test_dead_itinerary_opens_fresh_fares_not_login(self) -> None:
         import inspect

@@ -329,6 +329,31 @@ def makemytrip_results_url(origin: str, destination: str, depart: str) -> str:
     return _mmt_url(origin_hit[0], dest_hit[0], when, False, domestic)
 
 
+def indigo_results_url(origin: str, destination: str, depart: str) -> str:
+    """IndiGo deep link — only Guwahati→Delhi. Empty when the route is not GAU–DEL."""
+    origin_hit = resolve_place(origin)
+    dest_hit = resolve_place(destination)
+    if not origin_hit or not dest_hit:
+        return ""
+    if origin_hit[0].upper() != "GAU" or dest_hit[0].upper() != "DEL":
+        return ""
+    when = str(depart)[:10]
+    return (
+        "https://www.goindigo.in/book/flight-select.html?"
+        + urlencode(
+            {
+                "origin": "GAU",
+                "destination": "DEL",
+                "departureDate": when,
+                "adult": "1",
+                "child": "0",
+                "infant": "0",
+                "tripType": "oneWay",
+            }
+        )
+    )
+
+
 # Sellers the agent can open. Order is the default try order (feasible first).
 SELLERS: list[dict[str, str]] = [
     {"id": "cleartrip", "label": "Cleartrip", "host": "cleartrip.com"},
@@ -346,6 +371,7 @@ def seller_results_url(seller_id: str, origin: str, destination: str, depart: st
         "makemytrip": makemytrip_results_url,
         "google": flight_results_url,
         "kayak": kayak_results_url,
+        "indigo": indigo_results_url,
     }
     build = builders.get((seller_id or "").lower())
     if not build:
@@ -368,11 +394,13 @@ def named_seller(text: str) -> str:
         return "makemytrip"
     if re.search(r"\bkayak\b", raw):
         return "kayak"
+    if re.search(r"\b(indigo|goindigo|indi\s*go)\b", raw):
+        return "indigo"
     return ""
 
 
-# Pages we can search but cannot ticket.
-NOT_BOOKABLE = {"google", "kayak"}
+# Pages we can search / price-check but cannot ticket.
+NOT_BOOKABLE = {"google", "kayak", "indigo"}
 
 
 _BOOKABLE_CYCLE = ("cleartrip", "easemytrip", "ixigo")

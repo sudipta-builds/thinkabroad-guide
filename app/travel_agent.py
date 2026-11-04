@@ -620,6 +620,44 @@ def handle_turn(
             reply = _usable_reply(state, spoken, _booking_ack(state, kind, text))
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="✈️")
+    if (
+        _wants_book_compare(text)
+        and state.get("origin")
+        and state.get("destination")
+        and state.get("depart")
+        and not busy
+    ):
+        from app.kernel_otp import kernel_configured
+
+        if kernel_configured():
+            state["busy_at"] = f"{time.time():.3f}"
+            hint = str(state.get("selected_hint") or "")
+            if not hint:
+                opts = _stored_options(state)
+                if opts:
+                    hint = str(_pick_best(opts, str(state.get("preference") or "")).get("depart") or "")
+            started = state["busy_at"]
+            _save(phone, state)
+
+            def _compare_job(
+                p: str = phone,
+                t: float | str = started,
+                h: str = hint,
+            ) -> None:
+                try:
+                    _publish_book_quotes(p, [], t, hint=h)
+                finally:
+                    _clear_busy(p, t)
+
+            threading.Thread(target=_compare_job, name="book-quotes", daemon=True).start()
+            trip = _trip_line(state) or "that trip"
+            reply = (
+                f"Checking Cleartrip, Ixigo, and EaseMyTrip prices for {trip}"
+                + (f" at {hint}" if hint else "")
+                + ". I'll recommend the cheapest site to book."
+            )
+            db.add_message(phone, "assistant", reply)
+            return Reply.of(reply, emoji="✈️")
     if _should_browse(state, text, busy=busy, changed=changed) and _direct_results(state, text) and chromium_ready():
         state["busy_at"] = f"{time.time():.3f}"
         _save(phone, state)
@@ -1331,6 +1369,19 @@ def _wants_price_elsewhere(text: str) -> bool:
     )
 
 
+def _wants_book_compare(text: str) -> bool:
+    """Ask which site is cheapest / where to book — separate from Google Flights."""
+    return bool(
+        re.search(
+            r"\b(?:where (?:to|should i) book|compare (?:prices?|sites?|fares?|sellers?)|"
+            r"cheapest (?:site|seller|fare)|best site to book|"
+            r"check (?:the )?prices? (?:on|across|for))\b",
+            text or "",
+            re.I,
+        )
+    )
+
+
 def _coerce_kind(text: str, kind: str, state: dict[str, Any] | None = None) -> str:
     """A date looks up fares. A named seller with fares already on screen books that site."""
     from app.intent import explicit_date
@@ -1986,6 +2037,8 @@ def _seller_label(seller_id: str) -> str:
     for item in SELLERS:
         if item["id"] == seller_id:
             return item["label"]
+    if (seller_id or "").lower() == "indigo":
+        return "IndiGo"
     return seller_id or "the seller"
 
 
@@ -2073,10 +2126,10 @@ def _options_reply(state: dict[str, Any], options: list[dict[str, Any]], seller:
     from app.search import default_bookable_seller, seller_can_book
 
     if not seller_can_book(seller or ""):
-        book_on = _seller_label(default_bookable_seller())
         lines.append(
-            f"I'd take {best['airline']} at {best['depart']}. "
-            f"{label} can't take the booking. Say that time and I'll book it on {book_on}, or name another site."
+            f"I'd take {best['airline']} at {best['depart']}"
+            + (f" (₹{best['price']} on {label})" if best.get("price") else "")
+            + ". Checking Cleartrip, Ixigo, and EaseMyTrip for that time — I'll recommend where to book."
         )
     else:
         lines.append(f"I'd take {best['airline']} at {best['depart']} on {label}. Say that time and I'll book it.")
@@ -2171,15 +2224,70 @@ def _publish_fares(
             )
             return
         spoken = _options_reply(saved, options, seller=seller["id"]) if options else _fare_line(result, saved, seller=seller["id"])
-        if seller["id"] in NOT_BOOKABLE and "can't take the booking" not in spoken:
-            spoken += " Booking isn't possible on this page. Say a time and I'll book it on Cleartrip, or name another site."
+        if seller["id"] in NOT_BOOKABLE and "Checking Cleartrip" not in spoken and "can't take the booking" not in spoken:
+            spoken += " Booking isn't possible on this page. Checking Cleartrip, Ixigo, and EaseMyTrip next."
         _deliver(phone, spoken, session, secrets)
+        # After Google (or any non-bookable list), pull live book-site prices off the browse lock.
+        # started_at=None so clearing search busy does not cancel the quote reply.
+        if seller["id"] in NOT_BOOKABLE and (options or prices) and not _stale(phone, started_at):
+            best = _pick_best(options, str(saved.get("preference") or "")) if options else {}
+            hint = str(best.get("depart") or saved.get("selected_hint") or "")
+            threading.Thread(
+                target=_publish_book_quotes,
+                args=(phone, list(secrets), None),
+                kwargs={"hint": hint},
+                name="book-quotes",
+                daemon=True,
+            ).start()
     except Exception:
         logger.exception("Fare search failed")
         if not _stale(phone, started_at):
             _deliver(phone, "The fare page didn't open. Say the date again and I'll try once.", None, secrets)
     finally:
         session.close()
+
+
+def _publish_book_quotes(
+    phone: str,
+    secrets: list[str],
+    started_at: float | str | None,
+    *,
+    hint: str = "",
+) -> None:
+    """Second pass after Google: live prices on bookable sites, recommend the cheapest."""
+    from app.book_quotes import collect_book_quotes, format_book_quotes
+    from app.kernel_otp import kernel_configured
+
+    if not kernel_configured():
+        return
+    state = _load(phone)
+    origin = str(state.get("origin") or "")
+    destination = str(state.get("destination") or "")
+    depart = str(state.get("depart") or "")
+    if not (origin and destination and depart):
+        return
+    when = hint or str(state.get("selected_hint") or "")
+    quotes = collect_book_quotes(
+        phone=phone,
+        origin=origin,
+        destination=destination,
+        depart=depart,
+        hint=when,
+    )
+    if _stale(phone, started_at):
+        return
+    saved = _load(phone)
+    saved["book_quotes"] = [
+        {k: q[k] for k in ("seller", "label", "price", "price_n", "depart", "bookable") if k in q}
+        for q in quotes
+    ]
+    bookable = [q for q in quotes if q.get("bookable") and int(q.get("price_n") or 0) > 0]
+    if bookable:
+        best_site = min(bookable, key=lambda q: int(q["price_n"]))
+        saved["preferred_seller"] = str(best_site["seller"])
+    _save(phone, saved)
+    spoken = format_book_quotes(quotes, hint=when, trip=_trip_line(saved) or "")
+    _deliver(phone, spoken, None, secrets)
 
 
 def _book_on_seller(

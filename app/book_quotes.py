@@ -76,13 +76,13 @@ def format_book_quotes(
     pick = min(bookable or usable, key=lambda q: int(q["price_n"]))
     if pick.get("bookable"):
         lines.append(
-            f"Cheapest to book is {pick['label']} at ₹{int(pick['price_n']):,}. "
-            f"Say {when} to book there, or name another site."
+            f"Cheapest to book is {pick['label']} at ₹{int(pick['price_n']):,} for {when}. "
+            f"Reply {pick['label']} to book there, or name Cleartrip / Ixigo / EaseMyTrip."
         )
     else:
         lines.append(
             f"{pick['label']} shows ₹{int(pick['price_n']):,} but I book via Cleartrip or Ixigo. "
-            f"Say {when} and I'll open the cheapest bookable site."
+            "Reply Cleartrip or Ixigo to open that site."
         )
     return " ".join(lines)
 

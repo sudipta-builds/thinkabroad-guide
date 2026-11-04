@@ -2657,11 +2657,12 @@ class SellerChoiceAndProxy(unittest.TestCase):
         spoken = _options_reply(state, state["options"], seller="google")
         self.assertIn("Checking Cleartrip", spoken)
         self.assertIn("Ixigo", spoken)
-        self.assertIn("recommend where to book", spoken.lower())
+        self.assertIn("ask which site", spoken.lower())
         self.assertNotRegex(spoken.lower(), r"where are you flying")
         # Book-site quote formatter picks the cheapest bookable seller.
         from app.book_quotes import format_book_quotes, is_gau_del, price_for_hint, quote_sellers_for_route
         from app.search import indigo_results_url, named_seller, seller_can_book as can_book
+        from app.travel_agent import _book_site_choice_reply, _needs_book_site_choice
 
         self.assertTrue(is_gau_del("Guwahati", "Delhi"))
         self.assertFalse(is_gau_del("Mumbai", "Delhi"))
@@ -2686,7 +2687,37 @@ class SellerChoiceAndProxy(unittest.TestCase):
         )
         self.assertIn("Ixigo ₹9,812", spoken_q)
         self.assertIn("Cheapest to book is Ixigo", spoken_q)
+        self.assertIn("Reply Ixigo to book", spoken_q)
         self.assertEqual(_seller_label(default_bookable_seller()), "Cleartrip")
+        # Bare "2:20" after Google must not open Cleartrip — wait for site choice.
+        waiting = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "google",
+            "awaiting_book_site": True,
+            "selected_hint": "2:20",
+            "options": state["options"],
+        }
+        self.assertTrue(_needs_book_site_choice(waiting, "2:20"))
+        self.assertFalse(_needs_book_site_choice(waiting, "Ixigo"))
+        hold = _book_site_choice_reply(waiting, "2:20")
+        self.assertIn("Noted 2:20", hold)
+        self.assertIn("which site", hold.lower())
+        ready = {
+            **waiting,
+            "awaiting_book_site": False,
+            "book_site_ready": True,
+            "preferred_seller": "ixigo",
+            "book_quotes": [
+                {"label": "Cleartrip", "price_n": 10263, "bookable": True},
+                {"label": "Ixigo", "price_n": 8021, "bookable": True},
+            ],
+        }
+        self.assertTrue(_needs_book_site_choice(ready, "2:20"))
+        self.assertFalse(_needs_book_site_choice(ready, "Ixigo"))
+        ask = _book_site_choice_reply(ready, "2:20")
+        self.assertIn("Reply Ixigo", ask)
 
     def test_dead_itinerary_opens_fresh_fares_not_login(self) -> None:
         import inspect

@@ -507,6 +507,17 @@ def handle_turn(
     if cached and do not in {"search", "book"}:
         db.add_message(phone, "assistant", cached)
         return Reply.of(cached, emoji="✈️")
+    # After Google: note the clock, wait for site prices / an explicit seller — never default Cleartrip.
+    if kind in _BOOKING and _needs_book_site_choice(state, text):
+        hint = _flight_hint(text) or str(state.get("selected_hint") or "")
+        if hint:
+            state["selected_hint"] = hint
+        state["stage"] = "results"
+        state.pop("busy_at", None)
+        _save(phone, state)
+        reply = _book_site_choice_reply(state, text)
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply, emoji="✈️")
     if kind in _BOOKING and _should_browse(state, text, busy=busy, changed=changed):
         from app.kernel_otp import kernel_configured
 
@@ -1207,6 +1218,67 @@ def _booking_seller_id(state: dict[str, Any], text: str = "") -> str:
     return fulfillment_seller(preferred, named)
 
 
+def _needs_book_site_choice(state: dict[str, Any], text: str = "") -> bool:
+    """After Google, a bare time must not open Cleartrip until the traveller picks a site."""
+    from app.search import NOT_BOOKABLE, seller_can_book
+
+    named = named_seller_from(text)
+    if named and seller_can_book(named):
+        return False
+    # Already mid-checkout on a bookable Kernel/Chromium sheet.
+    if state.get("kernel_seller") or str(state.get("stage") or "") in {
+        "booking",
+        "review",
+        "passenger",
+        "login",
+        "addons",
+        "payment",
+    }:
+        live_seller = str(state.get("seller") or "")
+        if live_seller and seller_can_book(live_seller) and not state.get("awaiting_book_site"):
+            return False
+    if state.get("awaiting_book_site"):
+        return True
+    if state.get("book_site_ready") and state.get("preferred_seller"):
+        # Quotes done — naming the recommended site (or any bookable) starts booking.
+        # A bare clock alone still asks once so we never silently pick Cleartrip.
+        return not bool(named and seller_can_book(named))
+    seller = str(state.get("seller") or "")
+    if seller in NOT_BOOKABLE and not state.get("kernel_seller"):
+        return True
+    return False
+
+
+def _book_site_choice_reply(state: dict[str, Any], text: str = "") -> str:
+    """Note the clock; ask which bookable site. Never start Cleartrip here."""
+    hint = str(state.get("selected_hint") or _flight_hint(text) or "").strip()
+    noted = f"Noted {hint}. " if hint else ""
+    if state.get("awaiting_book_site"):
+        return (
+            f"{noted}Still checking Cleartrip, Ixigo, and EaseMyTrip prices. "
+            "I'll ask which site to book once those are in. Nothing paid."
+        )
+    quotes = state.get("book_quotes") if isinstance(state.get("book_quotes"), list) else []
+    preferred = str(state.get("preferred_seller") or "")
+    if quotes and preferred:
+        bits = [
+            f"{q.get('label') or q.get('seller')} ₹{int(q.get('price_n') or 0):,}"
+            for q in quotes
+            if int(q.get("price_n") or 0) > 0
+        ]
+        prices = (" " + " · ".join(bits) + ".") if bits else ""
+        return (
+            f"{noted}Cheapest was {_seller_label(preferred)}."
+            f"{prices} Reply {_seller_label(preferred)} to book"
+            + (f" the {hint}" if hint else "")
+            + ", or name Cleartrip / Ixigo / EaseMyTrip. Nothing paid."
+        )
+    return (
+        f"{noted}Which site should I book — Cleartrip, Ixigo, or EaseMyTrip? "
+        "Nothing paid."
+    )
+
+
 def _form_status_reply(state: dict[str, Any]) -> str:
     """Say what is saved. Call the form filled only after Ixigo kept the fields."""
     if passenger_gaps(state):
@@ -1460,6 +1532,9 @@ def _search_ack(state: dict[str, Any], text: str = "") -> str:
 def _hold_live(state: dict[str, Any], text: str, *, busy: bool, changed: bool) -> bool:
     """A running search stays up. A new route, or a request for the Ixigo form, replaces it."""
     if _asks_for_filled_form(text) or named_seller_from(text) == "ixigo":
+        return False
+    # Time pick while site prices are still loading — answer with the site-choice line, don't soft-hold.
+    if state.get("awaiting_book_site") and infer_intent(state, text) in {"select", "book"}:
         return False
     if not busy or changed:
         return False
@@ -2129,7 +2204,8 @@ def _options_reply(state: dict[str, Any], options: list[dict[str, Any]], seller:
         lines.append(
             f"I'd take {best['airline']} at {best['depart']}"
             + (f" (₹{best['price']} on {label})" if best.get("price") else "")
-            + ". Checking Cleartrip, Ixigo, and EaseMyTrip for that time — I'll recommend where to book."
+            + ". Checking Cleartrip, Ixigo, and EaseMyTrip for that time — "
+            "I'll ask which site to book once those prices are in. Don't pick a site yet."
         )
     else:
         lines.append(f"I'd take {best['airline']} at {best['depart']} on {label}. Say that time and I'll book it.")
@@ -2198,9 +2274,11 @@ def _publish_fares(
         if preferred and preferred not in NOT_BOOKABLE:
             saved["preferred_seller"] = preferred
         elif seller["id"] in NOT_BOOKABLE:
-            from app.search import default_bookable_seller
-
-            saved["preferred_seller"] = default_bookable_seller()
+            # Do not pre-select Cleartrip — wait for live quotes / an explicit site name.
+            saved.pop("preferred_seller", None)
+            saved["awaiting_book_site"] = True
+            saved.pop("book_site_ready", None)
+            saved.pop("book_quotes", None)
         if options:
             saved["options"] = [
                 {k: item[k] for k in ("airline", "flight", "depart", "arrive", "price") if k in item}
@@ -2277,6 +2355,8 @@ def _publish_book_quotes(
     if _stale(phone, started_at):
         return
     saved = _load(phone)
+    # Prefer a clock the traveller already named while quotes were loading.
+    when = str(saved.get("selected_hint") or when or "")
     saved["book_quotes"] = [
         {k: q[k] for k in ("seller", "label", "price", "price_n", "depart", "bookable") if k in q}
         for q in quotes
@@ -2285,6 +2365,8 @@ def _publish_book_quotes(
     if bookable:
         best_site = min(bookable, key=lambda q: int(q["price_n"]))
         saved["preferred_seller"] = str(best_site["seller"])
+    saved["awaiting_book_site"] = False
+    saved["book_site_ready"] = True
     _save(phone, saved)
     spoken = format_book_quotes(quotes, hint=when, trip=_trip_line(saved) or "")
     _deliver(phone, spoken, None, secrets)

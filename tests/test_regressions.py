@@ -2313,6 +2313,37 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(plan["do"], "book")
         self.assertEqual(plan.get("tap") or "", "")
 
+    def test_payment_page_allows_other_site_login_or_price_check(self) -> None:
+        from app.travel_agent import _coerce_kind, infer_intent
+        from app.turn_loop import align_action
+
+        pay = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "cleartrip",
+            "selected_hint": "6:20",
+            "stage": "payment",
+            "stuck_kind": "pay",
+            "kernel_auth_mode": "guest",
+            "stuck_page": "Pay to complete your booking Scan QR code Pay now ₹10,039",
+            "last_vision": {"kind": "pay", "what": "payment page", "tap": ""},
+        }
+        self.assertEqual(align_action("yes", dict(pay))["do"], "pay_stop")
+        ixigo = align_action("6:20 PM on Ixigo", dict(pay))
+        self.assertEqual(ixigo["do"], "book")
+        self.assertEqual(ixigo.get("tap") or "", "")
+        logged = dict(pay)
+        plan_login = align_action("I'd like to login on Cleartrip", logged)
+        self.assertEqual(plan_login["do"], "book")
+        self.assertEqual(logged.get("kernel_auth_mode"), "login")
+        price = align_action("what's the price on Ixigo", dict(pay))
+        self.assertEqual(price["do"], "search")
+        self.assertEqual(infer_intent(pay, "I'd like to login"), "login")
+        self.assertEqual(infer_intent(pay, "how much on ixigo"), "search")
+        self.assertEqual(_coerce_kind("6:20 on Ixigo", "select", pay), "book")
+        self.assertEqual(_coerce_kind("price on EaseMyTrip", "chat", pay), "search")
+
     def test_kernel_site_error_reopens_fresh_browser(self) -> None:
         import inspect
 

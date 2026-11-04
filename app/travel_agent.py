@@ -150,6 +150,11 @@ def handle_turn(
         if _looks_like_birth_depart(str(state.get("depart") or ""), str(state.get("dob") or "")):
             state["depart"] = "2026-12-04"
             state.pop("depart_until", None)
+    on_pay = (
+        str(state.get("stage") or "") == "payment"
+        or str(state.get("stuck_kind") or "") == "pay"
+        or str((state.get("last_vision") or {}).get("kind") or "") == "pay"
+    )
     if _wants_other_seller(text) and state.get("origin") and state.get("destination") and state.get("depart"):
         from app.search import next_bookable_seller
 
@@ -162,24 +167,55 @@ def handle_turn(
         state.pop("kernel_session_id", None)
         state.pop("kernel_logged_in", None)
         state.pop("kernel_seller", None)
+        state.pop("kernel_auth_mode", None)
+        state.pop("stuck_kind", None)
         kind = "book"
     else:
         from app.search import NOT_BOOKABLE
 
         named = named_seller_from(text)
-        if kind == "book" and named and named not in NOT_BOOKABLE:
+        # From payment (or mid-book), a named site + time/select must switch sellers.
+        if named and named not in NOT_BOOKABLE and kind in {"book", "select", "search", "login"}:
             previous = str(state.get("kernel_seller") or state.get("seller") or state.get("preferred_seller") or "")
-            if named != previous:
+            if named != previous or on_pay:
                 from app.kernel_otp import release_saved_kernel
 
                 release_saved_kernel(str(state.get("kernel_session_id") or ""))
                 state.pop("live", None)
                 state.pop("kernel_session_id", None)
                 state.pop("kernel_logged_in", None)
-                state.pop("kernel_seller", None)
+                state.pop("stuck_kind", None)
+                state.pop("chosen_tap", None)
+                if named != previous:
+                    state.pop("kernel_auth_mode", None)
             state["preferred_seller"] = named
             state["seller"] = named
             state["kernel_seller"] = named
+            if kind == "select":
+                kind = "book"
+    # Guest payment → "I'd like to login" on the same site (or named site).
+    if on_pay and (_wants_kernel_login(text) or kind == "login"):
+        from app.kernel_otp import release_saved_kernel
+
+        release_saved_kernel(str(state.get("kernel_session_id") or ""))
+        state["kernel_auth_mode"] = "login"
+        state.pop("kernel_session_id", None)
+        state.pop("kernel_logged_in", None)
+        state.pop("live", None)
+        state.pop("stuck_kind", None)
+        state.pop("chosen_tap", None)
+        kind = "book"
+    elif on_pay and (_wants_price_elsewhere(text) or kind == "search") and named_seller_from(text):
+        from app.kernel_otp import release_saved_kernel
+        from app.turn_loop import clear_checkout_memory
+
+        release_saved_kernel(str(state.get("kernel_session_id") or ""))
+        clear_checkout_memory(state)
+        named = named_seller_from(text)
+        if named:
+            state["preferred_seller"] = named
+            state["seller"] = named
+        kind = "search"
     named_now = named_seller_from(text)
     kernel_now = str(state.get("kernel_seller") or "")
     if named_now and kernel_now and named_now != kernel_now:
@@ -735,6 +771,11 @@ def infer_intent(state: dict[str, Any], text: str) -> str:
     asked = extract_user_ask(text, state)
     if asked.get("intent") in {"status", "book"} and _mid_booking(state):
         return asked["intent"]
+    # Leave a payment sheet when they ask for OTP login or another site's fares.
+    if _wants_kernel_login(raw):
+        return "login"
+    if _wants_price_elsewhere(raw):
+        return "search"
     if _mid_booking(state) and re.search(r"\b(check|show|what next)\b", raw, re.I) and not re.search(
         r"\b(fly|search fares|show flights)\b", raw, re.I
     ):
@@ -1216,14 +1257,61 @@ def _bookable_live_url(url: str) -> str:
     return ""
 
 
+def _wants_kernel_login(text: str) -> bool:
+    """Traveller wants OTP/account login instead of (or after) guest checkout."""
+    return bool(
+        re.search(
+            r"\b(?:log\s*in|sign\s*in|with (?:an? )?otp|use (?:an? )?otp|use (?:my )?account)\b",
+            text or "",
+            re.I,
+        )
+    )
+
+
+def _wants_price_elsewhere(text: str) -> bool:
+    """Fare check on another named site — leave the payment sheet for a search."""
+    from app.search import named_seller
+
+    raw = text or ""
+    if not re.search(r"\b(?:price|fare|cost|how much|cheaper|compare|rates?)\b", raw, re.I):
+        return False
+    return bool(
+        named_seller(raw)
+        or re.search(r"\b(?:another|other|different)\s+(?:site|seller|service)\b", raw, re.I)
+    )
+
+
 def _coerce_kind(text: str, kind: str, state: dict[str, Any] | None = None) -> str:
     """A date looks up fares. A named seller with fares already on screen books that site."""
     from app.intent import explicit_date
     from app.search import NOT_BOOKABLE
 
-    if _flight_hint(text) or kind in {"pay", "login", "details", "pay_self", "cancel"}:
-        return kind
     named = named_seller_from(text)
+    on_pay = bool(state) and (
+        str(state.get("stage") or "") == "payment"
+        or str(state.get("stuck_kind") or "") == "pay"
+        or str((state.get("last_vision") or {}).get("kind") or "") == "pay"
+    )
+    # From payment: another site / time / login must leave the pay sheet.
+    if on_pay and _wants_kernel_login(text):
+        return "login" if kind == "login" else "book"
+    if on_pay and _wants_price_elsewhere(text):
+        return "search"
+    if on_pay and named and named not in NOT_BOOKABLE and state.get("origin") and state.get("depart"):
+        return "book"
+    if _flight_hint(text):
+        if (
+            on_pay
+            and named
+            and named not in NOT_BOOKABLE
+            and state
+            and state.get("origin")
+            and state.get("depart")
+        ):
+            return "book"
+        return kind
+    if kind in {"pay", "login", "details", "pay_self", "cancel"}:
+        return kind
     if (
         named
         and named not in NOT_BOOKABLE

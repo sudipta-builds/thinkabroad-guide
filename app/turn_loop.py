@@ -556,6 +556,48 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
         return {"do": "details", "kind": "details", "tap": tap, "turn": turn, "reply": ""}
 
     if sheet == "pay":
+        from app.search import named_seller
+
+        named = named_seller(text)
+        bare_yes = bool(re.fullmatch(r"yes|yep|yeah|ok|okay|sure", (text or "").strip(), re.I))
+        wants_login = bool(
+            re.search(
+                r"\b(?:log\s*in|sign\s*in|with (?:an? )?otp|use (?:an? )?otp|use (?:my )?account)\b",
+                text or "",
+                re.I,
+            )
+        )
+        price_elsewhere = bool(
+            re.search(r"\b(?:price|fare|cost|how much|cheaper|compare|rates?)\b", text or "", re.I)
+            and (
+                named
+                or re.search(r"\b(?:another|other|different)\s+(?:site|seller|service)\b", text or "", re.I)
+            )
+        )
+        # Payment is a stop — unless they want another site, a fare check, or to log in.
+        # Bare "yes" stays on the pay handoff (do not treat as a seller hop).
+        if wants_fresh_search(text) and trip:
+            return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
+        leave_pay = bool(
+            (not bare_yes)
+            and (
+                named
+                or wants_login
+                or price_elsewhere
+                or clock
+                or intent in {"login", "search", "select"}
+            )
+        )
+        if leave_pay:
+            if wants_login:
+                state["kernel_auth_mode"] = "login"
+                state.pop("kernel_logged_in", None)
+            state.pop("stuck_kind", None)
+            state.pop("pending_step", None)
+            state.pop("chosen_tap", None)
+            if price_elsewhere or (intent == "search" and not clock and not wants_login):
+                return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
+            return {"do": "book", "kind": "book", "tap": "", "turn": turn, "reply": ""}
         return {"do": "pay_stop", "kind": "pay", "tap": "", "turn": turn, "reply": ""}
 
     if intent in {"book", "select"} or goal in {"skip", "forward"}:

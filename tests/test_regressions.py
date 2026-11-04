@@ -2655,10 +2655,20 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(align_action("10:45", state)["do"], "book")
         self.assertEqual(_booking_seller_id(state, "10:45"), default_bookable_seller())
         spoken = _options_reply(state, state["options"], seller="google")
-        self.assertIn("Checking Cleartrip", spoken)
+        self.assertIn("Reply with a departure time", spoken)
+        self.assertIn("Cleartrip", spoken)
         self.assertIn("Ixigo", spoken)
-        self.assertIn("ask which site", spoken.lower())
+        self.assertNotIn("Checking Cleartrip", spoken)
+        self.assertNotIn("Don't pick a site yet", spoken)
         self.assertNotRegex(spoken.lower(), r"where are you flying")
+        # Quotes start only after a clock is chosen — not inside _publish_fares.
+        import inspect
+
+        from app.travel_agent import _publish_fares
+
+        fares_src = inspect.getsource(_publish_fares)
+        self.assertIn("Do not auto-quote", fares_src)
+        self.assertNotIn('name="book-quotes"', fares_src)
         # Book-site quote formatter picks the cheapest bookable seller.
         from app.book_quotes import format_book_quotes, is_gau_del, price_for_hint, quote_sellers_for_route
         from app.search import indigo_results_url, named_seller, seller_can_book as can_book
@@ -2930,6 +2940,94 @@ class SellerChoiceAndProxy(unittest.TestCase):
         )
         self.assertIn("no longer available", spoken.lower())
         self.assertNotIn("Filled your details", spoken)
+
+    def test_pick_saved_traveller_not_contact_fill(self) -> None:
+        from unittest.mock import patch
+
+        from app.travel_agent import (
+            extract_user_ask,
+            resolve_intent,
+            wants_delete_traveller,
+            wants_pick_saved_traveller,
+        )
+        from app.turn_loop import align_action, interpret_turn
+
+        self.assertTrue(wants_pick_saved_traveller("click one of the names"))
+        self.assertTrue(wants_delete_traveller("delete one of the profiles"))
+        self.assertTrue(wants_delete_traveller("get rid of the duplicate profiles"))
+        self.assertFalse(wants_pick_saved_traveller("8876233052"))
+        state = {
+            "stage": "booking",
+            "stuck_kind": "form",
+            "stuck_page": "Mr Suprita Sinha Mr Suprita Sinha Add New Traveller Contact Details Mobile",
+            "seller": "ixigo",
+            "selected_hint": "8:55",
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "phone": "8876233052",
+            "last_vision": {"kind": "form"},
+        }
+        asked = extract_user_ask("click one of the names", state)
+        self.assertEqual(asked["tap"], "__select_traveller__")
+        self.assertEqual(asked["intent"], "book")
+        plan = align_action("click one of the names", state)
+        self.assertEqual(plan["do"], "book")
+        self.assertEqual(plan["tap"], "__select_traveller__")
+        delete = align_action("delete one of the duplicate profiles", state)
+        self.assertEqual(delete["tap"], "__delete_traveller__")
+        # Gemini paraphrase path: unusual wording → pick_traveller goal → select tap.
+        gemini_pick = {
+            "goal": "pick_traveller",
+            "intent": "book",
+            "kind": "form",
+            "what": "saved travellers",
+            "why": "you asked to use an existing name",
+            "recommend": "tick one saved traveller",
+            "tap": "",
+            "auto": "",
+            "reply": "I'll use one of your saved travellers. Nothing paid.",
+            "facts": [],
+            "source": "gemini",
+        }
+        with patch("app.turn_loop.interpret_turn", return_value=gemini_pick):
+            paraphrased = align_action("just use whoever is already there", state)
+        self.assertEqual(paraphrased["do"], "book")
+        self.assertEqual(paraphrased["tap"], "__select_traveller__")
+        gemini_ask = {
+            "goal": "ask",
+            "intent": "status",
+            "kind": "form",
+            "what": "traveller list",
+            "why": "unclear",
+            "recommend": "say which name",
+            "tap": "",
+            "reply": "Which saved name should I tick? Nothing paid.",
+            "facts": [],
+            "source": "gemini",
+        }
+        with patch("app.turn_loop.interpret_turn", return_value=gemini_ask):
+            clarify = align_action("hmm what about that", state)
+        self.assertEqual(clarify["do"], "reply")
+        self.assertEqual(clarify["kind"], "status")
+        # resolve_intent maps Gemini wanted_tap without requiring the label on the page.
+        with patch("app.travel_agent.llm.converse", return_value={
+            "intent": "book",
+            "wanted_tap": "__delete_traveller__",
+            "reply": "Removing a duplicate profile.",
+            "flight_hint": "",
+        }):
+            kind, spoken = resolve_intent("clear out those extra names please", state, [])
+        self.assertEqual(kind, "book")
+        self.assertEqual(state.get("chosen_tap"), "__delete_traveller__")
+        self.assertIn("remove", spoken.lower())
+        import inspect
+
+        self.assertIn(
+            "__select_traveller__",
+            inspect.getsource(__import__("app.page_agent", fromlist=["run_checkout_agent"]).run_checkout_agent),
+        )
+        self.assertIn("pick_traveller", inspect.getsource(interpret_turn) + __import__("app.turn_loop", fromlist=["_TURN"])._TURN)
 
     def test_checkout_brain_rails_contact_not_pay_and_ready_fill(self) -> None:
         from unittest.mock import patch

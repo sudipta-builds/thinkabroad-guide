@@ -17,7 +17,7 @@ _TURN = (
     "Understand what they want. Look at the screenshot if present — that is the current step.\n"
     "Rails: never pay; never tap Pay/Buy/Secure/Assure/Insure; never invent a button or a flight.\n"
     "Return JSON only:\n"
-    '{"goal":"skip|forward|ask|stop|pay|search|details",'
+    '{"goal":"skip|forward|ask|stop|pay|search|details|pick_traveller|delete_traveller",'
     '"intent":"search|select|book|login|details|pay|pay_self|cancel|status|chat",'
     '"kind":"upsell|form|login|otp|review|results|pay|unavailable|addons|other",'
     '"what":"","why":"","recommend":"","tap":"","auto":false,"reply":"","facts":[]}\n'
@@ -25,6 +25,11 @@ _TURN = (
     "Name the screenshot and recommend the safe next tap.\n"
     "goal=forward (intent=book) when they confirm the flight, continue, go on, or yes to your last rec.\n"
     "goal=skip (intent=book) when they skip extras.\n"
+    "goal=pick_traveller (intent=book) when they want you to tick/select one existing saved name on the "
+    "traveller list (any wording: click a name, use the saved one, pick that person) — tap empty; "
+    "do NOT fill contact mobile and do NOT create a new traveller.\n"
+    "goal=delete_traveller (intent=book) when they want a saved profile removed "
+    "(delete/remove/clear a duplicate name or profile) — tap empty; never pay.\n"
     "If the screenshot is NOT Choose add-ons / seat map / missed-meals, do not recommend Skip add-ons.\n"
     "If the screenshot is an optional paid extra (flexibility, protect, cancellation, insurance), "
     "kind=upsell, tap Continue or the decline label, never Book now on that extra.\n"
@@ -213,6 +218,46 @@ def _local_turn(text: str, page: str, state: dict[str, Any]) -> dict[str, Any]:
         }
     from app.kernel_otp import indian_national
 
+    if re.search(
+        r"\b(?:delete|remove|erase|clear)\b.+\b(?:travellers?|travelers?|profiles?|names?|passengers?|duplicates?)\b"
+        r"|\bget rid of\b.+\b(?:profile|name|traveller|traveler|duplicate)\b"
+        r"|\b(?:too many|duplicate)\b.+\b(?:profiles?|names?)\b",
+        raw,
+        re.I,
+    ):
+        return {
+            "goal": "delete_traveller",
+            "intent": "book",
+            "kind": kind or "form",
+            "what": "saved traveller profiles",
+            "why": "you asked to remove a saved profile",
+            "recommend": "delete one saved traveller on screen",
+            "tap": "__delete_traveller__",
+            "auto": "",
+            "reply": "I'll remove one saved traveller profile. Nothing paid.",
+            "facts": [],
+            "source": "local",
+        }
+    if re.search(
+        r"\b(?:click|pick|select|tick|choose|use|tap)\b.+\b(?:name|names|traveller|traveler|profile|saved|one of)\b"
+        r"|\bone of the names\b|\bsaved (?:traveller|traveler|profile)\b"
+        r"|\buse (?:the |an? )?existing\b|\bdon'?t create (?:a )?new\b",
+        raw,
+        re.I,
+    ):
+        return {
+            "goal": "pick_traveller",
+            "intent": "book",
+            "kind": kind or "form",
+            "what": "saved traveller list",
+            "why": "you asked to use an existing name",
+            "recommend": "tick one saved traveller",
+            "tap": "__select_traveller__",
+            "auto": "",
+            "reply": "I'll tick one saved traveller. I won't create a new profile. Nothing paid.",
+            "facts": [],
+            "source": "local",
+        }
     looks_details = bool(
         re.search(r"@|\bmale\b|\bfemale\b|\bother\b|\d{1,2}/\d{1,2}/\d{2,4}", raw, re.I)
         or indian_national(raw)
@@ -407,6 +452,27 @@ def interpret_turn(
         kind = ""
         tap = ""
         reply = ""
+    # Gemini paraphrases for saved-traveller actions → stable taps for checkout rails.
+    local_goal = str(local.get("goal") or "")
+    if local_goal in {"pick_traveller", "delete_traveller"}:
+        goal = local_goal
+        intent = "book"
+        tap = "__select_traveller__" if local_goal == "pick_traveller" else "__delete_traveller__"
+    elif goal in {"pick_traveller", "select_traveller"} or (
+        intent == "book"
+        and re.search(r"\b(saved traveller|tick|select).+\b(name|traveller|profile)\b", f"{what} {recommend} {reply}", re.I)
+        and not re.search(r"\b(delete|remove)\b", f"{goal} {what} {recommend}", re.I)
+    ):
+        goal = "pick_traveller"
+        intent = "book"
+        tap = "__select_traveller__"
+    elif goal in {"delete_traveller", "remove_traveller"} or (
+        intent == "book"
+        and re.search(r"\b(delete|remove|clear).+\b(profile|traveller|name|duplicate)\b", f"{what} {recommend} {reply}", re.I)
+    ):
+        goal = "delete_traveller"
+        intent = "book"
+        tap = "__delete_traveller__"
     if not shot and not page and not stored_fare_list(state):
         if trip_ready and intent in {"status", "select", "book", "chat", ""}:
             intent = "search"
@@ -425,7 +491,7 @@ def interpret_turn(
         "auto": "1" if data.get("auto") in (True, "1", "true", "True") else "",
         "reply": reply or str(local.get("reply") or ""),
         "facts": facts or list(local.get("facts") or []),
-        "source": "gemini",
+        "source": "gemini" if data else str(local.get("source") or "local"),
     }
 
 
@@ -475,6 +541,52 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
 
     if wants_fresh_search(text) and trip:
         return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
+
+    # Gemini said ask/status — clarify; do not invent a click.
+    if goal == "ask" or (intent == "status" and goal in {"ask", ""}):
+        if not (goal in {"pick_traveller", "delete_traveller", "forward", "skip"} or clock):
+            return {
+                "do": "reply",
+                "kind": "status",
+                "tap": "",
+                "turn": turn,
+                "reply": format_turn_reply(turn)
+                or (
+                    "I'm on the open booking page — say what you want: click a saved name, "
+                    "delete a profile, continue, or skip. Nothing paid."
+                ),
+            }
+
+    # Saved-name pick/delete: Gemini goal first, then paraphrase regex.
+    raw_ask = (text or "").strip()
+    if tap in {"__delete_traveller__", "__remove_traveller__"} or goal == "delete_traveller" or re.search(
+        r"\b(?:delete|remove|erase|clear)\b.+\b(?:travellers?|travelers?|profiles?|names?|passengers?|duplicates?)\b"
+        r"|\bdelete (?:one|a|the|this|that|some)\b.+\b(?:names?|profiles?|travellers?|travelers?)\b"
+        r"|\bget rid of\b.+\b(?:profile|name|traveller|traveler|duplicate)\b",
+        raw_ask,
+        re.I,
+    ):
+        return {
+            "do": "book",
+            "kind": "book",
+            "tap": "__delete_traveller__",
+            "turn": {**turn, "intent": "book", "goal": "delete_traveller"},
+            "reply": "",
+        }
+    if tap in {"__select_traveller__", "__pick_traveller__"} or goal == "pick_traveller" or re.search(
+        r"\b(?:click|pick|select|tick|choose|use|tap)\b.+\b(?:name|names|traveller|traveler|profile|saved|one of)\b"
+        r"|\bone of the names\b|\bsaved (?:traveller|traveler|profile)\b"
+        r"|\buse (?:the |an? )?existing\b|\bdon'?t create (?:a )?new\b",
+        raw_ask,
+        re.I,
+    ):
+        return {
+            "do": "book",
+            "kind": "book",
+            "tap": "__select_traveller__",
+            "turn": {**turn, "intent": "book", "goal": "pick_traveller"},
+            "reply": "",
+        }
 
     from app.page_agent import site_error_page
     from app.step_read import safe_tap

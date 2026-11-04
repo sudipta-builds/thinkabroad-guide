@@ -67,7 +67,9 @@ _UNDERSTAND = (
     "search: they want fares or named a route (fly, want to fly, show flights).\n"
     "select: they picked a fare already discussed (a time, airline, that one, done).\n"
     "book: act on the open booking — go ahead, continue, confirm, skip the extra, click a named button, "
-    "go to add-ons, next step, tick the traveller, or keep booking.\n"
+    "go to add-ons, next step, tick/select a saved traveller name, delete/remove a duplicate profile, "
+    "or keep booking. wanted_tap=__select_traveller__ when they want an existing name ticked; "
+    "wanted_tap=__delete_traveller__ when they want a saved profile removed (any natural wording).\n"
     "status: they only ask what is wrong, why stuck, what you see, or ? — do not restart the trip.\n"
     "login: site sign-in or they are giving a password.\n"
     "details: name, email, phone, date of birth, or gender. A birth date with email/gender is not a new flight date.\n"
@@ -476,46 +478,58 @@ def handle_turn(
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="💳")
     if do == "details":
-        waiting = _form_ask_if_needed(state)
-        if waiting:
-            state.pop("busy_at", None)
+        # "click one of the names" is traveller pick — never contact-fill.
+        if wants_pick_saved_traveller(text) or wants_delete_traveller(text):
+            asked = extract_user_ask(text, state)
+            state["chosen_tap"] = asked.get("tap") or (
+                "__delete_traveller__" if wants_delete_traveller(text) else "__select_traveller__"
+            )
+            kind = "book"
+            do = "book"
+            tap = state["chosen_tap"]
             _save(phone, state)
-            db.add_message(phone, "assistant", waiting)
-            return Reply.of(waiting, emoji="📝")
-        kind = "book"
-        from app.step_read import form_sheet
-
-        open_page = str(state.get("stuck_page") or "")
-        from app.kernel_otp import indian_national as _fill_mobile
-
-        contactish = bool(
-            form_sheet(open_page)
-            or str(state.get("stuck_kind") or "") in {"form", "pay", "passenger"}
-            or re.search(r"add contact|please enter mobile", open_page, re.I)
-            or _fill_mobile(text)
-        )
-        # Contact form: fill first. Do not advertise Continue until mobile sticks.
-        if contactish:
-            state["chosen_tap"] = "Continue"
-            state.pop("stuck_kind", None)  # drop stale "pay" from contact false-positive
-            if _fill_mobile(text) or state.get("phone"):
-                spoken = (
-                    f"Typing your mobile into {_seller_label(str(state.get('seller') or 'cleartrip'))} contact. "
-                    "I won't Continue until that field sticks. Nothing paid."
-                )
-                state["busy_at"] = f"{time.time():.3f}"
-                _save(phone, state)
-                threading.Thread(
-                    target=_run_browse,
-                    args=(phone, text, state.get("busy_at"), "details"),
-                    name="guide-browse",
-                    daemon=True,
-                ).start()
-                db.add_message(phone, "assistant", spoken)
-                return Reply.of(spoken, emoji="✈️")
         else:
-            state["chosen_tap"] = tap or str(state.get("chosen_tap") or "Skip add-ons")
-        _save(phone, state)
+            waiting = _form_ask_if_needed(state)
+            if waiting:
+                state.pop("busy_at", None)
+                _save(phone, state)
+                db.add_message(phone, "assistant", waiting)
+                return Reply.of(waiting, emoji="📝")
+            kind = "book"
+            from app.step_read import form_sheet
+
+            open_page = str(state.get("stuck_page") or "")
+            from app.kernel_otp import indian_national as _fill_mobile
+
+            contactish = bool(
+                form_sheet(open_page)
+                or str(state.get("stuck_kind") or "") in {"form", "pay", "passenger"}
+                or re.search(r"add contact|please enter mobile", open_page, re.I)
+                or _fill_mobile(text)
+            )
+            # Contact form: fill only when they sent a mobile or an explicit contact phone is saved.
+            # Login OTP mobile alone must not silently type into Contact Details.
+            if contactish:
+                state["chosen_tap"] = "Continue"
+                state.pop("stuck_kind", None)  # drop stale "pay" from contact false-positive
+                if _fill_mobile(text) or state.get("phone"):
+                    spoken = (
+                        f"Typing your mobile into {_seller_label(str(state.get('seller') or 'cleartrip'))} contact. "
+                        "I won't Continue until that field sticks. Nothing paid."
+                    )
+                    state["busy_at"] = f"{time.time():.3f}"
+                    _save(phone, state)
+                    threading.Thread(
+                        target=_run_browse,
+                        args=(phone, text, state.get("busy_at"), "details"),
+                        name="guide-browse",
+                        daemon=True,
+                    ).start()
+                    db.add_message(phone, "assistant", spoken)
+                    return Reply.of(spoken, emoji="✈️")
+            else:
+                state["chosen_tap"] = tap or str(state.get("chosen_tap") or "Skip add-ons")
+            _save(phone, state)
     if do == "search":
         kind = "search"
         state.pop("chosen_tap", None)
@@ -528,17 +542,48 @@ def handle_turn(
             state.pop("chosen_tap", None)
         state.pop("pending_step", None)
         _save(phone, state)
+        if tap in {"__select_traveller__", "__pick_traveller__"}:
+            # Fall through to browse with a clear ack — never contact-fill.
+            pass
+        elif tap in {"__delete_traveller__", "__remove_traveller__"}:
+            pass
     cached = _cached_fares_reply(state, text, kind)
     if cached and do not in {"search", "book"}:
         db.add_message(phone, "assistant", cached)
         return Reply.of(cached, emoji="✈️")
-    # After Google: note the clock, wait for site prices / an explicit seller — never default Cleartrip.
+    # After Google: note the clock; start site quotes only once a time is chosen — never default Cleartrip.
     if kind in _BOOKING and _needs_book_site_choice(state, text):
         hint = _flight_hint(text) or str(state.get("selected_hint") or "")
         if hint:
             state["selected_hint"] = hint
         state["stage"] = "results"
         state.pop("busy_at", None)
+        # First clock after Google: kick Cleartrip/Ixigo/EMT quotes for that time (not the bot's guess).
+        start_quotes = bool(
+            hint
+            and state.get("awaiting_book_site")
+            and not state.get("book_quotes")
+            and not state.get("book_quotes_busy")
+        )
+        if start_quotes:
+            from app.kernel_otp import kernel_configured
+
+            if kernel_configured():
+                state["book_quotes_busy"] = True
+                _save(phone, state)
+                threading.Thread(
+                    target=_publish_book_quotes,
+                    args=(phone, [], None),
+                    kwargs={"hint": hint},
+                    name="book-quotes",
+                    daemon=True,
+                ).start()
+                reply = (
+                    f"Noted {hint}. Checking Cleartrip, Ixigo, and EaseMyTrip for that flight — "
+                    "I'll ask which site to book once those prices are in. Nothing paid."
+                )
+                db.add_message(phone, "assistant", reply)
+                return Reply.of(reply, emoji="✈️")
         _save(phone, state)
         reply = _book_site_choice_reply(state, text)
         db.add_message(phone, "assistant", reply)
@@ -621,9 +666,18 @@ def handle_turn(
                 signed_in = str(state.get("kernel_logged_in") or "") == book_seller
                 auth_mode = str(state.get("kernel_auth_mode") or "").strip().lower()
                 trip = _spoken_trip(state)
-                if chosen and (resume_booking_url(state, text) or state.get("kernel_session_id")):
-                    tap = str(state.get("chosen_tap") or "")
-                    if re.search(r"skip add", tap, re.I):
+                held_tap = str(state.get("chosen_tap") or tap or "")
+                if held_tap in {"__select_traveller__", "__pick_traveller__"}:
+                    canned = (
+                        f"Ticking one saved traveller on {_seller_label(book_seller)} for the {chosen or 'open flight'}. "
+                        "I will not create a new profile. Nothing paid."
+                    )
+                elif held_tap in {"__delete_traveller__", "__remove_traveller__"}:
+                    canned = (
+                        f"Removing one saved traveller profile on {_seller_label(book_seller)}. Nothing paid."
+                    )
+                elif chosen and (resume_booking_url(state, text) or state.get("kernel_session_id")):
+                    if re.search(r"skip add", held_tap, re.I):
                         canned = (
                             f"Pressing Skip add-ons on {_seller_label(book_seller)} if Choose add-ons is still open. "
                             "If that page is gone I'll open a fresh fare list. Nothing paid."
@@ -809,6 +863,39 @@ def _mid_booking(state: dict[str, Any]) -> bool:
     )
 
 
+def wants_pick_saved_traveller(text: str) -> bool:
+    """Traveller asked to tick an existing Ixigo/Cleartrip saved name, not fill contact."""
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:click|pick|select|tick|choose|use|tap)\b.+\b(?:name|names|traveller|traveler|profile|saved|one of)\b"
+            r"|\bone of the names\b|\bsaved (?:traveller|traveler|profile)\b|\bexisting (?:traveller|traveler)\b"
+            r"|\bany of (?:the|those) names\b|\buse (?:the |a )?saved\b",
+            raw,
+            re.I,
+        )
+    )
+
+
+def wants_delete_traveller(text: str) -> bool:
+    """Traveller asked to remove a duplicate saved profile on the seller page."""
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:delete|remove|erase|clear)\b.+\b(?:travellers?|travelers?|profiles?|names?|passengers?|duplicates?)\b"
+            r"|\bdelete (?:one|a|the|this|that|some)\b.+\b(?:names?|profiles?|travellers?|travelers?)\b"
+            r"|\bremove (?:one|a|the|this|that)?\s*(?:of )?(?:the )?(?:duplicate )?profiles?\b"
+            r"|\bget rid of\b.+\b(?:profiles?|names?|travellers?|travelers?|duplicates?)\b",
+            raw,
+            re.I,
+        )
+    )
+
+
 def extract_user_ask(text: str, state: dict[str, Any]) -> dict[str, str]:
     """What the traveller wants pressed or asked, from plain wording."""
     from app.step_read import choice_phrase, safe_tap
@@ -824,6 +911,16 @@ def extract_user_ask(text: str, state: dict[str, Any]) -> dict[str, str]:
         re.I,
     ):
         out["intent"] = "status"
+        return out
+    if wants_delete_traveller(raw) and _mid_booking(state):
+        out["intent"] = "book"
+        out["goal"] = "delete_traveller"
+        out["tap"] = "__delete_traveller__"
+        return out
+    if wants_pick_saved_traveller(raw) and _mid_booking(state):
+        out["intent"] = "book"
+        out["goal"] = "pick_traveller"
+        out["tap"] = "__select_traveller__"
         return out
     if re.search(r"\b(add-?ons?|next step|go (?:to |on to )?payment|move (?:on|forward|ahead))\b", raw, re.I):
         out["intent"] = "book"
@@ -976,13 +1073,18 @@ def _merge_intent(local: str, model: str, text: str, state: dict[str, Any]) -> s
         return "status"
     if _asks_for_filled_form(text):
         return "status"
-    if re.search(r"\b(?:click|press|tap)\b", text or "", re.I) or re.fullmatch(
-        r"continue|confirm|next(?: step)?", (text or "").strip(), re.I
+    # Named continue/confirm (with optional "click/press") — free-form "click a name" uses Gemini/extract.
+    if re.fullmatch(
+        r"(?:(?:click|press|tap|hit)\s+)?(?:continue|confirm|next(?: step)?)",
+        (text or "").strip(),
+        re.I,
     ):
         if str(state.get("stage") or "") in {"booking", "passenger", "results", "payment", "login", "review"} or _mid_booking(
             state
         ):
             return "book"
+    if wants_pick_saved_traveller(text) or wants_delete_traveller(text):
+        return "book"
     if local == "book" and (resume_booking_url(state, text) or _mid_booking(state)):
         return "book"
     model = (model or "").lower()
@@ -1038,67 +1140,145 @@ def _usable_reply(state: dict[str, Any], spoken: str, fallback: str) -> str:
     return text
 
 
+def _apply_understood_tap(state: dict[str, Any], wanted: str, *, page: str = "") -> str:
+    """Map Gemini/local wanted_tap to a checkout tap. Special traveller taps bypass page match."""
+    raw = (wanted or "").strip()
+    if not raw:
+        return ""
+    if raw in {"__select_traveller__", "__pick_traveller__", "__delete_traveller__", "__remove_traveller__"}:
+        state["chosen_tap"] = raw if raw.startswith("__") else raw
+        if raw in {"__pick_traveller__"}:
+            state["chosen_tap"] = "__select_traveller__"
+        if raw in {"__remove_traveller__"}:
+            state["chosen_tap"] = "__delete_traveller__"
+        return state["chosen_tap"]
+    from app.step_read import safe_tap
+
+    hay = page or str(state.get("stuck_page") or "")
+    tap = safe_tap(raw, hay) if hay else raw[:40]
+    if tap:
+        state["chosen_tap"] = tap
+    return tap
+
+
+def _trivial_mid_booking_yes(text: str, asked: dict[str, str]) -> bool:
+    """Exact yes/skip/confirm — safe to act without a fresh Gemini call."""
+    raw = (text or "").strip()
+    if asked.get("tap") in {"__select_traveller__", "__delete_traveller__"}:
+        return True
+    if re.fullmatch(
+        r"yes|yep|yeah|ok|okay|sure|decline|skip|skip add-ons|skip addons|no thanks|no, thanks|confirm|continue",
+        raw,
+        re.I,
+    ):
+        return True
+    if re.fullmatch(r"\d{1,2}:\d{2}", raw):
+        return True
+    from app.kernel_otp import indian_national
+
+    return bool(indian_national(raw))
+
+
 def resolve_intent(text: str, state: dict[str, Any], prior: list[dict[str, Any]]) -> tuple[str, str]:
-    """Gemini (via converse / turn loop) names the wish. Local rails keep pay/details safe."""
+    """Gemini names the wish when available. Local rails keep pay/details/cancel safe."""
     local = infer_intent(state, text)
     asked = extract_user_ask(text, state)
     if asked.get("tap") and _mid_booking(state):
-        state["chosen_tap"] = asked["tap"]
-    if _mid_booking(state) and local not in {"details", "pay", "pay_self", "cancel"}:
-        spoken = ""
-        if asked.get("tap"):
-            spoken = f"I'll press {asked['tap']} on the open page. Nothing paid."
-        elif asked.get("goal") == "skip":
-            spoken = "I'll skip the paid extra and keep your traveller selected. Nothing paid."
-            if not state.get("chosen_tap"):
-                from app.step_read import decline_tap
+        _apply_understood_tap(state, asked["tap"])
 
-                page = str(state.get("stuck_page") or "")
-                state["chosen_tap"] = decline_tap(page) or "Skip add-ons"
-        elif asked.get("goal") == "forward":
-            spoken = "I'll move the booking forward and stop before payment."
-        return local, spoken
-    if not get_settings().gemini_api_key and not get_settings().llm_ready:
-        spoken = ""
+    def _local_spoken() -> str:
+        if asked.get("tap") == "__select_traveller__":
+            return "I'll tick one saved traveller. I won't create a new profile. Nothing paid."
+        if asked.get("tap") == "__delete_traveller__":
+            return "I'll remove one saved traveller profile. Nothing paid."
         if asked.get("tap"):
-            spoken = f"I'll press {asked['tap']} on the open page. Nothing paid."
-        elif asked.get("goal") == "forward":
-            spoken = "I'll move the booking forward and stop before payment."
-        elif asked.get("goal") == "skip":
-            spoken = "I'll skip the paid extra and keep your traveller selected. Nothing paid."
+            return f"I'll press {asked['tap']} on the open page. Nothing paid."
+        if asked.get("goal") == "skip":
             if not state.get("chosen_tap") and _mid_booking(state):
                 from app.step_read import decline_tap
 
-                page = str(state.get("stuck_page") or "")
-                state["chosen_tap"] = decline_tap(page) or "Skip add-ons"
-        return local, spoken
+                state["chosen_tap"] = decline_tap(str(state.get("stuck_page") or "")) or "Skip add-ons"
+            return "I'll skip the paid extra and keep your traveller selected. Nothing paid."
+        if asked.get("goal") == "forward":
+            return "I'll move the booking forward and stop before payment."
+        return ""
+
+    # Mid-booking: still ask Gemini for non-trivial wording so paraphrases are understood.
+    use_gemini = bool(get_settings().gemini_api_key or get_settings().llm_ready)
+    if not use_gemini:
+        if local in {"pay", "pay_self", "cancel", "details"}:
+            return local, _local_spoken()
+        if _mid_booking(state):
+            return local, _local_spoken()
+        return local, _local_spoken()
+
+    if (
+        _mid_booking(state)
+        and local not in {"details", "pay", "pay_self", "cancel"}
+        and _trivial_mid_booking_yes(text, asked)
+        and asked.get("goal") in {"skip", "forward", "pick_traveller", "delete_traveller", ""}
+        and (asked.get("tap") or asked.get("goal") in {"skip", "forward"})
+    ):
+        return local if local != "chat" else "book", _local_spoken()
+
     data = llm.converse(_UNDERSTAND, _planner_payload(phone="", text=text, state=state, prior=prior, busy=False), timeout=8)
     model = str(data.get("intent") or "")
     spoken = str(data.get("reply") or "")
     kind = _merge_intent(local, model, text, state)
-    if asked.get("intent") == "book" and _mid_booking(state) and kind in {"chat", "search", "status"}:
+    # Gemini traveller goals / special taps beat a vague book/details merge.
+    wanted = str(data.get("wanted_tap") or "").strip()
+    reply_l = f"{spoken} {wanted} {data.get('goal') or ''}".lower()
+    if _mid_booking(state) and (
+        wanted in {"__select_traveller__", "__pick_traveller__"}
+        or re.search(r"\b(tick|select|pick|use).+\b(saved|name|traveller|profile)\b", reply_l)
+        or asked.get("goal") == "pick_traveller"
+    ):
         kind = "book"
+        _apply_understood_tap(state, wanted or "__select_traveller__")
+        spoken = spoken or "I'll tick one saved traveller. I won't create a new profile. Nothing paid."
+    elif _mid_booking(state) and (
+        wanted in {"__delete_traveller__", "__remove_traveller__"}
+        or re.search(r"\b(delete|remove|clear).+\b(profile|traveller|name|duplicate)\b", reply_l)
+        or asked.get("goal") == "delete_traveller"
+    ):
+        kind = "book"
+        _apply_understood_tap(state, wanted or "__delete_traveller__")
+        spoken = spoken or "I'll remove one saved traveller profile. Nothing paid."
+    elif asked.get("intent") == "book" and _mid_booking(state) and kind in {"chat", "search"}:
+        # Ambiguous chat mid-booking: ask, don't invent a click.
+        if not wanted and not asked.get("tap") and not asked.get("goal"):
+            kind = "status"
+            spoken = spoken or (
+                "I'm on the open booking page — say what you want: click a saved name, "
+                "delete a profile, continue, or skip. Nothing paid."
+            )
+        else:
+            kind = "book"
     if asked.get("intent") == "status" and _mid_booking(state):
         kind = "status"
+    if kind == "status" and _mid_booking(state) and not spoken:
+        spoken = (
+            "I'm on the open booking page — say what you want: click a saved name, "
+            "delete a profile, continue, or skip. Nothing paid."
+        )
     hint = str(data.get("flight_hint") or "").strip()
     if hint and kind != "details":
         state["selected_hint"] = hint[:40]
-    wanted = str(data.get("wanted_tap") or "").strip()
     if wanted and _mid_booking(state) and kind == "book":
         page = str((state.get("pending_step") or {}).get("page") if isinstance(state.get("pending_step"), dict) else "")
         page = page or str(state.get("stuck_page") or "")
-        from app.step_read import safe_tap
-
-        tap = safe_tap(wanted, page) if page else wanted[:40]
-        if tap:
-            state["chosen_tap"] = tap
+        _apply_understood_tap(state, wanted, page=page)
     if asked.get("goal") == "skip" and _mid_booking(state) and not state.get("chosen_tap"):
         from app.step_read import decline_tap
 
-        page = str(state.get("stuck_page") or "")
-        state["chosen_tap"] = decline_tap(page) or "Skip add-ons"
+        state["chosen_tap"] = decline_tap(str(state.get("stuck_page") or "")) or "Skip add-ons"
     if not spoken and asked.get("tap"):
-        spoken = f"I'll press {asked['tap']} on the open page. Nothing paid."
+        if asked["tap"] == "__select_traveller__":
+            spoken = "I'll tick one saved traveller. I won't create a new profile. Nothing paid."
+        elif asked["tap"] == "__delete_traveller__":
+            spoken = "I'll remove one saved traveller profile. Nothing paid."
+        else:
+            spoken = f"I'll press {asked['tap']} on the open page. Nothing paid."
     return kind, spoken
 
 
@@ -1291,9 +1471,14 @@ def _book_site_choice_reply(state: dict[str, Any], text: str = "") -> str:
     hint = str(state.get("selected_hint") or _flight_hint(text) or "").strip()
     noted = f"Noted {hint}. " if hint else ""
     if state.get("awaiting_book_site"):
+        if state.get("book_quotes_busy"):
+            return (
+                f"{noted}Still checking Cleartrip, Ixigo, and EaseMyTrip prices. "
+                "I'll ask which site to book once those are in. Nothing paid."
+            )
         return (
-            f"{noted}Still checking Cleartrip, Ixigo, and EaseMyTrip prices. "
-            "I'll ask which site to book once those are in. Nothing paid."
+            f"{noted}Reply with a departure time first — then I'll check Cleartrip, Ixigo, "
+            "and EaseMyTrip for that flight and ask which site to book. Nothing paid."
         )
     quotes = state.get("book_quotes") if isinstance(state.get("book_quotes"), list) else []
     preferred = str(state.get("preferred_seller") or "")
@@ -2251,8 +2436,8 @@ def _options_reply(state: dict[str, Any], options: list[dict[str, Any]], seller:
         lines.append(
             f"I'd take {best['airline']} at {best['depart']}"
             + (f" (₹{best['price']} on {label})" if best.get("price") else "")
-            + ". Checking Cleartrip, Ixigo, and EaseMyTrip for that time — "
-            "I'll ask which site to book once those prices are in. Don't pick a site yet."
+            + ". Reply with a departure time and I'll check Cleartrip, Ixigo, and EaseMyTrip "
+            "for that flight, then ask which site to book. Nothing paid."
         )
     else:
         lines.append(f"I'd take {best['airline']} at {best['depart']} on {label}. Say that time and I'll book it.")
@@ -2349,21 +2534,13 @@ def _publish_fares(
             )
             return
         spoken = _options_reply(saved, options, seller=seller["id"]) if options else _fare_line(result, saved, seller=seller["id"])
-        if seller["id"] in NOT_BOOKABLE and "Checking Cleartrip" not in spoken and "can't take the booking" not in spoken:
-            spoken += " Booking isn't possible on this page. Checking Cleartrip, Ixigo, and EaseMyTrip next."
+        if seller["id"] in NOT_BOOKABLE and "Cleartrip" not in spoken and "can't take the booking" not in spoken:
+            spoken += (
+                " Booking isn't possible on this page. Reply with a departure time and I'll "
+                "check Cleartrip, Ixigo, and EaseMyTrip for that flight."
+            )
         _deliver(phone, spoken, session, secrets)
-        # After Google (or any non-bookable list), pull live book-site prices off the browse lock.
-        # started_at=None so clearing search busy does not cancel the quote reply.
-        if seller["id"] in NOT_BOOKABLE and (options or prices) and not _stale(phone, started_at):
-            best = _pick_best(options, str(saved.get("preference") or "")) if options else {}
-            hint = str(best.get("depart") or saved.get("selected_hint") or "")
-            threading.Thread(
-                target=_publish_book_quotes,
-                args=(phone, list(secrets), None),
-                kwargs={"hint": hint},
-                name="book-quotes",
-                daemon=True,
-            ).start()
+        # Do not auto-quote bookable sites yet — wait until the traveller picks a departure time.
     except Exception:
         logger.exception("Fare search failed")
         if not _stale(phone, started_at):
@@ -2414,6 +2591,7 @@ def _publish_book_quotes(
         saved["preferred_seller"] = str(best_site["seller"])
     saved["awaiting_book_site"] = False
     saved["book_site_ready"] = True
+    saved.pop("book_quotes_busy", None)
     _save(phone, saved)
     spoken = format_book_quotes(quotes, hint=when, trip=_trip_line(saved) or "")
     _deliver(phone, spoken, None, secrets)
@@ -2583,6 +2761,15 @@ def _fill_what_we_can(phone: str, session: BrowserSession, secrets: list[str]) -
             session.fill_saved_login(str(creds.get("username") or ""), str(creds.get("password") or ""))
             did = True
             page = session.last_text or page
+    # Logged-in saved traveller grid: tick one — do not type Add New / invent contact.
+    if session.page is not None and re.search(r"\b(mr|ms|mrs|mx)\b", page, re.I):
+        from app.page_agent import _select_saved_traveller
+
+        note = _select_saved_traveller(session.page, str(state.get("name") or ""))
+        if note.startswith("traveller_"):
+            return True
+        if note.startswith("traveller_unticked") or re.search(r"\b(mr|ms|mrs|mx)\b", page, re.I):
+            return False
     profile = {
         "name": str(state.get("name") or ""),
         "email": str(state.get("email") or ""),

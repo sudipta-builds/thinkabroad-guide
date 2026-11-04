@@ -1844,16 +1844,18 @@ def _select_saved_traveller(page, name: str = "") -> str:
                 return r.width > 4 && r.height > 4 && s.visibility !== 'hidden'
                   && s.display !== 'none' && r.bottom > 0 && r.top < innerHeight;
               };
+              const shortLine = (raw) => (raw || '').split('\\n').map(s => s.replace(/\\s+/g, ' ').trim())
+                .find(s => s.length >= 4 && s.length <= 60) || '';
               const isPerson = (t) => {
-                if (!t || t.length > 80) return false;
-                if (/pay|assured|cancellation|seat|meal|baggage|continue|gst|email|mobile|contact/.test(t)) return false;
-                return /\\b(mr|ms|mrs|mx)\\b/.test(t) || /[a-z]{2,}\\s+[a-z]{2,}/.test(t);
+                const line = shortLine(t).toLowerCase();
+                if (!line || line.length > 60) return false;
+                if (/pay|assured|cancellation|seat|meal|baggage|continue|gst|email|mobile|contact|add new|gender|first/.test(line)) return false;
+                return /\\b(mr|ms|mrs|mx)\\.?\\b/.test(line) || /^[a-z]{2,}\\s+[a-z]{2,}/.test(line);
               };
-              const rowText = (el) => {
+              const personLine = (el) => {
                 let node = el;
                 for (let i = 0; i < 6 && node; i++) {
-                  const t = ((node.innerText || node.getAttribute && node.getAttribute('aria-label')) || '')
-                    .replace(/\\s+/g, ' ').trim().toLowerCase();
+                  const t = shortLine((node.innerText || node.getAttribute?.('aria-label') || '')).toLowerCase();
                   if (isPerson(t)) return t;
                   node = node.parentElement;
                 }
@@ -1862,27 +1864,30 @@ def _select_saved_traveller(page, name: str = "") -> str:
               const boxes = [...document.querySelectorAll(
                 'input[type=checkbox],[role=checkbox],input[type=radio]'
               )].filter(vis);
-              const adults = boxes.filter((el) => isPerson(rowText(el)));
+              const adults = boxes.filter((el) => isPerson(personLine(el)));
               const named = want
-                ? adults.filter((el) => rowText(el).includes(want))
+                ? adults.filter((el) => personLine(el).includes(want))
                 : adults;
               const pool = named.length ? named : adults;
               const alreadyOn = pool.find((el) => el.checked || el.getAttribute('aria-checked') === 'true');
-              if (alreadyOn) return 'already';
+              if (alreadyOn) return 'already:' + adults.length;
               const match = pool[0];
-              if (!match && adults.length) return 'unticked';
+              if (!match && adults.length) return 'unticked:' + adults.length;
               if (match) {
-                match.click();
-                return 'clicked';
+                const lab = match.closest('label') || match;
+                lab.click();
+                if (!match.checked && match.getAttribute('aria-checked') !== 'true') match.click();
+                return 'clicked:' + adults.length;
               }
-              const cards = [...document.querySelectorAll('label,button,div,li')].filter(vis);
+              const cards = [...document.querySelectorAll('label,button,div,li,span')].filter(vis);
               const card = cards.find((el) => {
-                const t = (el.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const t = shortLine(el.innerText || '').toLowerCase();
                 if (!isPerson(t)) return false;
+                if ((el.innerText || '').length > 80) return false;
                 return !want || t.includes(want);
               });
-              if (card) { card.click(); return 'card'; }
-              return '';
+              if (card) { card.click(); return 'card:' + adults.length; }
+              return adults.length ? 'unticked:' + adults.length : '';
             }""",
             wanted,
         )
@@ -1891,6 +1896,70 @@ def _select_saved_traveller(page, name: str = "") -> str:
     except Exception:
         return ""
     return ""
+
+
+def _delete_saved_traveller(page, name: str = "") -> str:
+    """Remove one saved traveller chip/row when the UI exposes a delete control."""
+    if read_surface(page).get("overlay"):
+        return "behind_sheet"
+    wanted = re.sub(r"\s+", " ", (name or "").strip()).lower()
+    wanted = re.sub(r"^(mr|ms|mrs|mx)\.?\s+", "", wanted)
+    try:
+        result = page.evaluate(
+            """(want) => {
+              const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 2 && r.height > 2 && s.visibility !== 'hidden'
+                  && s.display !== 'none' && r.bottom > 0 && r.top < innerHeight;
+              };
+              const shortLine = (raw) => (raw || '').split('\\n').map(s => s.replace(/\\s+/g, ' ').trim())
+                .find(s => s.length >= 4 && s.length <= 60) || '';
+              const isPerson = (t) => {
+                const line = shortLine(t).toLowerCase();
+                if (!line) return false;
+                return /\\b(mr|ms|mrs|mx)\\.?\\b/.test(line);
+              };
+              const nodes = [...document.querySelectorAll('button,a,[role=button],svg,i,span,div')].filter(vis);
+              const dels = nodes.filter((el) => {
+                const aria = (el.getAttribute('aria-label') || el.getAttribute('title') || '').toLowerCase();
+                const t = (el.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                if (/delete|remove|trash/.test(aria)) return true;
+                if (/^delete$|^remove$|✕|×|🗑/.test(t) && t.length < 12) return true;
+                return false;
+              });
+              const nearPerson = (del) => {
+                let node = del;
+                for (let i = 0; i < 8 && node; i++) {
+                  const line = shortLine(node.innerText || '').toLowerCase();
+                  if (isPerson(line)) return line;
+                  node = node.parentElement;
+                }
+                return '';
+              };
+              const pool = want
+                ? dels.filter((el) => nearPerson(el).includes(want))
+                : dels.filter((el) => nearPerson(el));
+              const hit = pool[0] || dels[0];
+              if (!hit) return '';
+              hit.click();
+              return 'clicked';
+            }""",
+            wanted,
+        )
+        if result == "clicked":
+            try:
+                page.wait_for_timeout(400)
+            except Exception:
+                pass
+            # Confirm delete dialog if present.
+            for label in ("Delete", "Remove", "Yes", "Confirm"):
+                if _click_label(page, label):
+                    return f"traveller_deleted:{label}"
+            return "traveller_deleted"
+    except Exception:
+        return ""
+    return "traveller_delete_miss"
 
 
 def _ixigo_opt_out_cancellation(page) -> str:
@@ -4131,7 +4200,34 @@ def run_checkout_agent(
         if tap_pending and "defer_continue_for_fill" not in log[-4:]:
             label = tap_pending
             tap_pending = ""
-            if label.startswith("__"):
+            if label in {"__select_traveller__", "__pick_traveller__"}:
+                note = _select_saved_traveller(page, str(profile.get("name") or ""))
+                log.append(f"user_pick_traveller:{note or 'miss'}")
+                if note.startswith("traveller_clicked") or note.startswith("traveller_already") or note.startswith(
+                    "traveller_card"
+                ):
+                    try:
+                        page.wait_for_timeout(500)
+                    except Exception:
+                        pass
+                    continue
+                if note.startswith("traveller_unticked") or note == "behind_sheet" or not note:
+                    handoff = (
+                        "Saved travellers are on screen. I could not tick one yet — "
+                        "reply click one of the names again, or say delete one of the profiles. "
+                        "I will not create a new traveller. Nothing paid."
+                    )
+                    return CheckoutOutcome("passenger", text, url, log, facts=facts, checks=checks, handoff=handoff)
+            elif label in {"__delete_traveller__", "__remove_traveller__"}:
+                note = _delete_saved_traveller(page, str(profile.get("name") or ""))
+                log.append(f"user_delete_traveller:{note or 'miss'}")
+                handoff = (
+                    "I removed one saved traveller profile."
+                    if note.startswith("traveller_deleted")
+                    else "I could not find a delete control on the traveller list. Nothing paid."
+                )
+                return CheckoutOutcome("passenger", text, url, log, facts=facts, checks=checks, handoff=handoff)
+            elif label.startswith("__"):
                 log.append("user_tap:recommended")
             elif re.search(r"pay now|pay to complete|make payment", label, re.I) and not allow_pay:
                 log.append("user_tap_refused")
@@ -4516,19 +4612,17 @@ def run_checkout_agent(
                 note = _clear_front_sheet(page, chosen_tap)
                 log.append(note or "behind_sheet_miss")
                 continue
-            if saved == "traveller_unticked":
-                log.append(saved)
-                return _pause_unknown(
-                    page,
-                    seller=seller,
-                    hint=hint,
-                    text=text,
-                    url=url,
-                    log=log,
-                    facts=facts,
-                    checks=checks,
-                    step=step,
+            if saved.startswith("traveller_unticked") or (
+                not saved and re.search(r"\b(mr|ms|mrs|mx)\b", text or "", re.I)
+            ):
+                log.append(saved or "traveller_list_visible")
+                # Logged-in saved list: never create another duplicate via Add New Traveller.
+                handoff = (
+                    "Your Ixigo account already lists saved travellers. "
+                    "Reply click one of the names and I'll tick it, or say delete one of the profiles. "
+                    "I will not create a new traveller while those are on screen. Nothing paid."
                 )
+                return CheckoutOutcome("passenger", text, url, log, facts=facts, checks=checks, handoff=handoff)
             if saved.startswith("traveller_"):
                 log.append(saved)
                 log.append("kept_saved_traveller")

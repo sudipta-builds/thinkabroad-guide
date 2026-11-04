@@ -194,7 +194,12 @@ def handle_turn(
             if kind == "select":
                 kind = "book"
     # Guest payment → "I'd like to login" on the same site (or named site).
-    if on_pay and (_wants_kernel_login(text) or kind == "login"):
+    # Do not steal the guest/login prompt reply — that handler owns seller + browse.
+    if (
+        on_pay
+        and not state.get("kernel_awaiting_auth_mode")
+        and (_wants_kernel_login(text) or kind == "login")
+    ):
         from app.kernel_otp import release_saved_kernel
 
         release_saved_kernel(str(state.get("kernel_session_id") or ""))
@@ -204,6 +209,7 @@ def handle_turn(
         state.pop("live", None)
         state.pop("stuck_kind", None)
         state.pop("chosen_tap", None)
+        state.pop("last_vision", None)
         kind = "book"
     elif on_pay and (_wants_price_elsewhere(text) or kind == "search") and named_seller_from(text):
         from app.kernel_otp import release_saved_kernel
@@ -257,11 +263,27 @@ def handle_turn(
     if state.get("kernel_awaiting_auth_mode"):
         raw_auth = (text or "").strip()
         seller_id = str(state.get("kernel_seller") or state.get("seller") or "cleartrip")
-        if re.search(r"\bguest\b|without (?:an? )?(?:login|otp|signing)|as a guest", raw_auth, re.I):
-            state["kernel_auth_mode"] = "guest"
+        from app.kernel_otp import release_saved_kernel
+
+        def _commit_auth_seller(mode: str) -> None:
+            """Keep the site from the guest/login ask; drop any other site's pay tab."""
+            state["kernel_auth_mode"] = mode
             state["kernel_awaiting_auth_mode"] = False
             state["seller"] = seller_id
             state["preferred_seller"] = seller_id
+            state["kernel_seller"] = seller_id
+            release_saved_kernel(str(state.get("kernel_session_id") or ""))
+            state.pop("kernel_session_id", None)
+            state.pop("kernel_logged_in", None)
+            state.pop("live", None)
+            state.pop("stuck_kind", None)
+            state.pop("chosen_tap", None)
+            state.pop("last_vision", None)
+            state.pop("stuck_page", None)
+            state["stage"] = "booking"
+
+        if re.search(r"\bguest\b|without (?:an? )?(?:login|otp|signing)|as a guest", raw_auth, re.I):
+            _commit_auth_seller("guest")
             state["busy_at"] = f"{time.time():.3f}"
             _save(phone, state)
             if message_sid:
@@ -272,17 +294,15 @@ def handle_turn(
                 name="guide-browse",
                 daemon=True,
             ).start()
+            need = "4" if seller_id == "cleartrip" else "6"
             reply = (
                 f"Opening the {str(state.get('selected_hint') or 'flight')} on {_seller_label(seller_id)} as a guest. "
-                "If a login code screen appears I'll ask for the digits then. I'll stop before payment."
+                f"If a login code appears I'll ask for the {need} digits then. I'll stop before payment."
             )
             db.add_message(phone, "assistant", reply)
             return Reply.of(reply, emoji="✈️")
         if re.search(r"\b(?:log\s*in|sign\s*in|otp|with (?:an? )?otp|account)\b", raw_auth, re.I):
-            state["kernel_auth_mode"] = "login"
-            state["kernel_awaiting_auth_mode"] = False
-            state["seller"] = seller_id
-            state["preferred_seller"] = seller_id
+            _commit_auth_seller("login")
             _save(phone, state)
             # Fall through: may still need a mobile, then browse.
             kind = "book"
@@ -498,6 +518,8 @@ def handle_turn(
             return Reply.of(reply, emoji="⚠️")
         state["seller"] = book_seller
         state["preferred_seller"] = book_seller
+        if kernel_book and not state.get("kernel_seller"):
+            state["kernel_seller"] = book_seller
         if kernel_book:
             from app.kernel_otp import indian_national, login_phone_for
 
@@ -508,6 +530,8 @@ def handle_turn(
             if chosen and not signed_in and auth_mode not in {"guest", "login"}:
                 state["kernel_awaiting_auth_mode"] = True
                 state["kernel_seller"] = book_seller
+                state["seller"] = book_seller
+                state["preferred_seller"] = book_seller
                 state.pop("busy_at", None)
                 _save(phone, state)
                 reply = (
@@ -523,6 +547,8 @@ def handle_turn(
                 if not login:
                     state["kernel_awaiting_phone"] = True
                     state["kernel_seller"] = book_seller
+                    state["seller"] = book_seller
+                    state["preferred_seller"] = book_seller
                     state.pop("busy_at", None)
                     _save(phone, state)
                     reply = (
@@ -536,6 +562,13 @@ def handle_turn(
             else:
                 state["kernel_awaiting_phone"] = False
             state["kernel_awaiting_auth_mode"] = False
+            # Login must open a fresh seller tab — never the previous guest pay sheet.
+            if auth_mode == "login" and not signed_in:
+                from app.kernel_otp import release_saved_kernel
+
+                release_saved_kernel(str(state.get("kernel_session_id") or ""))
+                state.pop("kernel_session_id", None)
+                state.pop("live", None)
         state["busy_at"] = f"{time.time():.3f}"
         _save(phone, state)
         threading.Thread(
@@ -1119,6 +1152,10 @@ def _booking_seller_id(state: dict[str, Any], text: str = "") -> str:
     named = named_seller_from(text)
     if named and seller_can_book(named):
         return named
+    # Guest/login prompt locks the site — "Login" must not fall back to a Cleartrip pay shot.
+    locked = str(state.get("kernel_seller") or "").strip().lower()
+    if locked and seller_can_book(locked):
+        return locked
     if str(state.get("seller") or "") == "ixigo" and str(state.get("kernel_logged_in") or "") == "ixigo":
         return "ixigo"
     vision = state.get("last_vision") if isinstance(state.get("last_vision"), dict) else {}
@@ -1126,6 +1163,9 @@ def _booking_seller_id(state: dict[str, Any], text: str = "") -> str:
     if not seller_can_book(sheet_seller):
         return fulfillment_seller("", named)
     preferred = str(state.get("preferred_seller") or sheet_seller or default_bookable_seller())
+    # Stale payment vision seller must not override preferred/kernel after a site switch.
+    if str(vision.get("kind") or "") == "pay" and str(state.get("preferred_seller") or ""):
+        preferred = str(state.get("preferred_seller") or preferred)
     return fulfillment_seller(preferred, named)
 
 
@@ -1194,11 +1234,18 @@ def resume_booking_url(state: dict[str, Any], text: str = "") -> str:
 
     live = state.get("live") if isinstance(state.get("live"), dict) else {}
     url = str(live.get("url") or "")
-    seller = str(state.get("seller") or state.get("preferred_seller") or "")
+    seller = str(state.get("kernel_seller") or state.get("seller") or state.get("preferred_seller") or "")
     if not is_resume_booking_url(url, seller):
         return ""
     stage = str(state.get("stage") or live.get("stage") or "")
     if stage not in {"booking", "review", "passenger", "payment", "login", "addons"}:
+        return ""
+    # Login OTP must not reopen a guest payment sheet and skip the code screen.
+    auth = str(state.get("kernel_auth_mode") or "").strip().lower()
+    signed = str(state.get("kernel_logged_in") or "") == seller
+    if auth == "login" and not signed and (
+        stage == "payment" or re.search(r"pay|payment", url or "", re.I)
+    ):
         return ""
     hint = _flight_hint(text)
     saved = str(state.get("selected_hint") or "")
@@ -1206,6 +1253,9 @@ def resume_booking_url(state: dict[str, Any], text: str = "") -> str:
         return ""
     named = named_seller_from(text)
     if named and named != seller:
+        return ""
+    locked = str(state.get("kernel_seller") or "").strip().lower()
+    if locked and seller and locked != seller:
         return ""
     return url
 

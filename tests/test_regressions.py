@@ -2314,7 +2314,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(plan.get("tap") or "", "")
 
     def test_payment_page_allows_other_site_login_or_price_check(self) -> None:
-        from app.travel_agent import _coerce_kind, infer_intent
+        from app.travel_agent import _booking_seller_id, _coerce_kind, infer_intent, resume_booking_url
         from app.turn_loop import align_action
 
         pay = {
@@ -2327,7 +2327,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
             "stuck_kind": "pay",
             "kernel_auth_mode": "guest",
             "stuck_page": "Pay to complete your booking Scan QR code Pay now ₹10,039",
-            "last_vision": {"kind": "pay", "what": "payment page", "tap": ""},
+            "last_vision": {"kind": "pay", "what": "payment page", "tap": "", "seller": "cleartrip"},
         }
         self.assertEqual(align_action("yes", dict(pay))["do"], "pay_stop")
         ixigo = align_action("6:20 PM on Ixigo", dict(pay))
@@ -2343,6 +2343,34 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(infer_intent(pay, "how much on ixigo"), "search")
         self.assertEqual(_coerce_kind("6:20 on Ixigo", "select", pay), "book")
         self.assertEqual(_coerce_kind("price on EaseMyTrip", "chat", pay), "search")
+
+        # After "For the 6:20 on Ixigo…", Login must stay on Ixigo — not Cleartrip pay.
+        awaiting = {
+            **pay,
+            "seller": "ixigo",
+            "preferred_seller": "ixigo",
+            "kernel_seller": "ixigo",
+            "kernel_awaiting_auth_mode": True,
+            "kernel_auth_mode": "",
+            "live": {
+                "url": "https://www.cleartrip.com/flights/itinerary/abc/payment",
+                "host": "cleartrip.com",
+                "stage": "payment",
+            },
+        }
+        self.assertEqual(_booking_seller_id(awaiting, "Login"), "ixigo")
+        self.assertEqual(_booking_seller_id(awaiting, "guest"), "ixigo")
+        login_state = {
+            **awaiting,
+            "kernel_auth_mode": "login",
+            "kernel_awaiting_auth_mode": False,
+            "stage": "booking",
+        }
+        self.assertEqual(
+            resume_booking_url(login_state, "Login"),
+            "",
+            "login must not resume a Cleartrip payment URL",
+        )
 
     def test_kernel_site_error_reopens_fresh_browser(self) -> None:
         import inspect

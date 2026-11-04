@@ -25,11 +25,13 @@ _TURN = (
     "Name the screenshot and recommend the safe next tap.\n"
     "goal=forward (intent=book) when they confirm the flight, continue, go on, or yes to your last rec.\n"
     "goal=skip (intent=book) when they skip extras.\n"
-    "goal=pick_traveller (intent=book) when they want you to tick/select one existing saved name on the "
-    "traveller list (any wording: click a name, use the saved one, pick that person) — tap empty; "
-    "do NOT fill contact mobile and do NOT create a new traveller.\n"
+    "goal=pick_traveller (intent=book) when they want an existing saved name ticked — ANY wording "
+    "(pick one, click a name, use saved, that person, whoever is listed). tap empty; "
+    "do NOT fill contact mobile; do NOT create a new traveller; do NOT use goal=details.\n"
     "goal=delete_traveller (intent=book) when they want a saved profile removed "
-    "(delete/remove/clear a duplicate name or profile) — tap empty; never pay.\n"
+    "(delete/remove/clear duplicates) — tap empty; never pay.\n"
+    "goal=details ONLY when they send passenger/contact VALUES (phone/email/name/DOB/gender), "
+    "not when they ask you to click something on the traveller list.\n"
     "If the screenshot is NOT Choose add-ons / seat map / missed-meals, do not recommend Skip add-ons.\n"
     "If the screenshot is an optional paid extra (flexibility, protect, cancellation, insurance), "
     "kind=upsell, tap Continue or the decline label, never Book now on that extra.\n"
@@ -240,8 +242,8 @@ def _local_turn(text: str, page: str, state: dict[str, Any]) -> dict[str, Any]:
         }
     if re.search(
         r"\b(?:click|pick|select|tick|choose|use|tap)\b.+\b(?:name|names|traveller|traveler|profile|saved|one of)\b"
-        r"|\bone of the names\b|\bsaved (?:traveller|traveler|profile)\b"
-        r"|\buse (?:the |an? )?existing\b|\bdon'?t create (?:a )?new\b",
+        r"|\bpick one\b|\bthat one\b|\bone of the names\b|\bsaved (?:traveller|traveler|profile)\b"
+        r"|\buse (?:the |an? )?existing\b|\bdon'?t create (?:a )?new\b|\banyone (?:of them|listed)\b",
         raw,
         re.I,
     ):
@@ -452,15 +454,15 @@ def interpret_turn(
         kind = ""
         tap = ""
         reply = ""
-    # Gemini paraphrases for saved-traveller actions → stable taps for checkout rails.
+    # Gemini goal wins for traveller actions; local is fallback when Gemini omitted goal.
     local_goal = str(local.get("goal") or "")
-    if local_goal in {"pick_traveller", "delete_traveller"}:
-        goal = local_goal
-        intent = "book"
-        tap = "__select_traveller__" if local_goal == "pick_traveller" else "__delete_traveller__"
-    elif goal in {"pick_traveller", "select_traveller"} or (
+    if goal in {"pick_traveller", "select_traveller"} or (
         intent == "book"
-        and re.search(r"\b(saved traveller|tick|select).+\b(name|traveller|profile)\b", f"{what} {recommend} {reply}", re.I)
+        and re.search(
+            r"\b(saved traveller|tick|select|pick one|click.+\bname)\b",
+            f"{what} {recommend} {reply} {text}",
+            re.I,
+        )
         and not re.search(r"\b(delete|remove)\b", f"{goal} {what} {recommend}", re.I)
     ):
         goal = "pick_traveller"
@@ -473,6 +475,10 @@ def interpret_turn(
         goal = "delete_traveller"
         intent = "book"
         tap = "__delete_traveller__"
+    elif local_goal in {"pick_traveller", "delete_traveller"}:
+        goal = local_goal
+        intent = "book"
+        tap = "__select_traveller__" if local_goal == "pick_traveller" else "__delete_traveller__"
     if not shot and not page and not stored_fare_list(state):
         if trip_ready and intent in {"status", "select", "book", "chat", ""}:
             intent = "search"
@@ -542,30 +548,8 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
     if wants_fresh_search(text) and trip:
         return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
 
-    # Gemini said ask/status — clarify; do not invent a click.
-    if goal == "ask" or (intent == "status" and goal in {"ask", ""}):
-        if not (goal in {"pick_traveller", "delete_traveller", "forward", "skip"} or clock):
-            return {
-                "do": "reply",
-                "kind": "status",
-                "tap": "",
-                "turn": turn,
-                "reply": format_turn_reply(turn)
-                or (
-                    "I'm on the open booking page — say what you want: click a saved name, "
-                    "delete a profile, continue, or skip. Nothing paid."
-                ),
-            }
-
-    # Saved-name pick/delete: Gemini goal first, then paraphrase regex.
-    raw_ask = (text or "").strip()
-    if tap in {"__delete_traveller__", "__remove_traveller__"} or goal == "delete_traveller" or re.search(
-        r"\b(?:delete|remove|erase|clear)\b.+\b(?:travellers?|travelers?|profiles?|names?|passengers?|duplicates?)\b"
-        r"|\bdelete (?:one|a|the|this|that|some)\b.+\b(?:names?|profiles?|travellers?|travelers?)\b"
-        r"|\bget rid of\b.+\b(?:profile|name|traveller|traveler|duplicate)\b",
-        raw_ask,
-        re.I,
-    ):
+    # --- Gemini goal → action (primary). Regex is offline fallback only. ---
+    if goal == "delete_traveller" or tap in {"__delete_traveller__", "__remove_traveller__"}:
         return {
             "do": "book",
             "kind": "book",
@@ -573,13 +557,7 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
             "turn": {**turn, "intent": "book", "goal": "delete_traveller"},
             "reply": "",
         }
-    if tap in {"__select_traveller__", "__pick_traveller__"} or goal == "pick_traveller" or re.search(
-        r"\b(?:click|pick|select|tick|choose|use|tap)\b.+\b(?:name|names|traveller|traveler|profile|saved|one of)\b"
-        r"|\bone of the names\b|\bsaved (?:traveller|traveler|profile)\b"
-        r"|\buse (?:the |an? )?existing\b|\bdon'?t create (?:a )?new\b",
-        raw_ask,
-        re.I,
-    ):
+    if goal == "pick_traveller" or tap in {"__select_traveller__", "__pick_traveller__"}:
         return {
             "do": "book",
             "kind": "book",
@@ -587,6 +565,53 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
             "turn": {**turn, "intent": "book", "goal": "pick_traveller"},
             "reply": "",
         }
+    # Clarify only on live booking sheets — never swallow error/pay/results routing.
+    if sheet not in {"error", "pay", "results", "loading", "unavailable"} and (
+        goal == "ask" or (intent == "status" and goal in {"ask", "", "status"})
+    ):
+        return {
+            "do": "reply",
+            "kind": "status",
+            "tap": "",
+            "turn": turn,
+            "reply": format_turn_reply(turn)
+            or (
+                "I'm on the open booking page — say what you want: click a saved name, "
+                "delete a profile, continue, or skip. Nothing paid."
+            ),
+        }
+
+    # Offline fallback when Gemini returned empty goal (no key / parse fail).
+    raw_ask = (text or "").strip()
+    gemini_alive = str(turn.get("source") or "") == "gemini" and bool(goal or intent)
+    if not gemini_alive and sheet not in {"error", "pay"}:
+        if re.search(
+            r"\b(?:delete|remove|erase|clear)\b.+\b(?:travellers?|travelers?|profiles?|names?|passengers?|duplicates?)\b"
+            r"|\bget rid of\b.+\b(?:profile|name|traveller|traveler|duplicate)\b",
+            raw_ask,
+            re.I,
+        ):
+            return {
+                "do": "book",
+                "kind": "book",
+                "tap": "__delete_traveller__",
+                "turn": {**turn, "intent": "book", "goal": "delete_traveller"},
+                "reply": "",
+            }
+        if re.search(
+            r"\b(?:click|pick|select|tick|choose|use|tap)\b.+\b(?:name|names|traveller|traveler|profile|saved|one of)\b"
+            r"|\bpick one\b|\bone of the names\b|\bsaved (?:traveller|traveler|profile)\b"
+            r"|\buse (?:the |an? )?existing\b",
+            raw_ask,
+            re.I,
+        ):
+            return {
+                "do": "book",
+                "kind": "book",
+                "tap": "__select_traveller__",
+                "turn": {**turn, "intent": "book", "goal": "pick_traveller"},
+                "reply": "",
+            }
 
     from app.page_agent import site_error_page
     from app.step_read import safe_tap
@@ -673,14 +698,20 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
 
     from app.kernel_otp import indian_national as _nat_mobile
 
-    if _nat_mobile(text or "") and (
+    # Contact VALUES in the message → details. Form sheet alone is NOT details.
+    sent_contact_value = bool(_nat_mobile(text or "")) or bool(
+        re.search(r"@|\bmale\b|\bfemale\b|\d{1,2}/\d{1,2}/\d{2,4}", text or "", re.I)
+    )
+    if sent_contact_value and (
         sheet in {"form", "passenger", "pay", "other", ""}
         or intent == "details"
+        or goal == "details"
         or str(state.get("stuck_kind") or "") in {"form", "pay", "passenger"}
     ):
         intent = "details"
+        goal = "details"
 
-    if sheet in {"form", "passenger"} or intent == "details":
+    if goal == "details" or (intent == "details" and sent_contact_value):
         if sheet in {"addons", "upsell", "review", "fare_sheet"}:
             return {
                 "do": "book",
@@ -689,7 +720,32 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
                 "turn": turn,
                 "reply": "",
             }
-        return {"do": "details", "kind": "details", "tap": tap, "turn": turn, "reply": ""}
+        return {"do": "details", "kind": "details", "tap": tap, "turn": {**turn, "goal": "details"}, "reply": ""}
+
+    # Traveller/contact sheet open but Gemini did not say details — do not invent contact-fill.
+    if sheet in {"form", "passenger"} or str(state.get("stuck_kind") or "") in {"form", "passenger"}:
+        if intent in {"book", "select"} or goal in {"forward", "skip"}:
+            from app.step_read import visible_forward
+
+            page = str(state.get("stuck_page") or "")
+            return {
+                "do": "book",
+                "kind": "book",
+                "tap": tap or visible_forward(page) or "Continue",
+                "turn": turn,
+                "reply": "",
+            }
+        return {
+            "do": "reply",
+            "kind": "status",
+            "tap": "",
+            "turn": turn,
+            "reply": format_turn_reply(turn)
+            or (
+                "Saved travellers are on screen. Say pick one, delete a profile, or send a mobile "
+                "if you want contact filled. Nothing paid."
+            ),
+        }
 
     if sheet == "pay":
         from app.search import named_seller

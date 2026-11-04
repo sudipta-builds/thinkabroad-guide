@@ -3042,6 +3042,107 @@ class SellerChoiceAndProxy(unittest.TestCase):
         under = __import__("app.travel_agent", fromlist=["_UNDERSTAND"])._UNDERSTAND
         self.assertIn("goal=pick_traveller", under)
         self.assertIn("You OWN intent", under)
+
+    def test_actionable_intent_always_maps_to_action(self) -> None:
+        """Every actionable goal/message must do something this turn — never note-only."""
+        from unittest.mock import patch
+
+        from app.turn_loop import _TURN, align_action, _message_implies_action
+
+        self.assertIn("ACTION RULE", _TURN)
+        self.assertTrue(_message_implies_action("sudipta@example.com"))
+        self.assertTrue(_message_implies_action("fill my email"))
+        self.assertTrue(_message_implies_action("pick one"))
+        self.assertTrue(_message_implies_action("continue"))
+        self.assertFalse(_message_implies_action("hmm what about that"))
+
+        base = {
+            "stage": "booking",
+            "seller": "ixigo",
+            "selected_hint": "8:55",
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "email": "old@example.com",
+            "phone": "8876233052",
+            "stuck_page": "Review Details Contact Details Please enter email Mobile Continue",
+            "last_vision": {"kind": "review"},
+        }
+        # Gemini wrongly "notes" an email → still details action.
+        noted = {
+            "goal": "ask",
+            "intent": "status",
+            "kind": "review",
+            "reply": "I have noted your email. Nothing paid.",
+            "tap": "",
+            "facts": [],
+            "source": "gemini",
+        }
+        with patch("app.turn_loop.interpret_turn", return_value=noted):
+            plan = align_action("sudipta@example.com", base)
+        self.assertEqual(plan["do"], "details")
+        with patch("app.turn_loop.interpret_turn", return_value={**noted, "kind": "form"}):
+            fill = align_action("fill my email", {**base, "last_vision": {"kind": "form"}})
+        self.assertEqual(fill["do"], "details")
+
+        # Forward / skip / pick / delete → book (never reply).
+        for goal, tap, msg in (
+            ("forward", "Continue", "go on"),
+            ("skip", "Skip add-ons", "skip"),
+            ("pick_traveller", "__select_traveller__", "pick one"),
+            ("delete_traveller", "__delete_traveller__", "delete the duplicates"),
+        ):
+            turn = {
+                "goal": goal,
+                "intent": "book",
+                "kind": "form" if "traveller" in goal else "addons",
+                "tap": "" if "traveller" in goal else tap,
+                "reply": "Okay.",
+                "facts": [],
+                "source": "gemini",
+            }
+            state = {
+                **base,
+                "stuck_kind": "form" if "traveller" in goal else "addons",
+                "last_vision": {"kind": turn["kind"]},
+                "stuck_page": (
+                    "Mr Sudhir Sethi Add New Traveller Contact Details"
+                    if "traveller" in goal
+                    else "Choose add-ons Skip add-ons Continue"
+                ),
+            }
+            with patch("app.turn_loop.interpret_turn", return_value=turn):
+                out = align_action(msg, state)
+            self.assertEqual(out["do"], "book", msg)
+            if "traveller" in goal:
+                self.assertEqual(out["tap"], tap)
+
+        # Pure status stays reply.
+        ask = {
+            "goal": "ask",
+            "intent": "status",
+            "kind": "form",
+            "reply": "Which name should I tick?",
+            "tap": "",
+            "facts": [],
+            "source": "gemini",
+        }
+        with patch("app.turn_loop.interpret_turn", return_value=ask):
+            clarify = align_action("hmm what about that", {**base, "last_vision": {"kind": "form"}})
+        self.assertEqual(clarify["do"], "reply")
+
+        # handle_turn details path must start browse (Typing…), not note-only.
+        import inspect
+
+        from app.travel_agent import _details_action_ack, handle_turn
+
+        src = inspect.getsource(handle_turn)
+        self.assertIn("_details_action_ack", src)
+        self.assertIn('args=(phone, text, state.get("busy_at"), "details")', src)
+        ack = _details_action_ack({**base, "seller": "ixigo"}, "sudipta@example.com")
+        self.assertIn("Typing your email", ack)
+        self.assertNotRegex(ack.lower(), r"\bnoted\b|\bsaved\b")
+
     def test_checkout_brain_rails_contact_not_pay_and_ready_fill(self) -> None:
         from unittest.mock import patch
 

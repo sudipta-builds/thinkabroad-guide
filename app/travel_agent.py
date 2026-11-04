@@ -477,7 +477,7 @@ def handle_turn(
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="💳")
     if do == "details":
-        # Gemini (or align) said details. Never treat pick/delete as contact-fill.
+        # Goal details → act same turn. Never treat pick/delete as contact-fill.
         turn_goal = str(turn.get("goal") or "")
         if turn_goal in {"pick_traveller", "delete_traveller"} or wants_pick_saved_traveller(text) or wants_delete_traveller(
             text
@@ -494,16 +494,25 @@ def handle_turn(
         else:
             from app.kernel_otp import indian_national as _fill_mobile
 
-            # Only type contact when THIS message carries a mobile (Gemini details + value).
-            # Saved phone alone must not trigger "Typing your mobile…" on pick-one wording.
-            if _fill_mobile(text):
-                state["phone"] = state.get("phone") or ("+91" + _fill_mobile(text))
-                state["chosen_tap"] = "Continue"
+            # absorb_details already ran in _recover_trip. Live form → fill now (intent = action).
+            mobile = _fill_mobile(text)
+            if mobile:
+                state["phone"] = state.get("phone") or ("+91" + mobile)
+            live_open = bool(state.get("live")) or str(state.get("stage") or "") in {
+                "booking",
+                "review",
+                "login",
+                "passenger",
+                "payment",
+                "form",
+            }
+            has_saved = bool(
+                state.get("email") or state.get("phone") or state.get("name") or state.get("dob") or state.get("gender")
+            )
+            if live_open and has_saved:
+                state["chosen_tap"] = tap or "Continue"
                 state.pop("stuck_kind", None)
-                spoken = (
-                    f"Typing your mobile into {_seller_label(str(state.get('seller') or 'cleartrip'))} contact. "
-                    "I won't Continue until that field sticks. Nothing paid."
-                )
+                spoken = _details_action_ack(state, text)
                 state["busy_at"] = f"{time.time():.3f}"
                 _save(phone, state)
                 threading.Thread(
@@ -520,7 +529,7 @@ def handle_turn(
                 _save(phone, state)
                 db.add_message(phone, "assistant", waiting)
                 return Reply.of(waiting, emoji="📝")
-            # Details intent without new values — fill saved profile on browse, no false mobile ack.
+            # No live page yet — keep values; fall through to book browse if mid-booking.
             kind = "book"
             state["chosen_tap"] = tap or str(state.get("chosen_tap") or "Continue")
             _save(phone, state)
@@ -1521,6 +1530,28 @@ def _form_status_reply(state: dict[str, Any]) -> str:
     )
 
 
+def _details_action_ack(state: dict[str, Any], text: str = "") -> str:
+    """Same-turn fill ack — never 'noted' / 'saved' alone when we are typing into the page."""
+    seller = _seller_label(str(state.get("seller") or "cleartrip"))
+    raw = text or ""
+    if _EMAIL.search(raw) or re.search(r"\be-?mail\b", raw, re.I):
+        return (
+            f"Typing your email into {seller} contact. "
+            "I'll fill what I have and tell you if anything is still missing. Nothing paid."
+        )
+    from app.kernel_otp import indian_national
+
+    if indian_national(raw) or re.search(r"\b(?:mobile|phone)\b", raw, re.I):
+        return (
+            f"Typing your mobile into {seller} contact. "
+            "I won't Continue until that field sticks. Nothing paid."
+        )
+    return (
+        f"Filling your details on {seller}. "
+        "I'll tell you if the page still needs something. Nothing paid."
+    )
+
+
 def _booking_ack(state: dict[str, Any], kind: str, text: str = "") -> str:
     trip = _trip_line(state) or "Guwahati to Delhi"
     hint = str(state.get("selected_hint") or _flight_hint(text) or "")
@@ -1542,7 +1573,7 @@ def _booking_ack(state: dict[str, Any], kind: str, text: str = "") -> str:
     if kind == "login":
         return f"I'll open sign-in for {trip}. If I don't have that site saved, I'll tell you what to send."
     if kind == "details":
-        return f"Saved. I'll put that on the {trip} form and tell you if the page still needs something."
+        return _details_action_ack(state, text)
     return (
         f"Booking {trip} on {seller}. I'll go through login and the passenger form, ask if a phone, email, or OTP is missing, "
         "and stop on payment with a link unless you want me to pay."

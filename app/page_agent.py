@@ -422,7 +422,8 @@ def deterministic_action(stage: str, *, hint: str, recovers: int, url: str = "")
     if stage == "fare_sheet":
         return {"action": "click", "target": "Continue", "value": ""}
     if stage == "review":
-        return {"action": "review_continue", "target": "Continue", "value": ""}
+        # Handler reads the sheet: fill a visible empty field we have, then its real button.
+        return {"action": "review_continue", "target": "", "value": ""}
     if stage == "login":
         return {"action": "login_phone", "target": "Continue", "value": ""}
     if stage == "passenger":
@@ -3526,6 +3527,19 @@ def fill_profile_slots(page, profile: dict, *, keys: tuple[str, ...] = ("email",
     return [f"{key}:{status}" for key, status in notes.items()]
 
 
+def type_saved_contact(page, profile: dict) -> list[str]:
+    """Type email or mobile only when that value is already saved or just sent."""
+    from app.step_read import is_contact_form
+
+    text, _url = _read(page)
+    if not is_contact_form(text or ""):
+        return []
+    keys = tuple(key for key in ("email", "phone") if str((profile or {}).get(key) or "").strip())
+    if not keys:
+        return []
+    return fill_profile_slots(page, profile, keys=keys)
+
+
 def contact_report(notes: str, page: str) -> str:
     """WhatsApp line from the fill log and the page after the attempt."""
     blob = notes or ""
@@ -4156,6 +4170,39 @@ def run_checkout_agent(
                 "This step took too long, so I stopped and sent the page. Nothing paid."
             )
             return CheckoutOutcome(stage, text, url, log, facts=facts, checks=checks, handoff=handoff)
+        # Act from this sheet: ask for an empty field we lack, type one we have, then click its button.
+        from app.step_read import decide_sheet
+
+        sheet_move = decide_sheet(text, profile)
+        if sheet_move.get("action") == "ask" and sheet_move.get("missing"):
+            fields = " and ".join(str(item) for item in sheet_move["missing"])
+            handoff = (
+                f"The open page needs your {fields} before I press a button. "
+                "Send it and I'll type it in. Nothing paid."
+            )
+            return CheckoutOutcome("passenger", text, url, log, facts=facts, checks=checks, handoff=handoff)
+        if sheet_move.get("action") == "fill":
+            keys = tuple(str(item) for item in (sheet_move.get("fills") or []) if str(item) in {"email", "phone", "name", "dob"})
+            typed = fill_profile_slots(page, profile, keys=keys or ("email", "phone"))
+            log.extend(typed)
+            text, url, stage, facts = _snapshot()
+            email_state = _field_state(typed, "email")
+            if email_state and email_state not in {"ok", "typed", "none"}:
+                log.append("contact_email_miss")
+                handoff = contact_report(" | ".join(typed), text) or (
+                    "A field on this page did not stick. Nothing paid."
+                )
+                return CheckoutOutcome(
+                    "passenger", text, url, log, facts=facts, checks=checks, handoff=handoff
+                )
+            sheet_move = decide_sheet(text, profile)
+        if (
+            sheet_move.get("action") == "click"
+            and sheet_move.get("tap")
+            and not tap_pending
+            and stage not in {"results", "loading", "pay", "otp", "home"}
+        ):
+            tap_pending = str(sheet_move["tap"])
         # A named button is clicked before any add-ons shortcut. Review is not Choose add-ons.
         if tap_pending and not tap_pending.startswith("__"):
             from app.step_read import form_sheet
@@ -4172,6 +4219,21 @@ def run_checkout_agent(
                 _leave_addons(page, log, rounds=2)
                 continue
             elif re.search(r"\b(confirm|continue|proceed)\b", tap_pending, re.I):
+                # Contact sheet: type a saved/just-sent email before Continue, or Ixigo stays put.
+                typed = type_saved_contact(page, profile)
+                if typed:
+                    log.extend(typed)
+                    email_state = _field_state(typed, "email")
+                    if email_state and email_state not in {"ok", "typed"}:
+                        log.append("contact_email_miss")
+                        tap_pending = ""
+                        text, url, stage, facts = _snapshot()
+                        handoff = contact_report(" | ".join(typed), text) or (
+                            "The email did not stick in the contact box. Nothing paid."
+                        )
+                        return CheckoutOutcome(
+                            "passenger", text, url, log, facts=facts, checks=checks, handoff=handoff
+                        )
                 # Ground to visible control; if sheet stuck, retry Confirm↔Continue once.
                 hit = advance_forward_control(page, tap_pending, kind=stage)
                 # Keep user_tap_continue for Continue; note Confirm/Proceed retries as forward.
@@ -4630,8 +4692,13 @@ def run_checkout_agent(
                     page.wait_for_timeout(400)
                 except Exception:
                     pass
-            # One accurate click per attempt. A miss can be retried; Pay is never clicked.
-            moved = _js_continue(page) or _safe_continue(page)
+            # One accurate click per attempt. Press the label on this sheet, else _safe_continue(page).
+            from app.step_read import forward_tap
+
+            label = forward_tap(text or "")
+            moved = bool(advance_forward_control(page, label, kind="review")) if label else False
+            if not moved:
+                moved = _js_continue(page) or _safe_continue(page)
             log.append(f"continue_click:{int(bool(moved))}")
             if not moved:
                 try:

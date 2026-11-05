@@ -1635,9 +1635,11 @@ class SellerChoiceAndProxy(unittest.TestCase):
             classify_page(ixigo_review, "https://www.ixigo.com/flight/booking/review"),
             "review",
         )
-        from app.step_read import accept_choice, is_name_confirm
+        from app.step_read import accept_choice, is_contact_form, is_name_confirm
 
-        self.assertTrue(is_name_confirm(ixigo_review))
+        # Fare summary + billing address is review, not a govt-id name check.
+        self.assertFalse(is_name_confirm(ixigo_review))
+        self.assertFalse(is_contact_form(ixigo_review))
         self.assertEqual(
             accept_choice(
                 "confirm",
@@ -1645,7 +1647,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
             ),
             "Continue",
         )
-        # Stuck reply must stay on name_confirm, not "fare list".
+        # Stuck reply must stay off the fare list.
         from app.travel_agent import _booking_page_reply
 
         class _Fake:
@@ -1664,9 +1666,109 @@ class SellerChoiceAndProxy(unittest.TestCase):
             ixigo_review,
             _Fake(),  # type: ignore[arg-type]
         )
-        self.assertIn("name check", spoken.lower())
+        self.assertNotIn("name check", spoken.lower())
         self.assertNotIn("fare list", spoken.lower())
-        self.assertRegex(spoken, r"Confirm|Continue")
+        self.assertRegex(spoken, r"Continue")
+        contact = (
+            "Review & Traveller Details Contact Details Please enter valid email address "
+            "Email Mobile Number Pincode GST Details Billing Address Continue Total Amount ₹9,425"
+        )
+        self.assertTrue(is_contact_form(contact))
+        self.assertFalse(is_name_confirm(contact))
+        contact_spoken = _booking_page_reply(
+            {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-12-04",
+                "seller": "ixigo",
+                "selected_hint": "8:55",
+                "email": "sudiptasaikia6@gmail.com",
+                "last_vision": {"kind": "review", "tap": "Confirm", "controls": ["Confirm"]},
+            },
+            "8:55",
+            contact,
+            _Fake(),  # type: ignore[arg-type]
+        )
+        self.assertIn("contact", contact_spoken.lower())
+        self.assertNotIn("name check", contact_spoken.lower())
+        self.assertNotIn("wants Confirm", contact_spoken)
+        self.assertIn("sudiptasaikia6@gmail.com", contact_spoken)
+        self.assertIn("I'll type", contact_spoken)
+        bare = _booking_page_reply(
+            {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-12-04",
+                "seller": "ixigo",
+                "selected_hint": "8:55",
+            },
+            "8:55",
+            contact,
+            _Fake(),  # type: ignore[arg-type]
+        )
+        self.assertIn("send your email", bare.lower())
+        self.assertNotIn("I'll press Continue", bare)
+        from app.step_read import decide_sheet
+
+        self.assertEqual(
+            decide_sheet(contact, {"email": "sudiptasaikia6@gmail.com"}).get("action"),
+            "fill",
+        )
+        self.assertEqual(decide_sheet(contact, {}).get("action"), "ask")
+        self.assertIn("email", decide_sheet(contact, {}).get("missing") or [])
+        fare_list = "IndiGo 08:55 Book ₹9,100 Air India 13:15 Book ₹9,400 SpiceJet 18:20 Book ₹8,900"
+        self.assertEqual(decide_sheet(fare_list, {}).get("action"), "pick")
+        addons = "Choose add-ons No meal selected Skip add-ons"
+        self.assertEqual(decide_sheet(addons, {}).get("action"), "click")
+        self.assertIn("Skip", str(decide_sheet(addons, {}).get("tap") or ""))
+        named = "Add traveller details First & middle name Last name Continue"
+        self.assertEqual(decide_sheet(named, {}).get("action"), "ask")
+        self.assertIn("full name", decide_sheet(named, {}).get("missing") or [])
+        ready = decide_sheet("Review your itinerary Fare summary Continue", {"email": "a@b.co"})
+        self.assertEqual(ready.get("action"), "click")
+        self.assertEqual(ready.get("tap"), "Continue")
+
+    def test_sheet_decides_fill_ask_or_click(self) -> None:
+        """Continue follows the open sheet: ask, fill, or the visible button. Never a stage default."""
+        from app.step_read import decide_sheet
+        from app.turn_loop import align_action
+
+        base = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "ixigo",
+            "selected_hint": "8:55",
+            "stage": "booking",
+            "last_vision": {"kind": "review"},
+        }
+        contact = (
+            "Review & Traveller Details Contact Details Please enter valid email address "
+            "Email Mobile Number Continue"
+        )
+        asked = align_action("continue", {**base, "stuck_page": contact, "stuck_kind": "review"})
+        self.assertEqual(asked["do"], "reply")
+        self.assertIn("email", asked["reply"].lower())
+        self.assertNotEqual(asked.get("tap"), "Continue")
+
+        filled = align_action(
+            "continue",
+            {**base, "stuck_page": contact, "stuck_kind": "review", "email": "a@b.co"},
+        )
+        self.assertEqual(filled["do"], "details")
+        self.assertEqual(decide_sheet(contact, {"email": "a@b.co"})["action"], "fill")
+
+        review = "Review your itinerary Fare summary Continue"
+        clicked = align_action("continue", {**base, "stuck_page": review, "stuck_kind": "review"})
+        self.assertEqual(clicked["do"], "book")
+        self.assertEqual(clicked.get("tap"), "Continue")
+
+        pay = align_action(
+            "continue",
+            {**base, "stuck_page": "Pay to complete your booking Pay now", "stuck_kind": "pay", "stage": "payment"},
+        )
+        self.assertEqual(pay["do"], "reply")
+        self.assertNotIn("pay now", (pay.get("tap") or "").lower())
 
     def test_after_book_follow_through_is_wired(self) -> None:
         import inspect

@@ -3140,6 +3140,27 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             "the next control is Continue on this page",
             f"I'll press {tap}",
         )
+    from app.step_read import decide_sheet, is_contact_form
+
+    if shown not in {"error", "unavailable", "pay", "otp", "login"} and is_contact_form(page or ""):
+        move = decide_sheet(page or "", state)
+        email_error = bool(re.search(r"please enter (?:a )?valid email", page or "", re.I))
+        # A generic contact step with a non-Indian mobile still uses the +91 reply below.
+        if move.get("action") == "fill" or (move.get("action") == "ask" and email_error):
+            visible = str(move.get("tap") or "") or "the button on this page"
+            if move.get("action") == "ask":
+                fields = " and ".join(str(item) for item in (move.get("missing") or []))
+                nxt = f"send your {fields} — that box is empty, so I won't press {visible}"
+            else:
+                saved_email = str(state.get("email") or "").strip()
+                nxt = f"I'll type {saved_email} into the email box, then press {visible}"
+            return _stuck_line(
+                state,
+                "form",
+                f"{seller} contact details for the {which}",
+                "this is the email and mobile step, not a name Confirm and not payment",
+                nxt,
+            )
     if shown not in {"error", "unavailable", "pay", "otp", "login"} and (
         shown == "review" or re.search(r"\breview details\b", page or "", re.I)
     ):
@@ -3156,7 +3177,7 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
                 or forward_tap(page or "")
                 or ("Confirm" if re.search(r"\bconfirm\b", page or "", re.I) else "Continue")
             )
-            if is_name_confirm(page or "") or re.search(r"\breview details\b", page or "", re.I):
+            if is_name_confirm(page or ""):
                 arm_pending_step(
                     state,
                     page or "",

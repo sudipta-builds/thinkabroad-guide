@@ -128,18 +128,141 @@ def is_paid_upsell(page: str) -> bool:
     return bool(re.search(r"secure my trip|buy this|assure my trip|no,?\s*thanks", hay, re.I))
 
 
-def is_name_confirm(page: str) -> bool:
-    """Name check / Review Details sheet (Confirm or Continue). Not payment."""
+def is_contact_form(page: str) -> bool:
+    """Ixigo/Cleartrip contact step: email, mobile, billing. Not a name-check Confirm."""
     hay = page or ""
-    if not re.search(r"\b(?:confirm|continue)\b", hay, re.I):
-        return False
+    if re.search(r"matches your (govt|name)|govt\.?\s*id|aadhaar|driver.?s license", hay, re.I):
+        if not re.search(r"contact details|please enter (?:a )?valid email", hay, re.I):
+            return False
     return bool(
         re.search(
-            r"review details|govt\.?\s*id|aadhaar|matches your (govt|name)|driver.?s license|billing address",
+            r"contact details|please enter (?:a )?valid email|enter your email|e-?mail address",
             hay,
             re.I,
         )
     )
+
+
+def is_name_confirm(page: str) -> bool:
+    """Name check sheet (govt-id / Confirm). Not the contact form and not payment."""
+    hay = page or ""
+    if is_contact_form(hay):
+        return False
+    if not re.search(r"\b(?:confirm|continue)\b", hay, re.I):
+        return False
+    return bool(
+        re.search(
+            r"govt\.?\s*id|aadhaar|matches your (govt|name)|driver.?s license|please ensure that your name",
+            hay,
+            re.I,
+        )
+    )
+
+
+def _fare_list_sheet(page: str) -> bool:
+    """Several flights with Book. Not a contact form, add-ons, or one review sheet."""
+    hay = page or ""
+    if (
+        is_contact_form(hay)
+        or is_name_confirm(hay)
+        or on_review_itinerary(hay)
+        or addons_sheet(hay)
+        or re.search(r"\breview details\b", hay, re.I)
+    ):
+        return False
+    times = set(re.findall(r"\b\d{1,2}:\d{2}\b", hay))
+    books = len(re.findall(r"\bBook\b", hay))
+    return len(times) >= 2 and books >= 2
+
+
+def _sheet_fields(page: str, facts: dict) -> tuple[list[str], list[str]]:
+    """Empty fields this sheet is showing. missing = we lack the value. fills = we can type it."""
+    hay = page or ""
+    missing: list[str] = []
+    fills: list[str] = []
+    formish = bool(
+        is_contact_form(hay)
+        or re.search(
+            r"add contact|contact details|add traveller|first name|first\s*&\s*middle|please enter",
+            hay,
+            re.I,
+        )
+    )
+    if not formish:
+        return missing, fills
+    email = str(facts.get("email") or "").strip()
+    if is_contact_form(hay) or re.search(r"e-?mail", hay, re.I):
+        on_page = bool(email) and email.lower() in hay.lower()
+        blocked = bool(re.search(r"please enter (?:a )?valid email", hay, re.I)) or (
+            is_contact_form(hay) and not on_page
+        )
+        if not email:
+            missing.append("email")
+        elif blocked:
+            fills.append("email")
+    phone = re.sub(r"\D", "", str(facts.get("phone") or ""))
+    if re.search(r"please enter (?:a )?(?:valid )?(?:mobile|phone)", hay, re.I):
+        if len(phone) < 10:
+            missing.append("mobile")
+        elif phone[-10:] not in re.sub(r"\D", "", hay):
+            fills.append("phone")
+    if re.search(r"first\s*(?:&|and)\s*middle|first name|last name \(surname\)|traveller name", hay, re.I):
+        name = str(facts.get("name") or "").strip()
+        if not name:
+            missing.append("full name")
+        elif name.lower() not in hay.lower():
+            fills.append("name")
+    if re.search(r"date of birth|\bdob\b", hay, re.I):
+        dob = str(facts.get("dob") or "").strip()
+        if not dob:
+            missing.append("date of birth")
+        elif dob.lower() not in hay.lower():
+            fills.append("dob")
+    return missing, fills
+
+
+def decide_sheet(page: str, profile: dict | None = None) -> dict[str, object]:
+    """One rule for every sheet: fill, ask, reply, or click whatever is actually on it.
+
+    A page type does not choose the button. Pay, a fare list, and paid extras are rails.
+    """
+    empty: dict[str, object] = {"action": "none", "tap": "", "missing": [], "fills": []}
+    hay = page or ""
+    facts = profile or {}
+    if not hay.strip():
+        return empty
+    if re.search(r"pay to complete|enter card number|\bpay now\b", hay, re.I):
+        return {**empty, "action": "stop"}
+    if re.search(r"enter otp|otp sent|verify your mobile", hay, re.I):
+        return {**empty, "action": "reply", "missing": ["the SMS code"]}
+    if re.search(r"no longer available|sold out|search again", hay, re.I) and re.search(
+        r"search again|no longer available|sold out", hay, re.I
+    ):
+        tap = safe_tap("Search Again", hay)
+        return {**empty, "action": "reply", "tap": tap}
+    if _fare_list_sheet(hay):
+        return {**empty, "action": "pick"}
+    if is_paid_upsell(hay):
+        return {**empty, "action": "ask", "tap": decline_tap(hay)}
+    if addons_sheet(hay):
+        tap = visible_forward(hay)
+        if tap:
+            return {**empty, "action": "click", "tap": tap}
+    missing, fills = _sheet_fields(hay, facts)
+    tap = ""
+    if is_name_confirm(hay):
+        tap = ground_tap("", page=hay, kind="name_confirm") or forward_tap(hay)
+    elif is_contact_form(hay) or form_sheet(hay):
+        tap = forward_tap(hay)
+    else:
+        tap = forward_tap(hay) or decline_tap(hay)
+    if missing:
+        return {"action": "ask", "tap": "", "missing": missing, "fills": fills}
+    if fills:
+        return {"action": "fill", "tap": tap, "missing": [], "fills": fills}
+    if tap:
+        return {"action": "click", "tap": tap, "missing": [], "fills": []}
+    return empty
 
 
 def forward_tap(page: str) -> str:
@@ -219,10 +342,17 @@ def ground_tap(
         for label in parse_control_labels(page):
             if label.lower() not in {p.lower() for p in pool}:
                 pool.append(label)
+    def _shown(label: str) -> bool:
+        if not page:
+            return True
+        if any(label.lower() == item.lower() for item in parse_control_labels(page)):
+            return True
+        return label.lower() in re.sub(r"\s+", " ", page).lower()
+
     want = re.sub(r"\s+", " ", (preferred or "").strip())
     if want and not _SPEND.search(want):
         for label in pool:
-            if label.lower() == want.lower():
+            if label.lower() == want.lower() and _shown(label):
                 return label
         hit = safe_tap(want, page) if page else ""
         if hit:

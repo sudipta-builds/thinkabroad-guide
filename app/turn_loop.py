@@ -1036,13 +1036,56 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
         if goal == "details":
             return _plan(do="details", kind="details", tap=tap, turn=turn, goal="details", intent="details")
 
+    from app.step_read import decide_sheet
+
+    sheet_move = decide_sheet(str(state.get("stuck_page") or ""), state)
+    # Only the open sheet. A new time, seller, or login is a different request.
+    on_this_sheet = goal in {"forward", "skip", "details"} or bool(
+        re.search(r"\b(?:continue|go on|yes|yeah|ok|okay|confirm)\b", text or "", re.I)
+    )
+    if on_this_sheet and sheet_move.get("action") in {"ask", "reply", "stop"}:
+        if sheet_move.get("action") == "stop":
+            fields = "payment"
+            reply = "This is the payment page. I won't press Pay unless you say pay with card or you'll pay yourself. Nothing paid."
+        elif sheet_move.get("missing"):
+            fields = " and ".join(str(item) for item in sheet_move["missing"])
+            reply = (
+                f"The open page needs your {fields} before I press a button. "
+                "Send it and I'll type it in. Nothing paid."
+            )
+        elif sheet_move.get("tap"):
+            reply = f"The page is blocked. Reply if you want me to press {sheet_move['tap']}. Nothing paid."
+        else:
+            reply = "Tell me which flight time you want. I won't press a button that isn't the next step. Nothing paid."
+        return _plan(do="reply", kind="form", turn=turn, goal="ask", intent="details", reply=reply)
+    if on_this_sheet and sheet_move.get("action") == "fill":
+        return _plan(
+            do="details",
+            kind="details",
+            tap=str(sheet_move.get("tap") or ""),
+            turn=turn,
+            goal="details",
+            intent="details",
+        )
+    if on_this_sheet and sheet_move.get("action") == "click" and sheet_move.get("tap") and goal != "details":
+        return _plan(
+            do="book",
+            kind="book",
+            tap=str(sheet_move["tap"]),
+            turn=turn,
+            goal="skip" if goal == "skip" else "forward",
+            intent="book",
+        )
+
     if sheet in {"addons", "upsell", "review", "fare_sheet"}:
         if goal == "ask" and not _message_implies_action(text):
             return _plan(do="reply", kind="status", tap=tap, turn=turn, goal="ask", intent="status", reply=format_turn_reply(turn))
         from app.step_read import visible_forward
 
         page = stuck_page
-        if re.search(r"\bcontinue\b", text or "", re.I):
+        if sheet_move.get("action") == "pick":
+            tap = ""
+        elif re.search(r"\bcontinue\b", text or "", re.I) and re.search(r"\bcontinue\b", page or "", re.I):
             tap = "Continue"
         else:
             grounded = visible_forward(page, text) or visible_forward(page, tap)
@@ -1052,7 +1095,7 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
                 tap = visible_forward(page) or ""
             elif sheet == "addons" and not tap:
                 tap = ""
-            elif not tap:
+            elif not tap and sheet_move.get("action") != "pick":
                 tap = "Continue"
         g = "skip" if goal == "skip" or re.search(r"\bskip\b", text or "", re.I) else "forward"
         return _plan(do="book", kind="book", tap=tap, turn=turn, goal=g, intent="book")

@@ -2329,7 +2329,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
             "stuck_page": "Pay to complete your booking Scan QR code Pay now ₹10,039",
             "last_vision": {"kind": "pay", "what": "payment page", "tap": "", "seller": "cleartrip"},
         }
-        self.assertEqual(align_action("yes", dict(pay))["do"], "pay_stop")
+        self.assertEqual(align_action("yes", dict(pay))["do"], "pay_ask")
         ixigo = align_action("6:20 PM on Ixigo", dict(pay))
         self.assertEqual(ixigo["do"], "book")
         self.assertEqual(ixigo.get("tap") or "", "")
@@ -2339,6 +2339,13 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(logged.get("kernel_auth_mode"), "login")
         price = align_action("what's the price on Ixigo", dict(pay))
         self.assertEqual(price["do"], "search")
+        # Intent first: fare-compare wording must leave pay — never pay_ask/pay_stop.
+        compare = align_action(
+            "I would like to check all the fares for all the different sites in cleartrip",
+            dict(pay),
+        )
+        self.assertEqual(compare["do"], "search")
+        self.assertTrue(compare.get("aligned", True))
         self.assertEqual(infer_intent(pay, "I'd like to login"), "login")
         self.assertEqual(infer_intent(pay, "how much on ixigo"), "search")
         self.assertEqual(_coerce_kind("6:20 on Ixigo", "select", pay), "book")
@@ -3047,13 +3054,19 @@ class SellerChoiceAndProxy(unittest.TestCase):
         """Every actionable goal/message must do something this turn — never note-only."""
         from unittest.mock import patch
 
-        from app.turn_loop import _TURN, align_action, _message_implies_action
+        from app.turn_loop import _TURN, _GOAL_DO, _align_ok, align_action, _message_implies_action
 
+        self.assertIn("INTENT FIRST", _TURN)
         self.assertIn("ACTION RULE", _TURN)
+        self.assertTrue(_align_ok("search", "search"))
+        self.assertFalse(_align_ok("search", "pay_ask"))
+        self.assertTrue(_align_ok("pay", "pay_ask"))
+        self.assertIn("pay", _GOAL_DO)
         self.assertTrue(_message_implies_action("sudipta@example.com"))
         self.assertTrue(_message_implies_action("fill my email"))
         self.assertTrue(_message_implies_action("pick one"))
         self.assertTrue(_message_implies_action("continue"))
+        self.assertTrue(_message_implies_action("check all the fares for all the different sites"))
         self.assertFalse(_message_implies_action("hmm what about that"))
 
         base = {
@@ -3142,6 +3155,32 @@ class SellerChoiceAndProxy(unittest.TestCase):
         ack = _details_action_ack({**base, "seller": "ixigo"}, "sudipta@example.com")
         self.assertIn("Typing your email", ack)
         self.assertNotRegex(ack.lower(), r"\bnoted\b|\bsaved\b")
+
+        # Bot payment: ask for UPI, or fill when UPI is sent — never ignore fare-compare.
+        from app.travel_agent import _pay_ask_reply
+
+        pay_state = {
+            **base,
+            "stage": "payment",
+            "stuck_kind": "pay",
+            "seller": "cleartrip",
+            "last_vision": {"kind": "pay"},
+            "stuck_page": "Pay to complete your booking UPI Pay now",
+        }
+        with patch(
+            "app.turn_loop.interpret_turn",
+            return_value={"goal": "pay", "intent": "pay", "kind": "pay", "reply": "", "tap": "", "facts": [], "source": "gemini"},
+        ):
+            ask = align_action("yes", pay_state)
+        self.assertEqual(ask["do"], "pay_ask")
+        ask_line = _pay_ask_reply(pay_state)
+        self.assertIn("UPI", ask_line)
+        with patch(
+            "app.turn_loop.interpret_turn",
+            return_value={"goal": "pay", "intent": "pay", "kind": "pay", "reply": "", "tap": "", "facts": [], "source": "gemini"},
+        ):
+            fill = align_action("pay with UPI name@ybl", pay_state)
+        self.assertEqual(fill["do"], "pay")
 
     def test_checkout_brain_rails_contact_not_pay_and_ready_fill(self) -> None:
         from unittest.mock import patch

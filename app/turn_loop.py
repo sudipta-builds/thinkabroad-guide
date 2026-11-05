@@ -1,6 +1,7 @@
-"""One Gemini turn: user wish + live screenshot → goal, recommend, tap.
+"""One Gemini turn: user wish + live screenshot → goal, then code maps goal → do.
 
-DeepSeek is not used here. Rails stay code: never pay, never invent a button.
+Pipeline: intent first → propose action → align gate → execute only if they match.
+DeepSeek is not used here. Rails stay code: never invent a button; pay only when authorized.
 """
 
 from __future__ import annotations
@@ -15,27 +16,33 @@ _TURN = (
     "You are Guide on WhatsApp. You get ONE traveller message and optionally a screenshot "
     "of the live Indian flight-booking page (Cleartrip/Ixigo/EaseMyTrip).\n"
     "Understand what they want. Look at the screenshot if present — that is the current step.\n"
-    "Rails: never pay; never tap Pay/Buy/Secure/Assure/Insure; never invent a button or a flight.\n"
+    "Rails: never invent a button or a flight. Tap Pay/Buy only when they explicitly authorize payment "
+    "(pay with UPI/card / fill payment / pay now) — otherwise stop on the pay sheet and ask.\n"
+    "INTENT FIRST: decide goal from the USER MESSAGE. Screenshot kind is context only — "
+    "being on a pay sheet must NOT force goal=pay if they asked to search/compare/leave.\n"
     "Return JSON only:\n"
-    '{"goal":"skip|forward|ask|stop|pay|search|details|pick_traveller|delete_traveller",'
+    '{"goal":"skip|forward|ask|stop|pay|pay_self|search|details|pick_traveller|delete_traveller",'
     '"intent":"search|select|book|login|details|pay|pay_self|cancel|status|chat",'
     '"kind":"upsell|form|login|otp|review|results|pay|unavailable|addons|other",'
     '"what":"","why":"","recommend":"","tap":"","auto":false,"reply":"","facts":[]}\n'
     "goal=ask (intent=status) when they ask which step, what to do next, check, or what you see. "
     "Name the screenshot and recommend the safe next tap.\n"
-    "goal=forward (intent=book) when they confirm the flight, continue, go on, or yes to your last rec.\n"
+    "goal=forward (intent=book) when they confirm the flight, continue, go on, or yes to your last rec "
+    "(not bare yes on a payment sheet — that is ask or pay).\n"
     "goal=skip (intent=book) when they skip extras.\n"
     "goal=pick_traveller (intent=book) when they want an existing saved name ticked — ANY wording "
     "(pick one, click a name, use saved, that person, whoever is listed). tap empty; "
     "do NOT fill contact mobile; do NOT create a new traveller; do NOT use goal=details.\n"
     "goal=delete_traveller (intent=book) when they want a saved profile removed "
-    "(delete/remove/clear duplicates) — tap empty; never pay.\n"
+    "(delete/remove/clear duplicates) — tap empty.\n"
     "goal=details ONLY when they send passenger/contact VALUES (phone/email/name/DOB/gender) "
     "OR ask you to fill/type a saved contact field — not when they ask to click a traveller name.\n"
-    "ACTION RULE: goal details|forward|skip|pick_traveller|delete_traveller|search means the app "
-    "ACTS this turn (fill / click / open / delete). reply must name that action "
-    "(Typing your email… / Clicking Continue… / Opening… / Removing…). "
-    "Never reply with noted, saved, I'll remember, or Got it alone when an action goal applies.\n"
+    "goal=search when they want fares / prices / other sites / compare — even if the screenshot is pay.\n"
+    "goal=pay when they want YOU to fill/pay (UPI ID, card, CVV, pay with UPI/card, authorize pay).\n"
+    "goal=pay_self when they will pay on the link themselves.\n"
+    "ACTION RULE: goal details|forward|skip|pick_traveller|delete_traveller|search|pay means the app "
+    "ACTS this turn. reply must name that action (Typing… / Opening… / Checking fares… / "
+    "Asking for UPI…). Never reply with noted/saved alone when an action goal applies.\n"
     "goal=ask ONLY for pure status / unclear messages with NO page action this turn.\n"
     "If the screenshot is NOT Choose add-ons / seat map / missed-meals, do not recommend Skip add-ons.\n"
     "If the screenshot is an optional paid extra (flexibility, protect, cancellation, insurance), "
@@ -556,10 +563,65 @@ def _wants_fill_field(text: str) -> bool:
     )
 
 
+def _wants_fare_compare(text: str) -> bool:
+    """Check / compare fares across sites — even from a payment sheet."""
+    raw = text or ""
+    if not re.search(
+        r"\b(?:prices?|fares?|costs?|how much|cheaper|compare|rates?)\b"
+        r"|\bcheck (?:all )?(?:the )?(?:fares?|prices?)\b",
+        raw,
+        re.I,
+    ):
+        return False
+    from app.search import named_seller
+
+    return bool(
+        named_seller(raw)
+        or re.search(
+            r"\b(?:another|other|different|all)\s+(?:sites?|sellers?|services?)\b"
+            r"|\bacross (?:sites?|sellers?)\b",
+            raw,
+            re.I,
+        )
+    )
+
+
+def _wants_bot_pay(text: str) -> bool:
+    raw = text or ""
+    from app.browser_hands import looks_like_card
+
+    if re.search(
+        r"\b(?:pay with (?:upi|card|debit|credit)|fill (?:my )?(?:upi|card|payment)|"
+        r"use (?:my )?(?:upi|card)|pay (?:it |for me|now)|authorize pay|go ahead and pay)\b"
+        r"|\b(?:upi id|vpa)\b",
+        raw,
+        re.I,
+    ):
+        return True
+    if re.search(
+        r"\b([a-z0-9.\-_]{2,}@(?:okaxis|okhdfcbank|okicici|oksbi|ybl|paytm|ibl|axl|apl|upi))\b",
+        raw,
+        re.I,
+    ):
+        return True
+    return bool(looks_like_card(raw) or re.search(r"\b(?:cvv|cvc)\s*[:\-]?\s*\d{3,4}\b", raw, re.I))
+
+
+def _wants_pay_self(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:pay (?:myself|yourself|on (?:the )?link|on my own)|i'?ll pay|"
+            r"send (?:me )?(?:the )?link|i will pay)\b",
+            text or "",
+            re.I,
+        )
+    )
+
+
 def _message_implies_action(text: str) -> bool:
     """True when the user message itself asks for a page action this turn."""
     raw = text or ""
-    if _contact_value_in(raw) or _wants_fill_field(raw):
+    if _contact_value_in(raw) or _wants_fill_field(raw) or _wants_fare_compare(raw) or _wants_bot_pay(raw) or _wants_pay_self(raw):
         return True
     if re.search(
         r"\b(?:delete|remove|erase|clear)\b.+\b(?:travellers?|travelers?|profiles?|names?|passengers?|duplicates?)\b"
@@ -580,123 +642,229 @@ def _message_implies_action(text: str) -> bool:
 
 def _contact_sheet_open(sheet: str, state: dict[str, Any]) -> bool:
     page = str(state.get("stuck_page") or "")
-    return bool(
-        sheet in {"form", "passenger", "review", "other", "", "pay"}
-        or str(state.get("stuck_kind") or "") in {"form", "pay", "passenger", "review", "name_confirm"}
-        or re.search(
+    contact_copy = bool(
+        re.search(
             r"please enter (?:an? )?(?:email|mobile)|contact details|add contact|traveller details",
             page,
             re.I,
         )
     )
+    # Real pay sheet is not contact — unless the page still shows contact fields.
+    if sheet == "pay" or str(state.get("stuck_kind") or "") == "pay":
+        return contact_copy
+    return bool(
+        sheet in {"form", "passenger", "review", "other", ""}
+        or str(state.get("stuck_kind") or "") in {"form", "passenger", "review", "name_confirm"}
+        or contact_copy
+    )
+
+
+# Intent → allowed do values. Align gate fails if proposed do is outside this set.
+_GOAL_DO: dict[str, set[str]] = {
+    "details": {"details"},
+    "forward": {"book"},
+    "skip": {"book"},
+    "pick_traveller": {"book"},
+    "delete_traveller": {"book"},
+    "search": {"search"},
+    "select": {"book"},
+    "login": {"book"},
+    "ask": {"reply", "ask_trip", "pay_ask"},
+    "stop": {"reply"},
+    "pay": {"pay", "pay_ask"},
+    "pay_self": {"pay_self"},
+    "cancel": {"reply"},
+    "status": {"reply", "pay_ask"},
+    "chat": {"reply"},
+    "book": {"book"},
+}
+
+
+def _align_ok(goal: str, do: str) -> bool:
+    allowed = _GOAL_DO.get(goal)
+    if not allowed:
+        return True
+    return do in allowed
+
+
+def _intent_first(text: str, state: dict[str, Any], turn: dict[str, Any]) -> tuple[str, str]:
+    """User message wins over screenshot-biased Gemini goals."""
+    goal = str(turn.get("goal") or "").strip().lower()
+    intent = str(turn.get("intent") or "").strip().lower()
+    raw = (text or "").strip()
+    tap = str(turn.get("tap") or "")
+    vision = state.get("last_vision") if isinstance(state.get("last_vision"), dict) else {}
+    on_pay = (
+        str(turn.get("kind") or vision.get("kind") or state.get("stuck_kind") or "") == "pay"
+        or str(state.get("stage") or "") == "payment"
+    )
+
+    if re.search(r"\b(?:stop|cancel|never mind)\b", raw, re.I) and not re.search(r"\bbook\b", raw, re.I):
+        return "stop", "cancel"
+    if _wants_pay_self(raw) or intent == "pay_self" or goal == "pay_self":
+        return "pay_self", "pay_self"
+    if _wants_fare_compare(raw) or wants_fresh_search(raw):
+        return "search", "search"
+    if _wants_bot_pay(raw):
+        return "pay", "pay"
+    # Bare yes/ok on the pay sheet = payment handoff options, not Continue/Book.
+    if on_pay and re.fullmatch(r"yes|yep|yeah|ok|okay|sure", raw, re.I):
+        return "pay", "pay"
+    if re.search(
+        r"\b(?:delete|remove|erase|clear)\b.+\b(?:travellers?|travelers?|profiles?|names?|passengers?|duplicates?)\b"
+        r"|\bget rid of\b.+\b(?:profile|name|traveller|traveler|duplicate)\b",
+        raw,
+        re.I,
+    ) or goal == "delete_traveller" or tap in {"__delete_traveller__", "__remove_traveller__"}:
+        return "delete_traveller", "book"
+    if re.search(
+        r"\b(?:click|pick|select|tick|choose|use|tap)\b.+\b(?:name|names|traveller|traveler|profile|saved|one of)\b"
+        r"|\bpick one\b|\bone of the names\b|\bsaved (?:traveller|traveler|profile)\b"
+        r"|\buse (?:the |an? )?existing\b",
+        raw,
+        re.I,
+    ) or goal == "pick_traveller" or tap in {"__select_traveller__", "__pick_traveller__"}:
+        return "pick_traveller", "book"
+    if _contact_value_in(raw) or _wants_fill_field(raw) or goal == "details" or intent == "details":
+        # Passenger values beat a stale pay intent from the screenshot.
+        return "details", "details"
+    if goal in {"forward", "skip"} or intent in {"book", "select"}:
+        if re.search(r"\b(?:continue|go on|skip(?:\s+add)?|confirm|book it|book this)\b", raw, re.I) or goal in {
+            "forward",
+            "skip",
+        }:
+            return ("skip" if goal == "skip" or re.search(r"\bskip\b", raw, re.I) else "forward"), "book"
+    if goal == "search" or intent == "search":
+        return "search", "search"
+    if goal == "login" or intent == "login":
+        return "login", "book"
+    if goal == "pay" or intent == "pay":
+        # Screenshot-only pay: keep pay only if message is empty/yes or explicitly about paying.
+        if not raw or re.fullmatch(r"yes|yep|yeah|ok|okay|sure", raw, re.I) or _wants_bot_pay(raw):
+            return "pay", "pay"
+        # Otherwise treat as ask — do not force pay_stop over a new wish.
+        return "ask", "status"
+    if goal == "ask" or intent == "status":
+        return "ask", "status"
+    if goal == "stop":
+        return "stop", "cancel"
+    return goal or intent or "ask", intent or "status"
+
+
+def _plan(
+    *,
+    do: str,
+    kind: str,
+    tap: str = "",
+    turn: dict[str, Any],
+    goal: str,
+    intent: str,
+    reply: str = "",
+) -> dict[str, Any]:
+    out = {
+        "do": do,
+        "kind": kind,
+        "tap": tap,
+        "turn": {**turn, "goal": goal, "intent": intent},
+        "reply": reply,
+        "aligned": True,
+    }
+    if not _align_ok(goal, do):
+        out["do"] = "reply"
+        out["kind"] = "status"
+        out["tap"] = ""
+        out["aligned"] = False
+        out["reply"] = reply or format_turn_reply(turn) or (
+            "I heard that, but I won't act until it matches — say what you want: "
+            "fill details, continue, pick a name, check fares, pay with UPI/card, or pay yourself. Nothing paid."
+        )
+    return out
 
 
 def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Map goal → do. Actionable goals never become reply-only; ask never blocks a needed action."""
+    """Intent first → propose do → align gate. Mismatched intent/action never executes."""
     turn = turn or interpret_turn(text, state)
     vision = state.get("last_vision") if isinstance(state.get("last_vision"), dict) else {}
     sheet = str(turn.get("kind") or vision.get("kind") or "")
     if not sheet and stored_fare_list(state):
         sheet = "results"
-    intent = str(turn.get("intent") or "")
-    goal = str(turn.get("goal") or "")
     tap = str(turn.get("tap") or "")
     live = has_live_facts(state)
     trip = bool(state.get("origin") and state.get("destination") and state.get("depart"))
     clock = bool(re.search(r"\b\d{1,2}[:.]\d{2}\b", text or ""))
-    implies = _message_implies_action(text)
+    goal, intent = _intent_first(text, state, turn)
+    turn = {**turn, "goal": goal, "intent": intent}
 
-    if intent == "cancel" or goal == "stop":
-        return {"do": "reply", "kind": "cancel", "tap": "", "turn": turn, "reply": turn.get("reply") or ""}
-    if intent == "pay_self":
-        return {"do": "pay_self", "kind": "pay_self", "tap": "", "turn": turn, "reply": ""}
-    if intent == "pay":
-        return {"do": "pay_stop", "kind": "pay", "tap": "", "turn": turn, "reply": ""}
-
+    if goal == "stop" or intent == "cancel":
+        return _plan(do="reply", kind="cancel", turn=turn, goal="stop", intent="cancel", reply=str(turn.get("reply") or ""))
+    if goal == "pay_self":
+        return _plan(do="pay_self", kind="pay_self", turn=turn, goal="pay_self", intent="pay_self")
     if wants_fresh_search(text) and trip:
-        return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
-
-    # --- Goal → do (primary). Intent without action is a bug; fix it here. ---
-    raw_ask = (text or "").strip()
-    wants_delete = bool(
-        re.search(
-            r"\b(?:delete|remove|erase|clear)\b.+\b(?:travellers?|travelers?|profiles?|names?|passengers?|duplicates?)\b"
-            r"|\bget rid of\b.+\b(?:profile|name|traveller|traveler|duplicate)\b",
-            raw_ask,
-            re.I,
+        return _plan(do="search", kind="search", turn=turn, goal="search", intent="search")
+    if goal == "search" and trip:
+        return _plan(do="search", kind="search", turn=turn, goal="search", intent="search")
+    if goal == "delete_traveller":
+        return _plan(
+            do="book",
+            kind="book",
+            tap="__delete_traveller__",
+            turn=turn,
+            goal="delete_traveller",
+            intent="book",
         )
-    )
-    wants_pick = bool(
-        re.search(
-            r"\b(?:click|pick|select|tick|choose|use|tap)\b.+\b(?:name|names|traveller|traveler|profile|saved|one of)\b"
-            r"|\bpick one\b|\bone of the names\b|\bsaved (?:traveller|traveler|profile)\b"
-            r"|\buse (?:the |an? )?existing\b",
-            raw_ask,
-            re.I,
+    if goal == "pick_traveller":
+        return _plan(
+            do="book",
+            kind="book",
+            tap="__select_traveller__",
+            turn=turn,
+            goal="pick_traveller",
+            intent="book",
         )
-    )
-    if goal == "delete_traveller" or tap in {"__delete_traveller__", "__remove_traveller__"} or wants_delete:
-        return {
-            "do": "book",
-            "kind": "book",
-            "tap": "__delete_traveller__",
-            "turn": {**turn, "intent": "book", "goal": "delete_traveller"},
-            "reply": "",
-        }
-    if goal == "pick_traveller" or tap in {"__select_traveller__", "__pick_traveller__"} or wants_pick:
-        return {
-            "do": "book",
-            "kind": "book",
-            "tap": "__select_traveller__",
-            "turn": {**turn, "intent": "book", "goal": "pick_traveller"},
-            "reply": "",
-        }
-    if goal == "search" or (intent == "search" and not clock):
-        if trip:
-            return {"do": "search", "kind": "search", "tap": "", "turn": {**turn, "goal": "search"}, "reply": ""}
 
-    # Contact / fill on an open contactish sheet → details (act), even if Gemini said ask.
-    if (_contact_value_in(text) or _wants_fill_field(text) or goal == "details" or intent == "details") and live:
+    # Contact fill — page grounds where, intent says details.
+    if goal == "details" and live:
         if sheet in {"addons", "upsell", "fare_sheet"} and not _contact_sheet_open(sheet, state):
-            # Values absorb; keep moving on extras.
-            if goal in {"details", ""} or intent == "details":
-                return {
-                    "do": "book",
-                    "kind": "book",
-                    "tap": tap or "Skip add-ons",
-                    "turn": turn,
-                    "reply": "",
-                }
-        elif _contact_sheet_open(sheet, state) or goal == "details" or intent == "details":
-            return {
-                "do": "details",
-                "kind": "details",
-                "tap": tap,
-                "turn": {**turn, "intent": "details", "goal": "details"},
-                "reply": "",
-            }
+            return _plan(do="book", kind="book", tap=tap or "Skip add-ons", turn=turn, goal="forward", intent="book")
+        if _contact_sheet_open(sheet, state) or sheet in {"form", "passenger", "review", "other", ""}:
+            return _plan(do="details", kind="details", tap=tap, turn=turn, goal="details", intent="details")
 
-    if goal in {"forward", "skip"} and live and sheet not in {"error", "pay"}:
-        # Fall through to sheet handlers for tap grounding — mark intent so ask cannot win.
-        intent = "book"
+    # Payment: ask for UPI/card, or fill when they authorized / sent secrets.
+    on_pay = sheet == "pay" or str(state.get("stuck_kind") or "") == "pay"
+    if goal == "pay" or (on_pay and goal in {"ask", "pay", "status"} and not _wants_fare_compare(text)):
+        from app.search import named_seller
 
-    # ask / status ONLY when the message does not imply a page action.
-    if (
-        sheet not in {"error", "pay", "results", "loading", "unavailable"}
-        and (goal == "ask" or (intent == "status" and goal in {"ask", "", "status"}))
-        and not implies
-    ):
-        return {
-            "do": "reply",
-            "kind": "status",
-            "tap": "",
-            "turn": turn,
-            "reply": format_turn_reply(turn)
-            or (
-                "I'm on the open booking page — say what you want: click a saved name, "
-                "delete a profile, continue, or skip. Nothing paid."
-            ),
-        }
+        named = named_seller(text)
+        wants_login = bool(
+            re.search(
+                r"\b(?:log\s*in|sign\s*in|with (?:an? )?otp|use (?:an? )?otp|use (?:my )?account)\b",
+                text or "",
+                re.I,
+            )
+        )
+        if wants_login or (named and not _wants_bot_pay(text) and goal != "pay"):
+            if wants_login:
+                state["kernel_auth_mode"] = "login"
+                state.pop("kernel_logged_in", None)
+            state.pop("stuck_kind", None)
+            state.pop("pending_step", None)
+            state.pop("chosen_tap", None)
+            g = "login" if wants_login else "forward"
+            return _plan(do="book", kind="book", tap="", turn=turn, goal=g, intent="book" if wants_login else "select")
+        has_vault = bool(state.get("payment_on_file"))
+        if _wants_bot_pay(text) and (
+            has_vault
+            or re.search(r"@", text or "")
+            or re.search(r"\d{13,19}", re.sub(r"\D", "", text or ""))
+            or re.search(r"\bcvv\b|\bcvc\b", text or "", re.I)
+        ):
+            return _plan(do="pay", kind="pay", turn=turn, goal="pay", intent="pay")
+        # Authorized pay with vault already on file.
+        if goal == "pay" and has_vault and re.search(
+            r"\b(?:pay with|fill|use my|pay now|go ahead and pay|authorize)\b", text or "", re.I
+        ):
+            return _plan(do="pay", kind="pay", turn=turn, goal="pay", intent="pay")
+        return _plan(do="pay_ask", kind="pay", turn=turn, goal="pay" if goal == "pay" else "ask", intent="pay" if goal == "pay" else "status")
 
     from app.page_agent import site_error_page
     from app.step_read import safe_tap
@@ -704,55 +872,64 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
     stuck_text = str(state.get("stuck_page") or "")
     if sheet == "error" or site_error_page(stuck_text, ""):
         if wants_fresh_search(text):
-            return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
-        from app.search import named_seller
-
-        from app.search import seller_can_book
+            return _plan(do="search", kind="search", turn=turn, goal="search", intent="search")
+        from app.search import named_seller, seller_can_book
 
         pending = str(state.get("pending_seller_switch") or "").strip().lower()
         yes = bool(re.fullmatch(r"yes|yep|yeah|ok|okay|sure", (text or "").strip(), re.I))
         guest = str(state.get("kernel_auth_mode") or "").strip().lower() == "guest"
         login_mode = str(state.get("kernel_auth_mode") or "").strip().lower() == "login"
-        # Guest/login Kernel: reopen the same flight on a fresh tab — never a seller hop.
         reopen = bool(
             re.search(r"\btry again\b|\bagain\b|\bgo on\b|\breopen\b|\bfresh\b", text or "", re.I)
             or clock
+            or goal in {"forward", "skip", "login"}
             or intent in {"book", "select"}
-            or goal in {"forward", "skip"}
             or yes
         )
         if (guest or login_mode) and reopen and not named_seller(text):
             state.pop("kernel_session_id", None)
             state.pop("pending_seller_switch", None)
-            return {"do": "book", "kind": "book", "tap": "", "turn": turn, "reply": ""}
-        # Accept the recommended bookable travel site — never silent switch.
+            return _plan(do="book", kind="book", turn=turn, goal="forward", intent="book")
         if named_seller(text) or clock or (yes and seller_can_book(pending)):
-            return {"do": "book", "kind": "book", "tap": "", "turn": turn, "reply": ""}
+            return _plan(do="book", kind="book", turn=turn, goal="forward", intent="book")
         home = safe_tap("Go to home", stuck_text) or safe_tap("Search Again", stuck_text) or safe_tap("Home", stuck_text)
-        if intent in {"book", "select"} or goal in {"forward", "skip"}:
-            # Yes-without-pending stays on recovery controls; do not invent Ixigo.
-            return {
-                "do": "book",
-                "kind": "book",
-                "tap": tap or home or "",
-                "turn": turn,
-                "reply": "",
-            }
-        return {"do": "reply", "kind": "error", "tap": "", "turn": turn, "reply": format_turn_reply(turn)}
+        if goal in {"forward", "skip", "login"} or intent in {"book", "select"}:
+            return _plan(do="book", kind="book", tap=tap or home or "", turn=turn, goal="forward", intent="book")
+        return _plan(
+            do="reply",
+            kind="error",
+            turn=turn,
+            goal="ask",
+            intent="status",
+            reply=format_turn_reply(turn),
+        )
 
     if not live:
         if trip:
-            return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
-        return {"do": "ask_trip", "kind": "search", "tap": "", "turn": turn, "reply": turn.get("reply") or ""}
+            return _plan(do="search", kind="search", turn=turn, goal="search", intent="search")
+        return _plan(
+            do="ask_trip",
+            kind="search",
+            turn=turn,
+            goal="ask",
+            intent="search",
+            reply=str(turn.get("reply") or ""),
+        )
 
     if sheet in {"results", "loading"}:
-        if clock or intent in {"select", "book"} or goal == "forward":
-            return {"do": "book", "kind": "select" if clock else "book", "tap": tap, "turn": turn, "reply": ""}
-        if intent == "status" or goal == "ask":
-            return {"do": "reply", "kind": "status", "tap": tap, "turn": turn, "reply": format_turn_reply(turn)}
-        return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
+        if clock or goal in {"forward", "select"} or intent in {"select", "book"}:
+            return _plan(
+                do="book",
+                kind="select" if clock else "book",
+                tap=tap,
+                turn=turn,
+                goal="select" if clock else "forward",
+                intent="select" if clock else "book",
+            )
+        if goal == "ask":
+            return _plan(do="reply", kind="status", tap=tap, turn=turn, goal="ask", intent="status", reply=format_turn_reply(turn))
+        return _plan(do="search", kind="search", turn=turn, goal="search", intent="search")
 
-    # Stale "pay" vision while contact is still open — treat as form, not payment handoff.
     stuck_page = str(state.get("stuck_page") or "")
     if sheet == "pay" and (
         re.search(r"add contact|please enter mobile|please enter email", stuck_page, re.I)
@@ -760,18 +937,12 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
     ):
         sheet = "form"
         state.pop("stuck_kind", None)
-        if _contact_value_in(text) or _wants_fill_field(text) or goal == "details" or intent == "details":
-            return {
-                "do": "details",
-                "kind": "details",
-                "tap": tap,
-                "turn": {**turn, "intent": "details", "goal": "details"},
-                "reply": "",
-            }
+        if goal == "details":
+            return _plan(do="details", kind="details", tap=tap, turn=turn, goal="details", intent="details")
 
     if sheet in {"addons", "upsell", "review", "fare_sheet"}:
-        if (intent == "status" or goal == "ask") and not implies:
-            return {"do": "reply", "kind": "status", "tap": tap, "turn": turn, "reply": format_turn_reply(turn)}
+        if goal == "ask" and not _message_implies_action(text):
+            return _plan(do="reply", kind="status", tap=tap, turn=turn, goal="ask", intent="status", reply=format_turn_reply(turn))
         from app.step_read import visible_forward
 
         page = stuck_page
@@ -787,87 +958,52 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
                 tap = ""
             elif not tap:
                 tap = "Continue"
-        return {"do": "book", "kind": "book", "tap": tap, "turn": turn, "reply": ""}
+        g = "skip" if goal == "skip" or re.search(r"\bskip\b", text or "", re.I) else "forward"
+        return _plan(do="book", kind="book", tap=tap, turn=turn, goal=g, intent="book")
 
-    # Traveller/contact sheet: forward/skip/book → tap; else clarify (never invent fill).
     if sheet in {"form", "passenger"} or str(state.get("stuck_kind") or "") in {"form", "passenger"}:
-        if intent in {"book", "select"} or goal in {"forward", "skip"} or re.search(
+        if goal in {"forward", "skip", "login"} or intent in {"book", "select"} or re.search(
             r"\b(?:continue|go on|skip(?:\s+add)?|confirm)\b", text or "", re.I
         ):
             from app.step_read import visible_forward
 
             page = str(state.get("stuck_page") or "")
-            return {
-                "do": "book",
-                "kind": "book",
-                "tap": tap or visible_forward(page) or "Continue",
-                "turn": turn,
-                "reply": "",
-            }
-        return {
-            "do": "reply",
-            "kind": "status",
-            "tap": "",
-            "turn": turn,
-            "reply": format_turn_reply(turn)
+            return _plan(
+                do="book",
+                kind="book",
+                tap=tap or visible_forward(page) or "Continue",
+                turn=turn,
+                goal="forward",
+                intent="book",
+            )
+        return _plan(
+            do="reply",
+            kind="status",
+            turn=turn,
+            goal="ask",
+            intent="status",
+            reply=format_turn_reply(turn)
             or (
                 "Saved travellers are on screen. Say pick one, delete a profile, or send a mobile "
                 "if you want contact filled. Nothing paid."
             ),
-        }
-
-    if sheet == "pay":
-        from app.search import named_seller
-
-        named = named_seller(text)
-        bare_yes = bool(re.fullmatch(r"yes|yep|yeah|ok|okay|sure", (text or "").strip(), re.I))
-        wants_login = bool(
-            re.search(
-                r"\b(?:log\s*in|sign\s*in|with (?:an? )?otp|use (?:an? )?otp|use (?:my )?account)\b",
-                text or "",
-                re.I,
-            )
         )
-        price_elsewhere = bool(
-            re.search(r"\b(?:price|fare|cost|how much|cheaper|compare|rates?)\b", text or "", re.I)
-            and (
-                named
-                or re.search(r"\b(?:another|other|different)\s+(?:site|seller|service)\b", text or "", re.I)
-            )
-        )
-        # Payment is a stop — unless they want another site, a fare check, or to log in.
-        # Bare "yes" stays on the pay handoff (do not treat as a seller hop).
-        if wants_fresh_search(text) and trip:
-            return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
-        leave_pay = bool(
-            (not bare_yes)
-            and (
-                named
-                or wants_login
-                or price_elsewhere
-                or clock
-                or intent in {"login", "search", "select"}
-            )
-        )
-        if leave_pay:
-            if wants_login:
-                state["kernel_auth_mode"] = "login"
-                state.pop("kernel_logged_in", None)
-            state.pop("stuck_kind", None)
-            state.pop("pending_step", None)
-            state.pop("chosen_tap", None)
-            if price_elsewhere or (intent == "search" and not clock and not wants_login):
-                return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
-            return {"do": "book", "kind": "book", "tap": "", "turn": turn, "reply": ""}
-        return {"do": "pay_stop", "kind": "pay", "tap": "", "turn": turn, "reply": ""}
 
-    if intent in {"book", "select"} or goal in {"skip", "forward"}:
-        return {"do": "book", "kind": "book", "tap": tap, "turn": turn, "reply": ""}
-    if trip and intent in {"search", ""}:
-        return {"do": "search", "kind": "search", "tap": "", "turn": turn, "reply": ""}
-    if (intent == "status" or goal == "ask") and not implies:
-        return {"do": "reply", "kind": "status", "tap": tap, "turn": turn, "reply": format_turn_reply(turn)}
-    if implies and live:
-        return {"do": "book", "kind": "book", "tap": tap or "Continue", "turn": turn, "reply": ""}
-    return {"do": "reply", "kind": intent or "chat", "tap": tap, "turn": turn, "reply": format_turn_reply(turn)}
+    if goal in {"forward", "skip", "login", "select"} or intent in {"book", "select"}:
+        return _plan(do="book", kind="book", tap=tap, turn=turn, goal=goal or "forward", intent="book")
+    if trip and goal == "search":
+        return _plan(do="search", kind="search", turn=turn, goal="search", intent="search")
+    if goal == "ask":
+        return _plan(do="reply", kind="status", tap=tap, turn=turn, goal="ask", intent="status", reply=format_turn_reply(turn))
+    if _message_implies_action(text) and live:
+        return _plan(do="book", kind="book", tap=tap or "Continue", turn=turn, goal="forward", intent="book")
+    return _plan(
+        do="reply",
+        kind=intent or "chat",
+        tap=tap,
+        turn=turn,
+        goal=goal or "ask",
+        intent=intent or "chat",
+        reply=format_turn_reply(turn),
+    )
 

@@ -76,7 +76,9 @@ _UNDERSTAND = (
     "(a phone number, email, name, DOB, gender) — not when asking you to click a name on screen.\n"
     "goal=ask + intent=status when unclear what to do next.\n"
     "search: new fares or a route. select: a departure time on a fare list.\n"
-    "login / pay / pay_self / cancel as usual.\n"
+    "goal=search when they want fares/prices/other sites — even if the last page was payment.\n"
+    "goal=pay when they want YOU to fill UPI/card / authorize pay; goal=pay_self when they pay on the link.\n"
+    "login / cancel as usual. Intent comes from the message, not the open sheet alone.\n"
     "wanted_tap: __select_traveller__, __delete_traveller__, or a visible button label, else empty.\n"
     "flight_hint: departure time if named. reply: one short sentence mirroring their ask. No emoji. Nothing paid."
 )
@@ -469,13 +471,50 @@ def handle_turn(
             db.add_message(phone, "assistant", reply)
             return Reply.of(reply, emoji="🤔")
     if do == "pay_self":
+        state["pay_authorized"] = False
+        _save(phone, state)
         reply = _pay_link_reply(state)
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="💳")
-    if do == "pay_stop":
-        reply = "I stop before payment. Say pay with card if you want me to fill the card, or say you'll pay yourself. Nothing paid."
+    if do in {"pay_ask", "pay_stop"}:
+        # On the pay sheet: ask for UPI/card (bot can fill) or offer pay-yourself / fare check.
+        reply = _pay_ask_reply(state, text)
+        state["stage"] = "payment"
+        state.pop("busy_at", None)
+        _save(phone, state)
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="💳")
+    if do == "pay":
+        # User authorized bot payment and sent (or already has) UPI/card — fill same turn.
+        state["stage"] = "payment"
+        state["pay_authorized"] = True
+        kind = "pay"
+        _save(phone, state)
+        gaps = _payment_gaps(phone, text)
+        if gaps:
+            reply = (
+                f"I can fill payment on {_seller_label(str(state.get('seller') or 'cleartrip'))}. "
+                f"Send your {', '.join(gaps)}. "
+                "CVV/OTP are used once and not saved. Or say you'll pay yourself for the link."
+            )
+            state.pop("busy_at", None)
+            _save(phone, state)
+            db.add_message(phone, "assistant", reply)
+            return Reply.of(reply, emoji="💳")
+        spoken = (
+            f"Filling payment on {_seller_label(str(state.get('seller') or 'cleartrip'))} with what you sent. "
+            "I'll tap Pay only after the fields stick. Reply with any OTP if the bank asks."
+        )
+        state["busy_at"] = f"{time.time():.3f}"
+        _save(phone, state)
+        threading.Thread(
+            target=_run_browse,
+            args=(phone, text, state.get("busy_at"), "pay"),
+            name="guide-browse",
+            daemon=True,
+        ).start()
+        db.add_message(phone, "assistant", spoken)
+        return Reply.of(spoken, emoji="💳")
     if do == "details":
         # Goal details → act same turn. Never treat pick/delete as contact-fill.
         turn_goal = str(turn.get("goal") or "")
@@ -1423,6 +1462,43 @@ def _pay_link_reply(state: dict[str, Any]) -> str:
     return f"I haven't reached payment for {trip} yet. Say book and I'll take it there, then send the link."
 
 
+def _payment_gaps(phone: str, text: str = "") -> list[str]:
+    """What the bot still needs to fill UPI/card on the pay sheet."""
+    from app.browser_hands import looks_like_card
+
+    pay = vault.unlock_payment(phone) or {}
+    raw = text or ""
+    upi_now = bool(_UPI.search(raw))
+    card_now = bool(_card_digits(raw) or looks_like_card(raw))
+    has_upi = bool(str(pay.get("upi") or "").strip()) or upi_now
+    has_card = bool(str(pay.get("card") or "").strip()) or card_now
+    if has_upi or has_card:
+        # Card path still needs CVV if they chose card and didn't send one this turn.
+        if has_card and not has_upi and not re.search(r"\b(?:cvv|cvc)\s*[:\-]?\s*\d{3,4}\b", raw, re.I):
+            # Ephemeral CVV may already be held for this turn.
+            return []
+        return []
+    return ["UPI ID (name@ybl) or card number + expiry"]
+
+
+def _pay_ask_reply(state: dict[str, Any], text: str = "") -> str:
+    """Payment handoff: bot can fill UPI/card, or they pay themselves / leave for fares."""
+    seller = _seller_label(str(state.get("seller") or "cleartrip"))
+    trip = _trip_line(state) or "that trip"
+    held = str(state.get("payment_on_file") or "").strip()
+    if held:
+        return (
+            f"I'm on {seller} payment for {trip}. I can fill {held} — reply pay with UPI or pay with card. "
+            "Or send a new UPI ID / card, say you'll pay yourself for the link, "
+            "or ask me to check fares on other sites. Nothing paid yet."
+        )
+    return (
+        f"I'm on {seller} payment for {trip}. Send your UPI ID (name@ybl) or card number + expiry "
+        "(and CVV when asked) and I'll fill it, or say you'll pay yourself for the link, "
+        "or ask me to check fares on other sites. Nothing paid yet."
+    )
+
+
 def _booking_seller_id(state: dict[str, Any], text: str = "") -> str:
     """Fulfill a pick on a site that can ticket. A named bookable site wins."""
     from app.search import default_bookable_seller, fulfillment_seller, seller_can_book
@@ -1686,24 +1762,22 @@ def _wants_kernel_login(text: str) -> bool:
 
 def _wants_price_elsewhere(text: str) -> bool:
     """Fare check on another named site — leave the payment sheet for a search."""
-    from app.search import named_seller
+    from app.turn_loop import _wants_fare_compare
 
-    raw = text or ""
-    if not re.search(r"\b(?:price|fare|cost|how much|cheaper|compare|rates?)\b", raw, re.I):
-        return False
-    return bool(
-        named_seller(raw)
-        or re.search(r"\b(?:another|other|different)\s+(?:site|seller|service)\b", raw, re.I)
-    )
+    return _wants_fare_compare(text)
 
 
 def _wants_book_compare(text: str) -> bool:
     """Ask which site is cheapest / where to book — separate from Google Flights."""
+    from app.turn_loop import _wants_fare_compare
+
+    if _wants_fare_compare(text):
+        return True
     return bool(
         re.search(
             r"\b(?:where (?:to|should i) book|compare (?:prices?|sites?|fares?|sellers?)|"
             r"cheapest (?:site|seller|fare)|best site to book|"
-            r"check (?:the )?prices? (?:on|across|for))\b",
+            r"check (?:the )?prices? (?:on|across|for)|check all (?:the )?fares?\b)",
             text or "",
             re.I,
         )

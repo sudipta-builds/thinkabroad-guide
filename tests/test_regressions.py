@@ -1626,6 +1626,47 @@ class SellerChoiceAndProxy(unittest.TestCase):
             classify_page(review_badge, "https://www.ixigo.com/flight/booking/1"),
             "review",
         )
+        # Ixigo Review Details with Continue + ₹ + clock must NOT become a fare list.
+        ixigo_review = (
+            "Review Details Fare Summary Base Fare ₹8,523 Taxes ₹902 Total ₹9,425 "
+            "Guwahati 8:55 Delhi Billing Address Street Continue Book flights"
+        )
+        self.assertEqual(
+            classify_page(ixigo_review, "https://www.ixigo.com/flight/booking/review"),
+            "review",
+        )
+        from app.step_read import accept_choice, is_name_confirm
+
+        self.assertTrue(is_name_confirm(ixigo_review))
+        self.assertEqual(
+            accept_choice(
+                "confirm",
+                {"tap": "Confirm", "page": ixigo_review, "kind": "name_confirm"},
+            ),
+            "Continue",
+        )
+        # Stuck reply must stay on name_confirm, not "fare list".
+        from app.travel_agent import _booking_page_reply
+
+        class _Fake:
+            page = type("P", (), {"url": "https://www.ixigo.com/flight/booking/review"})()
+
+        spoken = _booking_page_reply(
+            {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-12-04",
+                "seller": "ixigo",
+                "selected_hint": "8:55",
+                "last_vision": {"kind": "results", "fares_visible": True},
+            },
+            "8:55",
+            ixigo_review,
+            _Fake(),  # type: ignore[arg-type]
+        )
+        self.assertIn("name check", spoken.lower())
+        self.assertNotIn("fare list", spoken.lower())
+        self.assertRegex(spoken, r"Confirm|Continue")
 
     def test_after_book_follow_through_is_wired(self) -> None:
         import inspect

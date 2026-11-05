@@ -311,6 +311,35 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
     # Cleartrip "Review your itinerary" (flex Add cards) is review — never Skip-addons.
     if re.search(r"review your itinerary", hay, re.I):
         return "review"
+    # Empty title / name form beats review stepper copy ("Review & Traveller Details").
+    if re.search(r"please select your title|first & middle name|first name|last name", hay, re.I) and re.search(
+        r"\bcontinue\b|male|female|title|nationality|mobile", hay, re.I
+    ):
+        return "passenger"
+    # Ixigo/Cleartrip Review Details (name check / billing) BEFORE fare-list heuristics.
+    # ₹ + clock + a nav "Book" on this sheet used to false-trigger results.
+    if re.search(r"\breview details\b", hay, re.I) and re.search(
+        r"\b(?:continue|confirm)\b|billing address|fare summary|govt\.?\s*id|aadhaar",
+        hay,
+        re.I,
+    ):
+        return "review"
+    if (
+        re.search(r"review & traveller|fare summary|total amount", hay, re.I)
+        and re.search(
+            r"\b(?:IX|AI|6E|SG|QP)[\s-]*\d+|billing address|\bcontinue\b|\bconfirm\b",
+            hay,
+            re.I,
+        )
+        and not re.search(
+            r"free cancellation|buy this|secure my trip|no,?\s*thanks|\bassured\b",
+            hay,
+            re.I,
+        )
+    ):
+        # Single itinerary review — not a multi-row fare list or paid upsell.
+        if not (has_time and book_count >= 2):
+            return "review"
     # Live Skip / Choose add-ons beats a lone "Book" word left on the itinerary sheet.
     if re.search(r"choose add-ons|missed adding|skip add-?ons", hay, re.I):
         return "addons"
@@ -323,11 +352,6 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
     # Meals/luggage sheet without a review heading (Skip already handled above).
     if re.search(r"add seats|add meals|add extra luggage|choose your seat|add meal", hay, re.I):
         return "addons"
-    # A review sheet that already shows the traveller is not the empty name form.
-    if re.search(r"review details", hay, re.I) and re.search(r"\bcontinue\b", hay, re.I) and not re.search(
-        r"please select your title", hay, re.I
-    ):
-        return "review"
     if re.search(r"first name|last name|date of birth|add adult|primary passenger", hay, re.I) and re.search(
         r"mobile|email|gender", hay, re.I
     ):
@@ -337,10 +361,6 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         r"\bcontinue\b|male|female|title", hay, re.I
     ):
         return "passenger"
-    if re.search(r"review & traveller|fare summary|total amount", hay, re.I) and re.search(
-        r"\b(?:IX|AI|6E|SG|QP)[\s-]*\d+", hay, re.I
-    ):
-        return "review"
     if re.search(r"fare summary", hay, re.I) and re.search(r"\bcontinue\b", hay, re.I) and not re.search(
         r"first & middle|first name|last name|add traveller", hay, re.I
     ):

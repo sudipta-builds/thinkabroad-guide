@@ -129,12 +129,16 @@ def is_paid_upsell(page: str) -> bool:
 
 
 def is_name_confirm(page: str) -> bool:
-    """Name check sheet (Review Details + Confirm). Not payment."""
+    """Name check / Review Details sheet (Confirm or Continue). Not payment."""
     hay = page or ""
-    if not re.search(r"\bconfirm\b", hay, re.I):
+    if not re.search(r"\b(?:confirm|continue)\b", hay, re.I):
         return False
     return bool(
-        re.search(r"review details|govt\.?\s*id|aadhaar|matches your (govt|name)|driver.?s license", hay, re.I)
+        re.search(
+            r"review details|govt\.?\s*id|aadhaar|matches your (govt|name)|driver.?s license|billing address",
+            hay,
+            re.I,
+        )
     )
 
 
@@ -214,9 +218,11 @@ def accept_choice(text: str, pending: dict[str, str]) -> str:
             or RECOMMENDED
         )
     if _AGREE.fullmatch(raw) or re.search(r"\bskip\b", raw, re.I):
-        if re.fullmatch(r"confirm", raw, re.I):
+        if re.fullmatch(r"confirm", raw, re.I) or str(pending.get("kind") or "") == "name_confirm":
+            # Ixigo Review Details may show Confirm, Continue, or both — use what's on the page.
             return (
                 safe_tap("Confirm", page)
+                or safe_tap("Continue", page)
                 or safe_tap(str(pending.get("tap") or ""), page)
                 or forward_tap(page)
                 or decline_tap(page)

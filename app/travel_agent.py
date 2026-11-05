@@ -3088,11 +3088,21 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         )
     ):
         shown = "addons"
-    if vision_seen and vision_seen.get("fares_visible") and shown not in {"unavailable", "pay", "addons"}:
+    # Never let a stale fares_visible flag turn Review Details into a fare list.
+    if re.search(r"review details|review your itinerary", page or "", re.I):
+        shown = "review"
+    elif vision_seen and vision_seen.get("fares_visible") and shown not in {
+        "unavailable",
+        "pay",
+        "addons",
+        "review",
+    }:
         shown = "results"
-    from app.step_read import form_sheet
+    from app.step_read import form_sheet, is_name_confirm
 
-    if form_sheet(page) and shown not in {"pay", "otp", "login", "error", "unavailable"}:
+    if is_name_confirm(page or "") and shown not in {"pay", "otp", "login", "error", "unavailable"}:
+        shown = "review"
+    if form_sheet(page) and shown not in {"pay", "otp", "login", "error", "unavailable", "review"}:
         shown = "other"
     if site_error_page(page, url) or (vision_seen and str(vision_seen.get("kind") or "") == "error"):
         shown = "error"
@@ -3113,6 +3123,49 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             "the Where from / Search flights screen (or a cookie banner on it)",
             "say go on and I'll open the fare list for that time",
         )
+    # Cleartrip "Review your itinerary" — keep that wording (not Ixigo name-check).
+    # Never override a site error / pay sheet that still mentions itinerary in the DOM.
+    if shown not in {"error", "unavailable", "pay", "otp", "login"} and re.search(
+        r"review your itinerary", page or "", re.I
+    ):
+        from app.step_read import forward_tap as _fwd_itin
+
+        tap = _fwd_itin(page or "") or "Continue"
+        return _stuck_line(
+            state,
+            "review",
+            f"{seller} Review your itinerary for the {which} on {trip}",
+            "the next control is Continue on this page",
+            f"I'll press {tap}",
+        )
+    if shown not in {"error", "unavailable", "pay", "otp", "login"} and (
+        shown == "review" or re.search(r"\breview details\b", page or "", re.I)
+    ):
+        from app.step_read import arm_pending_step, forward_tap, is_name_confirm
+
+        # Paid upsell on top of review copy — let the upsell / decide_front path handle it.
+        if re.search(r"free cancellation|buy this|secure my trip|no,?\s*thanks", page or "", re.I):
+            pass
+        else:
+            tap = forward_tap(page or "") or (
+                "Confirm" if re.search(r"\bconfirm\b", page or "", re.I) else "Continue"
+            )
+            if is_name_confirm(page or "") or re.search(r"\breview details\b", page or "", re.I):
+                arm_pending_step(state, page or "", "name_confirm", tap=tap)
+                return _stuck_line(
+                    state,
+                    "name_confirm",
+                    f"{seller} name check for the {which}",
+                    f"Review Details wants {tap} — that is not payment",
+                    f"reply yes or confirm and I'll press {tap}, then move toward add-ons",
+                )
+            return _stuck_line(
+                state,
+                "review",
+                f"{seller} review for the {which} on {trip}",
+                "the next control is on this page",
+                f"reply yes and I'll press {tap}",
+            )
     if shown in {"results", "loading"}:
         # Instinct: recommend / book a clock — never "send the exact button" on a fare list.
         options = fare_options(page)

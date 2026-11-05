@@ -157,6 +157,95 @@ def forward_tap(page: str) -> str:
     return ""
 
 
+# Allowed forward labels by sheet kind (vision/DOM must still show the label).
+_SHEET_FORWARD: dict[str, tuple[str, ...]] = {
+    "review": ("Confirm", "Continue", "Proceed", "Continue with 1-step checkout", "Continue to payment"),
+    "name_confirm": ("Confirm", "Continue", "Proceed"),
+    "addons": ("Skip add-ons", "Skip add ons", "Continue without add-ons", "Continue", "No, Thanks", "No Thanks"),
+    "upsell": (
+        "No, Thanks",
+        "No Thanks",
+        "Not this time",
+        "I don't want Free Cancellation",
+        "Continue",
+    ),
+    "form": ("Continue", "Proceed"),
+    "passenger": ("Continue", "Proceed", "Continue to payment"),
+    "fare_sheet": ("Continue", "Book"),
+}
+
+
+def parse_control_labels(page_or_controls: str) -> list[str]:
+    """Pull short button-like labels from page text or a control digest."""
+    raw = page_or_controls or ""
+    found: list[str] = []
+    # control_digest lines: btn[ ] Continue
+    for match in re.finditer(r"(?:btn|button|a|role=button)\[.\]\s*([^!\n]{2,80})", raw, re.I):
+        label = re.sub(r"\s+", " ", match.group(1)).strip()
+        if label and not _SPEND.search(label) and label.lower() not in {f.lower() for f in found}:
+            found.append(label[:80])
+    for label in (
+        "Skip add-ons",
+        "Skip add ons",
+        "Continue without add-ons",
+        "Continue with 1-step checkout",
+        "Continue to payment",
+        "No, Thanks",
+        "No Thanks",
+        "Not this time",
+        "Confirm",
+        "Continue",
+        "Proceed",
+        "Edit",
+        "Search Again",
+        "Go to home",
+    ):
+        if re.search(rf"(?<![A-Za-z]){re.escape(label)}(?![A-Za-z])", raw, re.I):
+            if label.lower() not in {f.lower() for f in found}:
+                found.append(label)
+    return found[:12]
+
+
+def ground_tap(
+    preferred: str,
+    controls: list[str] | None = None,
+    page: str = "",
+    *,
+    kind: str = "",
+) -> str:
+    """Pick a real on-sheet label. Prefer preferred, then sheet allowlist, never invent."""
+    pool = list(controls or [])
+    if page:
+        for label in parse_control_labels(page):
+            if label.lower() not in {p.lower() for p in pool}:
+                pool.append(label)
+    want = re.sub(r"\s+", " ", (preferred or "").strip())
+    if want and not _SPEND.search(want):
+        for label in pool:
+            if label.lower() == want.lower():
+                return label
+        hit = safe_tap(want, page) if page else ""
+        if hit:
+            return hit
+        # Soft match: preferred Contained in a control (e.g. Continue vs Continue to payment).
+        for label in pool:
+            if want.lower() in label.lower() or label.lower() in want.lower():
+                if not _SPEND.search(label):
+                    return label
+    for label in _SHEET_FORWARD.get(str(kind or "").lower(), ()):
+        for item in pool:
+            if item.lower() == label.lower():
+                return item
+        hit = safe_tap(label, page) if page else ""
+        if hit:
+            return hit
+    # Last resort: first non-spend forward-ish control.
+    for item in pool:
+        if re.search(r"^(confirm|continue|proceed|skip)\b", item, re.I) and not _SPEND.search(item):
+            return item
+    return ""
+
+
 def safe_tap(tap: str, page: str) -> str:
     """A click the model named, only if the page shows it and it does not spend money."""
     label = re.sub(r"\s+", " ", (tap or "").strip())
@@ -201,7 +290,7 @@ def accept_choice(text: str, pending: dict[str, str]) -> str:
     yes/skip/ok/continue uses the recommended label, or the decline text on the
     page, or RECOMMENDED so checkout can opt out and tick a saved traveller.
     Any other short phrase is used only when that phrase is on the page.
-    Pay controls are never accepted here.
+    Pay controls are never accepted here. Prefer grounded labels from the sheet.
     """
     page = pending.get("page") or ""
     raw = choice_phrase(text)
@@ -209,45 +298,81 @@ def accept_choice(text: str, pending: dict[str, str]) -> str:
         return ""
     if re.search(r"\b(pay now|pay to complete|make payment|secure my trip)\b", raw, re.I):
         return ""
+    kind = str(pending.get("kind") or "")
+    controls = pending.get("controls")
+    pool: list[str] | None = None
+    if isinstance(controls, list):
+        pool = [str(c) for c in controls if str(c).strip()]
+    elif isinstance(controls, str) and controls.strip():
+        pool = parse_control_labels(controls)
     if re.search(r"confirm(?: the)? fl", raw, re.I):
         return (
-            safe_tap("Continue", page)
-            or safe_tap("Confirm", page)
+            ground_tap("Continue", pool, page, kind=kind or "review")
+            or ground_tap("Confirm", pool, page, kind=kind or "review")
             or forward_tap(page)
             or safe_tap(str(pending.get("tap") or ""), page)
             or RECOMMENDED
         )
     if _AGREE.fullmatch(raw) or re.search(r"\bskip\b", raw, re.I):
-        if re.fullmatch(r"confirm", raw, re.I) or str(pending.get("kind") or "") == "name_confirm":
-            # Ixigo Review Details may show Confirm, Continue, or both — use what's on the page.
+        if re.fullmatch(r"confirm", raw, re.I) or kind == "name_confirm":
+            # Ixigo Review Details may show Confirm, Continue, or both — ground to sheet.
             return (
-                safe_tap("Confirm", page)
-                or safe_tap("Continue", page)
-                or safe_tap(str(pending.get("tap") or ""), page)
+                ground_tap(
+                    str(pending.get("tap") or "Confirm"),
+                    pool,
+                    page,
+                    kind=kind or "name_confirm",
+                )
+                or ground_tap("Confirm", pool, page, kind="name_confirm")
+                or ground_tap("Continue", pool, page, kind="name_confirm")
                 or forward_tap(page)
                 or decline_tap(page)
                 or RECOMMENDED
             )
-        return safe_tap(str(pending.get("tap") or ""), page) or decline_tap(page) or forward_tap(page) or RECOMMENDED
+        # Prefer the recommended / decline label on the sheet before inventing Continue.
+        return (
+            safe_tap(str(pending.get("tap") or ""), page)
+            or decline_tap(page)
+            or ground_tap(str(pending.get("tap") or ""), pool, page, kind=kind)
+            or forward_tap(page)
+            or RECOMMENDED
+        )
     if re.search(r"no\s*,?\s*thanks", raw, re.I):
-        return safe_tap("No, Thanks", page) or safe_tap("No Thanks", page) or decline_tap(page)
+        return (
+            ground_tap("No, Thanks", pool, page, kind=kind or "upsell")
+            or safe_tap("No, Thanks", page)
+            or safe_tap("No Thanks", page)
+            or decline_tap(page)
+        )
     if re.search(r"don.?t want", raw, re.I):
         return decline_tap(page) or RECOMMENDED
-    if 2 <= len(raw) <= 80 and raw.lower() in re.sub(r"\s+", " ", page).lower():
-        return safe_tap(raw, page)
+    if 2 <= len(raw) <= 80:
+        hit = ground_tap(raw, pool, page, kind=kind) or safe_tap(raw, page)
+        if hit:
+            return hit
     return ""
 
 
-def arm_pending_step(state: dict, page: str, kind: str, *, tap: str = "") -> None:
+def arm_pending_step(
+    state: dict,
+    page: str,
+    kind: str,
+    *,
+    tap: str = "",
+    controls: list[str] | None = None,
+) -> None:
     """Remember this page so yes / No thanks can resume checkout."""
     hay = (page or "")[:1500]
     label = tap or decline_tap(hay)
-    state["stuck_page"] = hay
-    state["pending_step"] = {
+    pending: dict = {
         "tap": label,
         "page": hay,
         "kind": kind,
     }
+    if controls:
+        pending["controls"] = [str(c)[:80] for c in controls if str(c).strip()][:8]
+    state["stuck_page"] = hay
+    state["pending_step"] = pending
 
 
 def read_step(
@@ -366,8 +491,23 @@ def decide_front(
                 vision_kind = str((seen or {}).get("kind") or "")
                 if seen and seen.get("sold_out"):
                     stage = "unavailable"
-                if seen and seen.get("fares_visible") and stage not in {"unavailable", "pay"}:
+                if (
+                    seen
+                    and seen.get("fares_visible")
+                    and stage not in {"unavailable", "pay", "review", "addons", "form", "passenger"}
+                    and str((seen or {}).get("kind") or "") not in {"review", "form", "upsell", "passenger"}
+                ):
                     stage = "results"
+                # Prefer vision-grounded tap from its control list.
+                if seen and stage in {"review", "addons", "upsell", "form", "passenger"}:
+                    tapped = ground_tap(
+                        str(seen.get("tap") or chosen_tap or ""),
+                        list(seen.get("controls") or []),
+                        hay,
+                        kind=str(seen.get("kind") or stage),
+                    )
+                    if tapped:
+                        chosen_tap = tapped
         except Exception:
             vision_kind = ""
     if stage == "unavailable":
@@ -423,27 +563,28 @@ def decide_front(
     heard = read_step(page, seller=seller, hint=hint, controls=controls, image_path=image_path)
 
     if raw_choice:
+        kind_now = (heard or {}).get("kind") or vision_kind or "other"
         if raw_choice == RECOMMENDED or raw_choice.startswith("__"):
-            label = decline_tap(hay) or forward_tap(hay)
+            label = decline_tap(hay) or ground_tap("", page=hay, kind=kind_now) or forward_tap(hay)
             if label:
-                return {"action": "click", "tap": label, "kind": (heard or {}).get("kind") or "other"}
+                return {"action": "click", "tap": label, "kind": kind_now}
         elif _SPEND.search(raw_choice):
             return {
                 "action": "ask",
                 "tap": "",
-                "kind": (heard or {}).get("kind") or "other",
+                "kind": kind_now,
                 "what": (heard or {}).get("what") or "a control that would spend money",
                 "why": (heard or {}).get("why") or "I will not tap Pay or a paid extra",
                 "recommend": (heard or {}).get("recommend") or "send a safe button name",
             }
         else:
-            label = safe_tap(raw_choice, hay)
+            label = ground_tap(raw_choice, page=hay, kind=kind_now) or safe_tap(raw_choice, hay)
             if label:
-                return {"action": "click", "tap": label, "kind": (heard or {}).get("kind") or "other"}
+                return {"action": "click", "tap": label, "kind": kind_now}
         return {
             "action": "ask",
             "tap": "",
-            "kind": (heard or {}).get("kind") or "other",
+            "kind": kind_now,
             "what": (heard or {}).get("what") or "the sheet that is still open",
             "why": "that button is not on this sheet",
             "recommend": "send the exact label you see",
@@ -493,7 +634,8 @@ def decide_front(
 
     # Model off or empty: rails only. Name Confirm may auto-click; everything else asks.
     if is_name_confirm(hay):
-        return {"action": "click", "tap": forward_tap(hay) or "Confirm", "kind": "review"}
+        tap = ground_tap(chosen_tap or "Confirm", page=hay, kind="name_confirm") or forward_tap(hay)
+        return {"action": "click", "tap": tap, "kind": "review"}
     if is_paid_upsell(hay):
         return {
             "action": "ask",

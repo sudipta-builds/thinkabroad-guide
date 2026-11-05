@@ -1864,6 +1864,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
         refuse = inspect.getsource(run_checkout_agent)
         self.assertIn("continue to payment", refuse.lower())
         self.assertIn("user_tap_continue", refuse)
+        self.assertIn("advance_forward_control", refuse)
         self.assertIn("_cleartrip_guest_sprint", refuse)
         sprint = inspect.getsource(_cleartrip_guest_sprint)
         self.assertIn("data-ct-fill", sprint)
@@ -3319,19 +3320,96 @@ class SellerChoiceAndProxy(unittest.TestCase):
         import inspect
 
         from app import vision_agent
-        from app.page_agent import _clear_front_sheet, _pause_unknown, run_checkout_agent
-        from app.step_read import decide_front
+        from app.page_agent import (
+            _clear_front_sheet,
+            _pause_unknown,
+            advance_forward_control,
+            run_checkout_agent,
+        )
+        from app.step_read import decide_front, ground_tap, parse_control_labels
 
         self.assertTrue(callable(vision_agent.see_step))
         self.assertTrue(callable(vision_agent.classify_with_vision))
+        self.assertTrue(callable(advance_forward_control))
+        self.assertTrue(callable(ground_tap))
+        self.assertTrue(callable(parse_control_labels))
         src = inspect.getsource(run_checkout_agent)
         self.assertIn("classify_with_vision", src)
         self.assertIn("vision_enabled", src)
         self.assertIn("vision_shot_miss", src)
+        self.assertIn("advance_forward_control", src)
         self.assertIn("image_path", inspect.signature(decide_front).parameters)
-        self.assertIn("image_path", inspect.getsource(_clear_front_sheet))
+        clear_src = inspect.getsource(_clear_front_sheet)
+        self.assertIn("image_path", clear_src)
+        self.assertIn("advance_forward_control", clear_src)
         self.assertIn("image_path", inspect.getsource(_pause_unknown))
+        vision_src = inspect.getsource(vision_agent.see_step)
+        self.assertIn("controls", vision_src)
+        self.assertIn("ground_tap", vision_src)
+        self.assertIn('"controls":[]', vision_agent._VISION_READ)
+        classify_src = inspect.getsource(vision_agent.classify_with_vision)
+        self.assertIn('kind in {"review", "form", "upsell", "passenger"}', classify_src)
         self.assertTrue(Path("scripts/vision_step_smoke.py").is_file())
+
+    def test_vision_controls_ground_clicks_and_protect_review(self) -> None:
+        """Vision owns sheet kind + control allowlist; fares_visible cannot wipe review."""
+        from unittest.mock import patch
+
+        from app import vision_agent
+        from app.step_read import accept_choice, ground_tap, parse_control_labels
+
+        review = (
+            "Review Details Fare Summary Base Fare ₹8,523 Total ₹9,425 "
+            "Please ensure that your name matches your govt ID Confirm Edit Continue"
+        )
+        labels = parse_control_labels("btn[ ] Confirm\nbtn[ ] Edit\nbtn[ ] Continue\n" + review)
+        self.assertIn("Confirm", labels)
+        self.assertEqual(ground_tap("Confirm", labels, review, kind="review"), "Confirm")
+        self.assertEqual(ground_tap("Confirm", ["Continue", "Edit"], "Continue Edit", kind="name_confirm"), "Continue")
+        self.assertEqual(
+            accept_choice(
+                "yes",
+                {
+                    "tap": "Confirm",
+                    "page": "Review Details Continue govt ID",
+                    "kind": "name_confirm",
+                    "controls": ["Continue", "Edit"],
+                },
+            ),
+            "Continue",
+        )
+        fake = {
+            "kind": "review",
+            "what": "Review Details name check",
+            "why": "confirm traveller name",
+            "recommend": "press Confirm",
+            "tap": "Confirm",
+            "auto": True,
+            "fares_visible": True,
+            "sold_out": False,
+            "toast_only": False,
+            "controls": ["Confirm", "Edit"],
+            "facts": ["Confirm visible"],
+            "best_depart": "",
+            "best_price": "",
+        }
+        with patch.object(vision_agent, "vision_enabled", return_value=True), patch(
+            "app.llm.vision_converse", return_value=fake
+        ):
+            seen = vision_agent.see_step("/tmp/x.png", page_text=review)
+        self.assertIsNotNone(seen)
+        assert seen is not None
+        self.assertEqual(seen["kind"], "review")
+        self.assertFalse(seen["fares_visible"])
+        self.assertEqual(seen["tap"], "Confirm")
+        self.assertIn("Confirm", seen["controls"])
+
+        with patch.object(vision_agent, "see_step", return_value=seen):
+            mapped, again = vision_agent.classify_with_vision("results", "shot.png", page_text=review)
+        self.assertEqual(mapped, "review")
+        self.assertEqual((again or {}).get("kind"), "review")
+        # Spend preferred is ignored; sheet allowlist still grounds a safe forward.
+        self.assertEqual(ground_tap("Pay now", ["Confirm", "Continue"], review, kind="review"), "Confirm")
 
     def test_results_with_book_buttons_choose_the_time(self) -> None:
         action = deterministic_action("results", hint="1:15", recovers=0)

@@ -3091,12 +3091,14 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     # Never let a stale fares_visible flag turn Review Details into a fare list.
     if re.search(r"review details|review your itinerary", page or "", re.I):
         shown = "review"
-    elif vision_seen and vision_seen.get("fares_visible") and shown not in {
-        "unavailable",
-        "pay",
-        "addons",
-        "review",
-    }:
+    elif vision_seen and str(vision_seen.get("kind") or "") in {"review", "upsell"}:
+        shown = "review"
+    elif (
+        vision_seen
+        and vision_seen.get("fares_visible")
+        and shown not in {"unavailable", "pay", "addons", "review"}
+        and str(vision_seen.get("kind") or "") not in {"review", "form", "upsell", "passenger"}
+    ):
         shown = "results"
     from app.step_read import form_sheet, is_name_confirm
 
@@ -3141,17 +3143,27 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     if shown not in {"error", "unavailable", "pay", "otp", "login"} and (
         shown == "review" or re.search(r"\breview details\b", page or "", re.I)
     ):
-        from app.step_read import arm_pending_step, forward_tap, is_name_confirm
+        from app.step_read import arm_pending_step, forward_tap, ground_tap, is_name_confirm
 
         # Paid upsell on top of review copy — let the upsell / decide_front path handle it.
         if re.search(r"free cancellation|buy this|secure my trip|no,?\s*thanks", page or "", re.I):
             pass
         else:
-            tap = forward_tap(page or "") or (
-                "Confirm" if re.search(r"\bconfirm\b", page or "", re.I) else "Continue"
+            vision_controls = list((vision_seen or {}).get("controls") or [])
+            preferred = str((vision_seen or {}).get("tap") or "")
+            tap = (
+                ground_tap(preferred, vision_controls, page or "", kind="name_confirm")
+                or forward_tap(page or "")
+                or ("Confirm" if re.search(r"\bconfirm\b", page or "", re.I) else "Continue")
             )
             if is_name_confirm(page or "") or re.search(r"\breview details\b", page or "", re.I):
-                arm_pending_step(state, page or "", "name_confirm", tap=tap)
+                arm_pending_step(
+                    state,
+                    page or "",
+                    "name_confirm",
+                    tap=tap,
+                    controls=vision_controls or None,
+                )
                 return _stuck_line(
                     state,
                     "name_confirm",

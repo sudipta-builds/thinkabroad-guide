@@ -15,36 +15,38 @@ logger = logging.getLogger(__name__)
 _VISION_READ = (
     "You are looking at ONE screenshot of a live Indian flight-booking page "
     "(Ixigo, Cleartrip, EaseMyTrip, or similar).\n"
-    "Act like Instinct: say what the page really is, list visible facts, recommend the next move.\n"
+    "Act like Instinct: say what the page really is, list visible button labels, recommend the next move.\n"
     "Return JSON only with keys:\n"
     '{"kind":"upsell|form|login|otp|review|results|pay|unavailable|addons|other",'
     '"what":"","why":"","recommend":"","tap":"","auto":false,'
     '"fares_visible":false,"sold_out":false,"toast_only":false,'
     '"seat_map":false,"meals_offered":false,'
+    '"controls":[],'
     '"facts":[],'
     '"best_depart":"","best_price":""}\n'
     "Rules:\n"
-    "- kind=results when flight cards with Book/Select and prices are visible, even if a small toast says "
-    "'No flight data available' or a filter tip is pre-applied. Set fares_visible=true, toast_only=true for that chip.\n"
-    "- kind=unavailable when a modal says the flight is no longer available / Search Again. sold_out=true. "
-    "Do not treat this as a filled traveller form.\n"
+    "- kind is the PRIMARY sheet. A fare summary ₹ on Review Details is NOT results.\n"
+    "- kind=results ONLY when a multi-row flight card list with Book/Select is the main UI. "
+    "Set fares_visible=true only then. A toast 'No flight data' on a real list: fares_visible=true, toast_only=true.\n"
+    "- kind=review for Review Details / name check / billing address / Review your itinerary. "
+    "fares_visible=false even if Total ₹ is shown. tap=Confirm if visible else Continue.\n"
+    "- kind=unavailable when a modal says the flight is no longer available / Search Again. sold_out=true.\n"
     "- kind=addons for Choose add-ons / seat map / meals / baggage / 'missed adding Meal(s) and Seat(s)'. "
     "Set seat_map=true when a cabin seat map is visible; meals_offered=true when meals are offered. "
-    "facts MUST mention seats if a seat map is shown (e.g. 'seat map open, no seat selected'). "
-    "Default tap=Skip add-ons and auto=true unless the traveller clearly wants a paid seat. "
-    "Never invent a seat purchase.\n"
-    "- kind=results: recommend a departure time (best_depart) and price if readable; tap stays empty "
-    "(the bot clicks Book by time, not a button label). auto=false.\n"
-    "- kind=upsell: any optional paid extra (cancellation, insurance, flexibility, protect). "
-    "Tap Continue or the decline label. Never tap Buy / Book now on that extra.\n"
-    "- kind=review: Review Details name check with Confirm/Edit — tap Confirm, auto=true. "
-    "Or review/traveller page with Continue and filled name — tap Continue, auto=true only if Continue is safe.\n"
-    "- kind=form: empty or partial traveller fields (title/name/mobile/email) needing fill — tap empty or Continue.\n"
-    "- kind=otp / login / pay as usual. kind=other for unknown sheets (still recommend a safe next move).\n"
-    "- kind=pay: stop; tap empty; auto=false.\n"
-    "- facts: 1-4 short phrases of what is actually visible (seat map, meals, Skip, toast, sold-out).\n"
+    "Default tap=Skip add-ons and auto=true unless the traveller clearly wants a paid seat.\n"
+    "- kind=results: recommend a departure time (best_depart); tap empty (bot Books by time). auto=false.\n"
+    "- kind=upsell: optional paid extra. Tap Continue or the decline label. Never Buy/Book now on the extra.\n"
+    "- kind=form: empty/partial traveller fields. kind=otp/login/pay as usual. kind=pay: tap empty; auto=false.\n"
+    "- controls: short labels of EVERY visible primary button on this sheet "
+    "(Confirm, Continue, Edit, Skip add-ons, No Thanks, Book, …). Max 8. Exact on-screen text.\n"
+    "- tap MUST be one of controls (or empty). Never invent a button.\n"
     "- Never set tap to Pay, Buy, Secure My Trip, Assure My Trip, Insure My Trip, or anything that spends money.\n"
-    "- what/why/recommend: one short sentence each. Do not invent flights not in the image."
+    "- facts: 1-4 short phrases. what/why/recommend: one short sentence each."
+)
+
+_SPEND_TAP = re.compile(
+    r"\b(pay now|pay to complete|make payment|buy this|buy now|secure my trip|assure my trip|insure)\b",
+    re.I,
 )
 
 _KINDS = {
@@ -113,18 +115,33 @@ def see_step(
         facts.append("seat map is visible")
     if meals and not any(re.search(r"meal", f, re.I) for f in facts):
         facts.append("meals are offered")
+    controls_raw = data.get("controls") if isinstance(data.get("controls"), list) else []
+    controls: list[str] = []
+    for item in controls_raw[:8]:
+        label = re.sub(r"\s+", " ", str(item or "")).strip()[:80]
+        if label and not _SPEND_TAP.search(label) and label.lower() not in {c.lower() for c in controls}:
+            controls.append(label)
+    # Merge DOM-visible labels when the model omitted controls.
+    if not controls and page_text:
+        from app.step_read import parse_control_labels
+
+        controls = parse_control_labels(page_text)[:8]
+    tap = re.sub(r"\s+", " ", str(data.get("tap") or "")).strip()[:80]
+    if _SPEND_TAP.search(tap):
+        tap = ""
     out = {
         "kind": kind,
         "what": what[:220],
         "why": why[:220],
         "recommend": recommend[:220],
-        "tap": re.sub(r"\s+", " ", str(data.get("tap") or "")).strip()[:80],
+        "tap": tap,
         "auto": "1" if data.get("auto") in (True, "1", "true", "True") else "",
         "fares_visible": bool(data.get("fares_visible")),
         "sold_out": bool(data.get("sold_out") or kind == "unavailable"),
         "toast_only": bool(data.get("toast_only")),
         "seat_map": seat_map,
         "meals_offered": meals,
+        "controls": controls,
         "facts": facts,
         "best_depart": re.sub(r"\s+", "", str(data.get("best_depart") or ""))[:8],
         "best_price": re.sub(r"\s+", " ", str(data.get("best_price") or "")).strip()[:24],
@@ -132,12 +149,34 @@ def see_step(
     }
     if out["sold_out"]:
         out["kind"] = "unavailable"
-    if out["fares_visible"] and out["kind"] not in {"unavailable", "pay", "login", "otp", "addons"}:
+    # Review / form / upsell must never be wiped to results because a Total ₹ is visible.
+    if out["fares_visible"] and out["kind"] not in {
+        "unavailable",
+        "pay",
+        "login",
+        "otp",
+        "addons",
+        "review",
+        "form",
+        "upsell",
+        "passenger",
+    }:
         out["kind"] = "results"
+    elif out["kind"] in {"review", "form", "upsell", "passenger"}:
+        out["fares_visible"] = False
+    # DOM text can correct a wrong vision kind on Review Details.
+    if re.search(r"\breview details\b|review your itinerary", page_text or "", re.I) and out["kind"] in {
+        "results",
+        "other",
+        "loading",
+        "",
+    }:
+        out["kind"] = "review"
+        out["fares_visible"] = False
     if out["kind"] == "addons" and not out["tap"] and not re.search(r"review your itinerary", page_text or "", re.I):
         out["tap"] = "Skip add-ons"
         out["auto"] = "1"
-    from app.step_read import addons_sheet
+    from app.step_read import addons_sheet, ground_tap
 
     if addons_sheet(page_text) and re.search(r"skip add-?ons|choose add-ons", page_text or "", re.I):
         out["kind"] = "addons"
@@ -147,10 +186,16 @@ def see_step(
         out["tap"] = "Skip add-ons"
         out["auto"] = "1"
     elif re.search(r"\bcontinue\b", page_text or "", re.I) and not re.search(r"skip add-?ons", page_text or "", re.I):
-        out["kind"] = "review" if out["kind"] == "addons" else out["kind"]
-        out["tap"] = "Continue"
-        out["recommend"] = "press Continue"
+        if out["kind"] == "addons":
+            out["kind"] = "review"
+        out["tap"] = out["tap"] or "Continue"
+        out["recommend"] = out["recommend"] or "press Continue"
         out["auto"] = "1"
+    # Ground tap to controls / page — never invent.
+    grounded = ground_tap(out["tap"], out["controls"], page_text, kind=out["kind"])
+    out["tap"] = grounded
+    if grounded and grounded.lower() not in {c.lower() for c in out["controls"]}:
+        out["controls"] = [grounded, *[c for c in out["controls"] if c.lower() != grounded.lower()]][:8]
     return out
 
 
@@ -240,7 +285,16 @@ def classify_with_vision(
         return "addons", seen
     if seen.get("sold_out"):
         return "unavailable", seen
-    if seen.get("fares_visible") and mapped == "results":
+    # Review / form / upsell / passenger never become results via fares_visible.
+    if kind in {"review", "form", "upsell", "passenger"}:
+        return mapped, seen
+    if seen.get("fares_visible") and mapped == "results" and kind not in {
+        "review",
+        "form",
+        "upsell",
+        "passenger",
+        "addons",
+    }:
         return "results", seen
     # Toast-only false empty: keep results if vision says so over DOM "other"/loading.
     if mapped in {"unavailable", "results", "pay", "login", "otp", "addons", "review"} and mapped != dom_stage:

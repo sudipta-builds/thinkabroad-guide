@@ -707,6 +707,24 @@ def _clear_front_sheet(page, chosen_tap: str = "", *, seller: str = "", hint: st
         hit = _skip_addons(page)
         if hit:
             return f"front_tap:{hit}"
+    allow = []
+    try:
+        from app.step_read import parse_control_labels
+
+        allow = parse_control_labels(str(surface.get("controls") or "") + "\n" + front_copy)
+    except Exception:
+        allow = []
+    if label and re.search(r"^(confirm|continue|proceed)\b", label, re.I):
+        hit = advance_forward_control(
+            page, label, kind=str(decision.get("kind") or ""), allow=allow
+        )
+        if hit:
+            if re.search(r"skip|no,? thanks|continue", hit, re.I):
+                notes = []
+                if _leave_addons(page, notes, rounds=2):
+                    return f"front_tap:{hit}+left"
+            return f"front_tap:{hit}"
+        return "front_tap_miss"
     if label and _click_label(page, label):
         try:
             page.wait_for_timeout(500)
@@ -1437,6 +1455,79 @@ def click_verified(page, label: str) -> bool:
 def _click_label(page, label: str) -> bool:
     """Verified click. True only when the page actually changes."""
     return click_verified(page, label)
+
+
+_ALT_FORWARD = (
+    ("Confirm", ("Continue", "Proceed")),
+    ("Continue", ("Confirm", "Proceed")),
+    ("Proceed", ("Confirm", "Continue")),
+)
+
+
+def advance_forward_control(
+    page,
+    preferred: str = "",
+    *,
+    kind: str = "",
+    allow: list[str] | None = None,
+) -> str:
+    """Click a grounded forward label. If the sheet kind stays put, try Confirm↔Continue once.
+
+    Returns the label that moved the page (or was attempted last). Empty when nothing clicked.
+    """
+    from app.step_read import ground_tap, parse_control_labels
+
+    text_before, url_before = _read(page)
+    stage_before = classify_page(text_before, url_before)
+    pool = list(allow or []) or parse_control_labels(text_before)
+    target = ground_tap(preferred, pool, text_before, kind=kind)
+    if not target:
+        return ""
+
+    def _try(label: str) -> bool:
+        if re.search(r"^(confirm|continue|proceed)\b", label, re.I):
+            if _js_continue(page) or _safe_continue(page):
+                return True
+        return _click_label(page, label)
+
+    moved = _try(target)
+    clicked = target if moved else ""
+    try:
+        page.wait_for_timeout(700)
+    except Exception:
+        pass
+    text_after, url_after = _read(page)
+    stage_after = classify_page(text_after, url_after)
+    sticky = stage_after == stage_before and stage_before in {
+        "review",
+        "passenger",
+        "addons",
+        "other",
+        "fare_sheet",
+    }
+    if sticky or not moved:
+        alts: list[str] = []
+        for primary, others in _ALT_FORWARD:
+            if re.fullmatch(re.escape(primary), target, re.I):
+                alts.extend(others)
+                break
+        if not alts and re.search(r"confirm|continue|proceed", target, re.I):
+            alts = ["Confirm", "Continue", "Proceed"]
+        pool_after = parse_control_labels(text_after) or pool
+        for alt in alts:
+            if alt.lower() == target.lower():
+                continue
+            grounded = ground_tap(alt, pool_after, text_after, kind=kind)
+            if not grounded or grounded.lower() == target.lower():
+                continue
+            if _try(grounded):
+                clicked = grounded
+                try:
+                    page.wait_for_timeout(500)
+                except Exception:
+                    pass
+                break
+    return clicked
 
 
 def leave_site_error(page) -> str:
@@ -4080,13 +4171,19 @@ def run_checkout_agent(
                 tap_pending = ""
                 _leave_addons(page, log, rounds=2)
                 continue
-            elif re.search(r"\bcontinue\b", tap_pending, re.I):
-                # Cleartrip Review uses "Continue with 1-step checkout" — exact "Continue" misses.
-                moved = _js_continue(page) or _safe_continue(page) or _click_label(page, tap_pending)
-                log.append(f"user_tap_continue:{int(bool(moved))}")
+            elif re.search(r"\b(confirm|continue|proceed)\b", tap_pending, re.I):
+                # Ground to visible control; if sheet stuck, retry Confirm↔Continue once.
+                hit = advance_forward_control(page, tap_pending, kind=stage)
+                # Keep user_tap_continue for Continue; note Confirm/Proceed retries as forward.
+                if re.search(r"\bcontinue\b", tap_pending, re.I) or (
+                    hit and re.search(r"\bcontinue\b", hit, re.I)
+                ):
+                    log.append(f"user_tap_continue:{int(bool(hit))}")
+                else:
+                    log.append(f"user_tap_forward:{hit or 'miss'}")
                 tap_pending = ""
                 try:
-                    page.wait_for_timeout(900)
+                    page.wait_for_timeout(400)
                 except Exception:
                     pass
                 continue

@@ -3057,17 +3057,26 @@ class SellerChoiceAndProxy(unittest.TestCase):
         from app.turn_loop import _TURN, _GOAL_DO, _align_ok, align_action, _message_implies_action
 
         self.assertIn("INTENT FIRST", _TURN)
-        self.assertIn("ACTION RULE", _TURN)
+        self.assertIn("SEGMENT", _TURN)
+        self.assertIn("REPLY RULE", _TURN)
         self.assertTrue(_align_ok("search", "search"))
         self.assertFalse(_align_ok("search", "pay_ask"))
         self.assertTrue(_align_ok("pay", "pay_ask"))
+        self.assertTrue(_align_ok("ask", "reply"))
+        self.assertFalse(_align_ok("ask", "book"))
         self.assertIn("pay", _GOAL_DO)
+        from app.turn_loop import _wants_clarify
+
         self.assertTrue(_message_implies_action("sudipta@example.com"))
         self.assertTrue(_message_implies_action("fill my email"))
         self.assertTrue(_message_implies_action("pick one"))
         self.assertTrue(_message_implies_action("continue"))
         self.assertTrue(_message_implies_action("check all the fares for all the different sites"))
         self.assertFalse(_message_implies_action("hmm what about that"))
+        self.assertTrue(_wants_clarify("why is the convenience fee so high?"))
+        self.assertTrue(_wants_clarify("is this refundable?"))
+        self.assertFalse(_wants_clarify("continue"))
+        self.assertFalse(_wants_clarify("pick one"))
 
         base = {
             "stage": "booking",
@@ -3130,7 +3139,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
             if "traveller" in goal:
                 self.assertEqual(out["tap"], tap)
 
-        # Pure status stays reply.
+        # Pure status / doubt stays reply — never forced into book/details/pay.
         ask = {
             "goal": "ask",
             "intent": "status",
@@ -3143,6 +3152,22 @@ class SellerChoiceAndProxy(unittest.TestCase):
         with patch("app.turn_loop.interpret_turn", return_value=ask):
             clarify = align_action("hmm what about that", {**base, "last_vision": {"kind": "form"}})
         self.assertEqual(clarify["do"], "reply")
+        doubt = {
+            "goal": "forward",
+            "intent": "book",
+            "kind": "pay",
+            "reply": "Continuing.",
+            "tap": "Continue",
+            "facts": [],
+            "source": "gemini",
+        }
+        with patch("app.turn_loop.interpret_turn", return_value=doubt):
+            fee = align_action(
+                "why is the convenience fee so high?",
+                {**base, "stage": "payment", "stuck_kind": "pay", "last_vision": {"kind": "pay"}},
+            )
+        self.assertEqual(fee["do"], "reply")
+        self.assertEqual(fee["turn"]["goal"], "ask")
 
         # handle_turn details path must start browse (Typing…), not note-only.
         import inspect

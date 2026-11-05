@@ -78,6 +78,7 @@ _UNDERSTAND = (
     "search: new fares or a route. select: a departure time on a fare list.\n"
     "goal=search when they want fares/prices/other sites — even if the last page was payment.\n"
     "goal=pay when they want YOU to fill UPI/card / authorize pay; goal=pay_self when they pay on the link.\n"
+    "goal=ask when they have a doubt or want clarification (why/how/what) — reply only, no click.\n"
     "login / cancel as usual. Intent comes from the message, not the open sheet alone.\n"
     "wanted_tap: __select_traveller__, __delete_traveller__, or a visible button label, else empty.\n"
     "flight_hint: departure time if named. reply: one short sentence mirroring their ask. No emoji. Nothing paid."

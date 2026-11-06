@@ -3006,6 +3006,16 @@ def _stuck_line(state: dict[str, Any], kind: str, what: str, why: str, recommend
     return spoken
 
 
+def _remember_front_sheet(state: dict[str, Any], surface: dict) -> None:
+    """Keep the covering dialog for the next turn so clicks don't hit the page under it."""
+    if surface.get("overlay") and str(surface.get("text") or "").strip():
+        state["stuck_front"] = str(surface.get("text") or "")[:2000]
+        state["stuck_controls"] = str(surface.get("controls") or "")[:1200]
+    else:
+        state.pop("stuck_front", None)
+        state.pop("stuck_controls", None)
+
+
 def _addon_upsell(page: str) -> str:
     """Paid cancellation/add-on sheet from page text. Empty when Continue is the real step."""
     hay = page or ""
@@ -3038,6 +3048,7 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             surface = read_surface(session.page)
         except Exception:
             surface = {"overlay": False, "text": "", "controls": ""}
+        _remember_front_sheet(state, surface)
     from app.page_agent import apply_front_text, classify_page, flight_unavailable, nearest_depart_hint
 
     page = apply_front_text(page, surface)

@@ -1727,6 +1727,15 @@ class SellerChoiceAndProxy(unittest.TestCase):
         ready = decide_sheet("Review your itinerary Fare summary Continue", {"email": "a@b.co"})
         self.assertEqual(ready.get("action"), "click")
         self.assertEqual(ready.get("tap"), "Continue")
+        # Confirm modal covers Contact Details — must click, not fill behind it.
+        name_over_contact = (
+            "Review Details Contact Details Email Mobile Please ensure that your name matches "
+            "your govt ID such as Aadhaar Confirm Edit Mr Sudipta"
+        )
+        self.assertTrue(is_name_confirm(name_over_contact))
+        self.assertFalse(is_contact_form(name_over_contact))
+        self.assertEqual(decide_sheet(name_over_contact, {"email": "a@b.co"}).get("action"), "click")
+        self.assertEqual(decide_sheet(name_over_contact, {"email": "a@b.co"}).get("tap"), "Confirm")
 
     def test_sheet_decides_fill_ask_or_click(self) -> None:
         """Continue follows the open sheet: ask, fill, or the visible button. Never a stage default."""
@@ -1769,6 +1778,96 @@ class SellerChoiceAndProxy(unittest.TestCase):
         )
         self.assertEqual(pay["do"], "reply")
         self.assertNotIn("pay now", (pay.get("tap") or "").lower())
+
+        name_page = (
+            "Review Details Contact Details Email Please ensure that your name matches "
+            "your govt ID Confirm Edit"
+        )
+        name_yes = align_action(
+            "confirm",
+            {
+                **base,
+                "stuck_page": name_page,
+                "stuck_kind": "name_confirm",
+                "pending_step": {"tap": "Confirm", "page": name_page, "kind": "name_confirm"},
+                "email": "a@b.co",
+            },
+        )
+        self.assertEqual(name_yes["do"], "book")
+        self.assertEqual(name_yes.get("tap"), "Confirm")
+
+        # Front sheet wins: overlay Skip is pressed; background Continue is ignored.
+        from app.step_read import active_sheet_hay, decide_sheet
+
+        under = (
+            "Contact Details Please enter valid email address Email Continue "
+            "Skip add-ons Choose add-ons"
+        )
+        front = "Choose add-ons Skip add-ons"
+        hay, cover = active_sheet_hay(under, front=front, controls="btn[ ] Skip add-ons", overlay=True)
+        self.assertTrue(cover)
+        self.assertIn("Skip add-ons", hay)
+        move = decide_sheet(
+            under,
+            {"email": "a@b.co"},
+            front=front,
+            controls="btn[ ] Skip add-ons",
+            overlay=True,
+        )
+        self.assertEqual(move.get("action"), "click")
+        self.assertIn("Skip", str(move.get("tap") or ""))
+        self.assertNotEqual(move.get("action"), "fill")
+        upsell_front = "Free Cancellation No, Thanks Secure My Trip"
+        upsell_move = decide_sheet(
+            under + " " + upsell_front,
+            {},
+            front=upsell_front,
+            controls="btn[ ] No, Thanks",
+            overlay=True,
+        )
+        self.assertEqual(upsell_move.get("action"), "ask")
+        self.assertRegex(str(upsell_move.get("tap") or ""), r"No,?\s*Thanks")
+
+        # stuck_front makes yes press the cover button, not fill contact under it.
+        skip_yes = align_action(
+            "yes",
+            {
+                **base,
+                "stuck_page": under,
+                "stuck_kind": "addons",
+                "stuck_front": front,
+                "stuck_controls": "btn[ ] Skip add-ons",
+                "pending_step": {"tap": "Skip add-ons", "page": front, "kind": "addons"},
+                "email": "a@b.co",
+            },
+        )
+        self.assertEqual(skip_yes["do"], "book")
+        self.assertIn("Skip", str(skip_yes.get("tap") or ""))
+
+    def test_front_sheet_wiring_is_locked(self) -> None:
+        """Checkout and replies must prefer the covering dialog over the page under it."""
+        import inspect
+
+        from app.page_agent import run_checkout_agent
+        from app.step_read import active_sheet_hay, arm_pending_step
+        from app.travel_agent import _remember_front_sheet
+        from app.turn_loop import align_action
+
+        checkout = inspect.getsource(run_checkout_agent)
+        self.assertIn("read_surface(page)", checkout)
+        self.assertIn("overlay=", checkout)
+        self.assertIn("stuck_front", inspect.getsource(align_action) + inspect.getsource(arm_pending_step))
+        self.assertTrue(callable(active_sheet_hay))
+        self.assertTrue(callable(_remember_front_sheet))
+        state: dict = {}
+        _remember_front_sheet(
+            state,
+            {"overlay": True, "text": "Please ensure name Confirm Edit", "controls": "btn[ ] Confirm"},
+        )
+        self.assertIn("Confirm", state.get("stuck_front") or "")
+        self.assertIn("Confirm", state.get("stuck_controls") or "")
+        _remember_front_sheet(state, {"overlay": False, "text": "", "controls": ""})
+        self.assertNotIn("stuck_front", state)
 
     def test_after_book_follow_through_is_wired(self) -> None:
         import inspect

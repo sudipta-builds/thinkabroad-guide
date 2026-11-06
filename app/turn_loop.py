@@ -1038,11 +1038,49 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
 
     from app.step_read import decide_sheet
 
-    sheet_move = decide_sheet(str(state.get("stuck_page") or ""), state)
+    sheet_move = decide_sheet(
+        stuck_page,
+        state,
+        front=str(state.get("stuck_front") or ""),
+        controls=str(state.get("stuck_controls") or ""),
+        overlay=bool(state.get("stuck_front")),
+    )
     # Only the open sheet. A new time, seller, or login is a different request.
     on_this_sheet = goal in {"forward", "skip", "details"} or bool(
         re.search(r"\b(?:continue|go on|yes|yeah|ok|okay|confirm)\b", text or "", re.I)
     )
+    # Covering sheet: yes/confirm/continue presses that sheet's button — never fill behind it.
+    cover_kinds = {"name_confirm", "upsell", "addons", "review"}
+    if (
+        on_this_sheet
+        and str(state.get("stuck_kind") or "") in cover_kinds
+        and re.search(r"\b(?:confirm|yes|yep|yeah|ok|okay|sure|continue)\b", text or "", re.I)
+    ):
+        pending = state.get("pending_step") if isinstance(state.get("pending_step"), dict) else {}
+        cover_tap = str((pending or {}).get("tap") or sheet_move.get("tap") or tap or "")
+        if sheet_move.get("action") == "click" and cover_tap:
+            return _plan(
+                do="book",
+                kind="book",
+                tap=cover_tap,
+                turn=turn,
+                goal="forward",
+                intent="book",
+            )
+        # Upsell-style ask already named a safe decline/forward control.
+        if (
+            sheet_move.get("action") == "ask"
+            and cover_tap
+            and not sheet_move.get("missing")
+        ):
+            return _plan(
+                do="book",
+                kind="book",
+                tap=cover_tap,
+                turn=turn,
+                goal="skip" if re.search(r"skip|no.?thanks", cover_tap, re.I) else "forward",
+                intent="book",
+            )
     if on_this_sheet and sheet_move.get("action") in {"ask", "reply", "stop"}:
         if sheet_move.get("action") == "stop":
             fields = "payment"

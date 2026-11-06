@@ -4170,10 +4170,18 @@ def run_checkout_agent(
                 "This step took too long, so I stopped and sent the page. Nothing paid."
             )
             return CheckoutOutcome(stage, text, url, log, facts=facts, checks=checks, handoff=handoff)
-        # Act from this sheet: ask for an empty field we lack, type one we have, then click its button.
+        # Front sheet first: a covering dialog owns the click; never fill the page under it.
         from app.step_read import decide_sheet
 
-        sheet_move = decide_sheet(text, profile)
+        surface_now = read_surface(page)
+        front_now = apply_front_text(text, surface_now)
+        sheet_move = decide_sheet(
+            text,
+            profile,
+            front=str(surface_now.get("text") or ""),
+            controls=str(surface_now.get("controls") or ""),
+            overlay=bool(surface_now.get("overlay")),
+        )
         if sheet_move.get("action") == "ask" and sheet_move.get("missing"):
             fields = " and ".join(str(item) for item in sheet_move["missing"])
             handoff = (
@@ -4181,8 +4189,18 @@ def run_checkout_agent(
                 "Send it and I'll type it in. Nothing paid."
             )
             return CheckoutOutcome("passenger", text, url, log, facts=facts, checks=checks, handoff=handoff)
-        if sheet_move.get("action") == "fill":
-            keys = tuple(str(item) for item in (sheet_move.get("fills") or []) if str(item) in {"email", "phone", "name", "dob"})
+        if sheet_move.get("action") == "ask" and sheet_move.get("tap") and not tap_pending:
+            # Upsell / unknown cover — stop and name the button; don't fill behind it.
+            handoff = (
+                f"A sheet is open with {sheet_move['tap']}. "
+                f"Reply yes and I'll press it. Nothing paid."
+            )
+            log.append(f"front_ask:{sheet_move.get('tap')}")
+            return CheckoutOutcome("ask", text, url, log, facts=facts, checks=checks, handoff=handoff)
+        if sheet_move.get("action") == "fill" and not surface_now.get("overlay"):
+            keys = tuple(
+                str(item) for item in (sheet_move.get("fills") or []) if str(item) in {"email", "phone", "name", "dob"}
+            )
             typed = fill_profile_slots(page, profile, keys=keys or ("email", "phone"))
             log.extend(typed)
             text, url, stage, facts = _snapshot()
@@ -4195,7 +4213,14 @@ def run_checkout_agent(
                 return CheckoutOutcome(
                     "passenger", text, url, log, facts=facts, checks=checks, handoff=handoff
                 )
-            sheet_move = decide_sheet(text, profile)
+            surface_now = read_surface(page)
+            sheet_move = decide_sheet(
+                text,
+                profile,
+                front=str(surface_now.get("text") or ""),
+                controls=str(surface_now.get("controls") or ""),
+                overlay=bool(surface_now.get("overlay")),
+            )
         if (
             sheet_move.get("action") == "click"
             and sheet_move.get("tap")
@@ -4203,6 +4228,10 @@ def run_checkout_agent(
             and stage not in {"results", "loading", "pay", "otp", "home"}
         ):
             tap_pending = str(sheet_move["tap"])
+            log.append(f"sheet_decide:{tap_pending}:overlay={int(bool(surface_now.get('overlay')))}")
+        # Prefer front-only copy for later stage checks when a dialog is open.
+        if surface_now.get("overlay") and front_now:
+            text = front_now
         # A named button is clicked before any add-ons shortcut. Review is not Choose add-ons.
         if tap_pending and not tap_pending.startswith("__"):
             from app.step_read import form_sheet

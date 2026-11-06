@@ -128,31 +128,28 @@ def is_paid_upsell(page: str) -> bool:
     return bool(re.search(r"secure my trip|buy this|assure my trip|no,?\s*thanks", hay, re.I))
 
 
-def is_contact_form(page: str) -> bool:
-    """Ixigo/Cleartrip contact step: email, mobile, billing. Not a name-check Confirm."""
+def is_name_confirm(page: str) -> bool:
+    """Name-check overlay (govt-id / Confirm). Wins over contact copy behind the modal."""
     hay = page or ""
-    if re.search(r"matches your (govt|name)|govt\.?\s*id|aadhaar|driver.?s license", hay, re.I):
-        if not re.search(r"contact details|please enter (?:a )?valid email", hay, re.I):
-            return False
+    if not re.search(r"\b(?:confirm|continue)\b", hay, re.I):
+        return False
     return bool(
         re.search(
-            r"contact details|please enter (?:a )?valid email|enter your email|e-?mail address",
+            r"govt\.?\s*id|aadhaar|matches your (govt|name)|driver.?s license|please ensure that your name",
             hay,
             re.I,
         )
     )
 
 
-def is_name_confirm(page: str) -> bool:
-    """Name check sheet (govt-id / Confirm). Not the contact form and not payment."""
+def is_contact_form(page: str) -> bool:
+    """Ixigo/Cleartrip contact step: email, mobile, billing. Not a covering name-check."""
     hay = page or ""
-    if is_contact_form(hay):
-        return False
-    if not re.search(r"\b(?:confirm|continue)\b", hay, re.I):
+    if is_name_confirm(hay):
         return False
     return bool(
         re.search(
-            r"govt\.?\s*id|aadhaar|matches your (govt|name)|driver.?s license|please ensure that your name",
+            r"contact details|please enter (?:a )?valid email|enter your email|e-?mail address",
             hay,
             re.I,
         )
@@ -221,13 +218,41 @@ def _sheet_fields(page: str, facts: dict) -> tuple[list[str], list[str]]:
     return missing, fills
 
 
-def decide_sheet(page: str, profile: dict | None = None) -> dict[str, object]:
+def active_sheet_hay(
+    page: str,
+    *,
+    front: str = "",
+    controls: str = "",
+    overlay: bool = False,
+) -> tuple[str, bool]:
+    """The sheet that owns the next click. Covering dialogs win over the page behind them."""
+    front_text = (front or "").strip()
+    control_text = (controls or "").strip()
+    if overlay and (front_text or control_text):
+        return (f"{front_text}\n{control_text}".strip(), True)
+    full = page or ""
+    # DOM dumps often mix a modal with the form under it — prefer the cover.
+    if is_name_confirm(full) or is_paid_upsell(full):
+        return (full, True)
+    if addons_sheet(full) and re.search(r"skip add-?ons|no,?\s*thanks", full, re.I):
+        return (full, True)
+    return (full, False)
+
+
+def decide_sheet(
+    page: str,
+    profile: dict | None = None,
+    *,
+    front: str = "",
+    controls: str = "",
+    overlay: bool = False,
+) -> dict[str, object]:
     """One rule for every sheet: fill, ask, reply, or click whatever is actually on it.
 
-    A page type does not choose the button. Pay, a fare list, and paid extras are rails.
+    When a covering dialog is open, only that dialog's fields and buttons count.
     """
     empty: dict[str, object] = {"action": "none", "tap": "", "missing": [], "fills": []}
-    hay = page or ""
+    hay, cover = active_sheet_hay(page, front=front, controls=controls, overlay=overlay)
     facts = profile or {}
     if not hay.strip():
         return empty
@@ -240,22 +265,42 @@ def decide_sheet(page: str, profile: dict | None = None) -> dict[str, object]:
     ):
         tap = safe_tap("Search Again", hay)
         return {**empty, "action": "reply", "tap": tap}
-    if _fare_list_sheet(hay):
+    if not cover and _fare_list_sheet(hay):
         return {**empty, "action": "pick"}
     if is_paid_upsell(hay):
-        return {**empty, "action": "ask", "tap": decline_tap(hay)}
+        tap = decline_tap(hay) or ground_tap("", page=hay, kind="upsell")
+        return {**empty, "action": "ask", "tap": tap}
     if addons_sheet(hay):
-        tap = visible_forward(hay)
+        tap = visible_forward(hay) or ground_tap("Skip add-ons", page=hay, kind="addons")
         if tap:
             return {**empty, "action": "click", "tap": tap}
+    # Covering name-check / dialog: click its button. Never fill the form behind it.
+    if is_name_confirm(hay) or (cover and re.search(r"\bconfirm\b", hay, re.I) and re.search(
+        r"govt|aadhaar|edit\b", hay, re.I
+    )):
+        tap = (
+            ground_tap("", list(parse_control_labels(controls or hay)), hay, kind="name_confirm")
+            or forward_tap(hay)
+            or safe_tap("Confirm", hay)
+            or "Confirm"
+        )
+        return {"action": "click", "tap": tap, "missing": [], "fills": []}
+    if cover and not is_contact_form(hay) and not form_sheet(hay):
+        # Generic overlay: press a visible safe control from this sheet only.
+        tap = (
+            ground_tap("", list(parse_control_labels(controls or hay)), hay)
+            or decline_tap(hay)
+            or forward_tap(hay)
+        )
+        if tap:
+            return {"action": "click", "tap": tap, "missing": [], "fills": []}
+        return empty
     missing, fills = _sheet_fields(hay, facts)
-    tap = ""
-    if is_name_confirm(hay):
-        tap = ground_tap("", page=hay, kind="name_confirm") or forward_tap(hay)
-    elif is_contact_form(hay) or form_sheet(hay):
-        tap = forward_tap(hay)
-    else:
-        tap = forward_tap(hay) or decline_tap(hay)
+    tap = (
+        ground_tap("", list(parse_control_labels(controls or hay)), hay)
+        or forward_tap(hay)
+        or decline_tap(hay)
+    )
     if missing:
         return {"action": "ask", "tap": "", "missing": missing, "fills": fills}
     if fills:
@@ -492,7 +537,8 @@ def arm_pending_step(
     controls: list[str] | None = None,
 ) -> None:
     """Remember this page so yes / No thanks can resume checkout."""
-    hay = (page or "")[:1500]
+    front = str(state.get("stuck_front") or "").strip()
+    hay = (front or page or "")[:1500]
     label = tap or decline_tap(hay)
     pending: dict = {
         "tap": label,
@@ -501,6 +547,8 @@ def arm_pending_step(
     }
     if controls:
         pending["controls"] = [str(c)[:80] for c in controls if str(c).strip()][:8]
+    elif str(state.get("stuck_controls") or "").strip():
+        pending["controls"] = parse_control_labels(str(state.get("stuck_controls")))[:8]
     state["stuck_page"] = hay
     state["pending_step"] = pending
 

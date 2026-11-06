@@ -4418,6 +4418,36 @@ def run_checkout_agent(
                         page.wait_for_timeout(500)
                     except Exception:
                         pass
+                    # Conscience: after the tick, fill empty contact boxes then press Continue.
+                    typed = type_saved_contact(page, profile)
+                    if typed:
+                        log.extend(typed)
+                    from app.step_read import forward_tap
+
+                    after = _snapshot()
+                    text, url, stage, facts = after
+                    move = decide_sheet(text, profile)
+                    if move.get("action") == "ask" and move.get("missing"):
+                        fields = " and ".join(str(item) for item in move["missing"])
+                        handoff = (
+                            f"I ticked the saved traveller. The page still needs your {fields} "
+                            "before Continue. Send it and I'll type it in. Nothing paid."
+                        )
+                        return CheckoutOutcome(
+                            "passenger", text, url, log, facts=facts, checks=checks, handoff=handoff
+                        )
+                    if move.get("action") == "fill":
+                        keys = tuple(
+                            str(item)
+                            for item in (move.get("fills") or [])
+                            if str(item) in {"email", "phone", "name", "dob"}
+                        )
+                        more = fill_profile_slots(page, profile, keys=keys or ("email", "phone"))
+                        log.extend(more)
+                        text, url, stage, facts = _snapshot()
+                    label_next = str(move.get("tap") or "") or forward_tap(text or "") or "Continue"
+                    hit = advance_forward_control(page, label_next, kind="passenger")
+                    log.append(f"after_pick_continue:{hit or 'miss'}")
                     continue
                 if note.startswith("traveller_unticked") or note == "behind_sheet" or not note:
                     handoff = (

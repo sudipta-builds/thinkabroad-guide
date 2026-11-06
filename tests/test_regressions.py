@@ -1737,6 +1737,73 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(decide_sheet(name_over_contact, {"email": "a@b.co"}).get("action"), "click")
         self.assertEqual(decide_sheet(name_over_contact, {"email": "a@b.co"}).get("tap"), "Confirm")
 
+    def test_saved_traveller_sheet_continues_not_confirm(self) -> None:
+        """Saved list: Continue + fill conscience. Never Confirm; free-cancellation stays upsell."""
+        import inspect
+
+        from app.step_read import decide_sheet, forward_tap, is_name_confirm, is_saved_traveller_sheet
+        from app.travel_agent import _booking_page_reply
+
+        saved_list = (
+            "Review Details Traveller Details Adult 1 Mr Sudipta Saikia Ms Anita Continue Confirm"
+        )
+        self.assertTrue(is_saved_traveller_sheet(saved_list))
+        self.assertFalse(is_name_confirm(saved_list))
+        self.assertEqual(forward_tap(saved_list), "Continue")
+        ready = decide_sheet(
+            saved_list,
+            {"email": "a@b.co", "name": "Sudipta Saikia", "phone": "8876233052"},
+        )
+        self.assertEqual(ready.get("action"), "click")
+        self.assertEqual(ready.get("tap"), "Continue")
+        # Empty contact boxes → fill first; never jump to Confirm.
+        needs_email = (
+            "Review Details Traveller Details Adult 1 Mr Sudipta Saikia "
+            "Contact Details Please enter a valid email Continue Confirm"
+        )
+        self.assertTrue(is_saved_traveller_sheet(needs_email))
+        fill_move = decide_sheet(needs_email, {"email": "a@b.co", "name": "Sudipta Saikia"})
+        self.assertEqual(fill_move.get("action"), "fill")
+        self.assertEqual(fill_move.get("tap"), "Continue")
+        # Confirm still wins on a real govt-id modal.
+        confirm_page = (
+            "Review Details Please ensure that your name matches your govt ID Confirm Edit Continue"
+        )
+        self.assertFalse(is_saved_traveller_sheet(confirm_page))
+        self.assertTrue(is_name_confirm(confirm_page))
+        self.assertEqual(forward_tap(confirm_page), "Confirm")
+        # Free-cancellation radio with a name behind it is not the saved-list sheet.
+        radio = (
+            "Add Free Cancellation Please select an option before proceeding "
+            "I don't want Free Cancellation Traveller Details Mr Sudipta Saikia Continue"
+        )
+        self.assertFalse(is_saved_traveller_sheet(radio))
+        state = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "ixigo",
+            "selected_hint": "8:55",
+            "name": "Sudipta Saikia",
+            "email": "a@b.co",
+        }
+        spoken = _booking_page_reply(
+            state,
+            "8:55",
+            saved_list,
+            type("S", (), {"page": None})(),
+        )
+        self.assertIn("saved travellers", spoken.lower())
+        self.assertIn("Continue", spoken)
+        self.assertNotIn("wants Confirm", spoken)
+        self.assertEqual(state.get("stuck_kind"), "passenger")
+        self.assertEqual((state.get("pending_step") or {}).get("tap"), "Continue")
+        checkout = inspect.getsource(
+            __import__("app.page_agent", fromlist=["run_checkout_agent"]).run_checkout_agent
+        )
+        self.assertIn("after_pick_continue", checkout)
+        self.assertIn("user_pick_traveller", checkout)
+
     def test_sheet_decides_fill_ask_or_click(self) -> None:
         """Continue follows the open sheet: ask, fill, or the visible button. Never a stage default."""
         from app.step_read import decide_sheet
@@ -3204,9 +3271,15 @@ class SellerChoiceAndProxy(unittest.TestCase):
 
         self.assertTrue(wants_pick_saved_traveller("click one of the names"))
         self.assertTrue(wants_pick_saved_traveller("pick one"))
+        self.assertTrue(wants_pick_saved_traveller("selecte traveller as sudipta saikia"))
+        self.assertTrue(wants_pick_saved_traveller("select traveller as Sudipta Saikia"))
         self.assertTrue(wants_delete_traveller("delete one of the profiles"))
         self.assertTrue(wants_delete_traveller("get rid of the duplicate profiles"))
         self.assertFalse(wants_pick_saved_traveller("8876233052"))
+        from app.travel_agent import traveller_name_from_ask
+
+        self.assertEqual(traveller_name_from_ask("selecte traveller as sudipta saikia"), "sudipta saikia")
+        self.assertEqual(traveller_name_from_ask("pick traveller as Sudipta Saikia"), "Sudipta Saikia")
         state = {
             "stage": "booking",
             "stuck_kind": "form",
@@ -3221,6 +3294,9 @@ class SellerChoiceAndProxy(unittest.TestCase):
         }
         asked = extract_user_ask("click one of the names", state)
         self.assertEqual(asked["tap"], "__select_traveller__")
+        named_ask = extract_user_ask("selecte traveller as sudipta saikia", state)
+        self.assertEqual(named_ask["tap"], "__select_traveller__")
+        self.assertEqual(state.get("name"), "sudipta saikia")
         # Gemini goal drives action — even without regex-friendly wording.
         gemini_pick = {
             "goal": "pick_traveller",
@@ -3395,6 +3471,57 @@ class SellerChoiceAndProxy(unittest.TestCase):
         with patch("app.turn_loop.interpret_turn", return_value=ask):
             clarify = align_action("hmm what about that", {**base, "last_vision": {"kind": "form"}})
         self.assertEqual(clarify["do"], "reply")
+        # Saved-traveller sheet: yes → Continue (not Confirm), and typo selecte still picks.
+        saved_page = (
+            "Review Details Traveller Details Adult 1 Mr Sudipta Saikia "
+            "a@b.co 8876233052 Continue Confirm"
+        )
+        yes_turn = {
+            "goal": "forward",
+            "intent": "book",
+            "kind": "passenger",
+            "reply": "Continuing.",
+            "tap": "",
+            "facts": [],
+            "source": "gemini",
+        }
+        passenger_state = {
+            **base,
+            "stuck_kind": "passenger",
+            "stuck_page": saved_page,
+            "email": "a@b.co",
+            "phone": "8876233052",
+            "name": "Sudipta Saikia",
+            "last_vision": {"kind": "passenger"},
+        }
+        with patch("app.turn_loop.interpret_turn", return_value=yes_turn):
+            yes_go = align_action("yes", passenger_state)
+        self.assertEqual(yes_go["do"], "book")
+        self.assertEqual(yes_go["tap"], "Continue")
+        # Empty contact boxes → conscience fills first, does not invent Confirm.
+        empty_contact = {
+            **passenger_state,
+            "stuck_page": (
+                "Review Details Traveller Details Adult 1 Mr Sudipta Saikia "
+                "Contact Details Please enter a valid email Mobile Continue Confirm"
+            ),
+        }
+        with patch("app.turn_loop.interpret_turn", return_value=yes_turn):
+            fill_first = align_action("yes", empty_contact)
+        self.assertEqual(fill_first["do"], "details")
+        pick_typo = {
+            "goal": "pick_traveller",
+            "intent": "book",
+            "kind": "passenger",
+            "reply": "Picking.",
+            "tap": "",
+            "facts": [],
+            "source": "gemini",
+        }
+        with patch("app.turn_loop.interpret_turn", return_value=pick_typo):
+            typo = align_action("selecte traveller as sudipta saikia", passenger_state)
+        self.assertEqual(typo["do"], "book")
+        self.assertEqual(typo["tap"], "__select_traveller__")
         doubt = {
             "goal": "forward",
             "intent": "book",

@@ -527,6 +527,8 @@ def handle_turn(
                 if turn_goal == "delete_traveller" or wants_delete_traveller(text)
                 else "__select_traveller__"
             )
+            if state["chosen_tap"] == "__select_traveller__":
+                _remember_traveller_name(state, text)
             kind = "book"
             do = "book"
             tap = state["chosen_tap"]
@@ -586,8 +588,8 @@ def handle_turn(
         state.pop("pending_step", None)
         _save(phone, state)
         if tap in {"__select_traveller__", "__pick_traveller__"}:
-            # Fall through to browse with a clear ack — never contact-fill.
-            pass
+            _remember_traveller_name(state, text)
+            _save(phone, state)
         elif tap in {"__delete_traveller__", "__remove_traveller__"}:
             pass
     cached = _cached_fares_reply(state, text, kind)
@@ -913,7 +915,8 @@ def wants_pick_saved_traveller(text: str) -> bool:
         return False
     return bool(
         re.search(
-            r"\b(?:click|pick|select|tick|choose|use|tap)\b.+\b(?:name|names|traveller|traveler|profile|saved|one of)\b"
+            r"\b(?:click|pick|select\w*|tick|choose|use|tap)\b.+\b(?:name|names|traveller|traveler|profile|saved|one of)\b"
+            r"|\b(?:traveller|traveler)\s+as\b"
             r"|\bpick one\b|\bthat one\b|\bone of the names\b|\bsaved (?:traveller|traveler|profile)\b"
             r"|\bexisting (?:traveller|traveler)\b|\bany of (?:the|those) names\b|\buse (?:the |a )?saved\b"
             r"|\banyone (?:of them|listed)\b",
@@ -921,6 +924,26 @@ def wants_pick_saved_traveller(text: str) -> bool:
             re.I,
         )
     )
+
+
+def traveller_name_from_ask(text: str) -> str:
+    """Name the traveller asked to tick, e.g. 'select traveller as Sudipta Saikia'."""
+    raw = re.sub(r"\s+", " ", (text or "").strip())
+    match = re.search(
+        r"(?:traveller|traveler|name|profile)\s+as\s+(.+)$"
+        r"|(?:select\w*|pick|tick|choose|use)\s+(?:the\s+)?(?:traveller|traveler|name|profile)\s+(?:as\s+)?(.+)$"
+        r"|(?:select\w*|pick|tick|choose)\s+(.+)$",
+        raw,
+        re.I,
+    )
+    if not match:
+        return ""
+    name = next((g for g in match.groups() if g), "")
+    name = re.sub(r"\b(?:traveller|traveler|profile|please|thanks)\b", " ", name, flags=re.I)
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    if len(name) < 3 or re.fullmatch(r"one|it|that|this|him|her", name, re.I):
+        return ""
+    return name[:80]
 
 
 def wants_delete_traveller(text: str) -> bool:
@@ -965,6 +988,7 @@ def extract_user_ask(text: str, state: dict[str, Any]) -> dict[str, str]:
         out["intent"] = "book"
         out["goal"] = "pick_traveller"
         out["tap"] = "__select_traveller__"
+        _remember_traveller_name(state, raw)
         return out
     if re.search(r"\b(add-?ons?|next step|go (?:to |on to )?payment|move (?:on|forward|ahead))\b", raw, re.I):
         out["intent"] = "book"
@@ -1184,6 +1208,14 @@ def _usable_reply(state: dict[str, Any], spoken: str, fallback: str) -> str:
     return text
 
 
+def _remember_traveller_name(state: dict[str, Any], text: str = "") -> str:
+    """Keep the named saved traveller from the ask so checkout can tick that person."""
+    name = traveller_name_from_ask(text)
+    if name:
+        state["name"] = name
+    return name
+
+
 def _apply_understood_tap(state: dict[str, Any], wanted: str, *, page: str = "") -> str:
     """Map Gemini/local wanted_tap to a checkout tap. Special traveller taps bypass page match."""
     raw = (wanted or "").strip()
@@ -1229,10 +1261,15 @@ def resolve_intent(text: str, state: dict[str, Any], prior: list[dict[str, Any]]
     asked = extract_user_ask(text, state)
     if asked.get("tap") and _mid_booking(state):
         _apply_understood_tap(state, asked["tap"])
+        if asked.get("tap") == "__select_traveller__":
+            _remember_traveller_name(state, text)
 
     def _local_spoken() -> str:
         if asked.get("tap") == "__select_traveller__":
-            return "I'll tick one saved traveller. I won't create a new profile. Nothing paid."
+            who = str(state.get("name") or "").strip()
+            if who:
+                return f"I'll tick {who} on the saved list, fill what's needed, then Continue. Nothing paid."
+            return "I'll tick one saved traveller, fill what's needed, then Continue. Nothing paid."
         if asked.get("tap") == "__delete_traveller__":
             return "I'll remove one saved traveller profile. Nothing paid."
         if asked.get("tap"):
@@ -1279,7 +1316,13 @@ def resolve_intent(text: str, state: dict[str, Any], prior: list[dict[str, Any]]
     ):
         kind = "book"
         _apply_understood_tap(state, wanted or "__select_traveller__")
-        spoken = spoken or "I'll tick one saved traveller. I won't create a new profile. Nothing paid."
+        _remember_traveller_name(state, text)
+        who = str(state.get("name") or "").strip()
+        spoken = spoken or (
+            f"I'll tick {who}, fill what's needed, then Continue. Nothing paid."
+            if who
+            else "I'll tick one saved traveller, fill what's needed, then Continue. Nothing paid."
+        )
     elif _mid_booking(state) and (
         gem_goal in {"delete_traveller", "remove_traveller"}
         or wanted in {"__delete_traveller__", "__remove_traveller__"}
@@ -1326,7 +1369,12 @@ def resolve_intent(text: str, state: dict[str, Any], prior: list[dict[str, Any]]
         state["chosen_tap"] = decline_tap(str(state.get("stuck_page") or "")) or "Skip add-ons"
     if not spoken and asked.get("tap"):
         if asked["tap"] == "__select_traveller__":
-            spoken = "I'll tick one saved traveller. I won't create a new profile. Nothing paid."
+            who = str(state.get("name") or "").strip()
+            spoken = (
+                f"I'll tick {who}, fill what's needed, then Continue. Nothing paid."
+                if who
+                else "I'll tick one saved traveller, fill what's needed, then Continue. Nothing paid."
+            )
         elif asked["tap"] == "__delete_traveller__":
             spoken = "I'll remove one saved traveller profile. Nothing paid."
         else:
@@ -3172,6 +3220,32 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
                 "this is the email and mobile step, not a name Confirm and not payment",
                 nxt,
             )
+    from app.step_read import is_saved_traveller_sheet
+
+    if shown not in {"error", "unavailable", "pay", "otp", "login"} and is_saved_traveller_sheet(page or ""):
+        from app.step_read import arm_pending_step, forward_tap
+
+        tap = forward_tap(page or "") or "Continue"
+        move = decide_sheet(page or "", state)
+        if move.get("action") == "ask" and move.get("missing"):
+            fields = " and ".join(str(item) for item in move["missing"])
+            nxt = f"send your {fields}, or say pick traveller {state.get('name') or ''} — then I'll press {tap}".strip()
+        elif move.get("action") == "fill":
+            nxt = f"I'll fill what's saved, then press {tap}"
+        else:
+            nxt = (
+                f"say pick traveller {state.get('name') or 'the name on screen'} "
+                f"if none is ticked, or reply yes and I'll press {tap}"
+            ).strip()
+        arm_pending_step(state, page or "", "passenger", tap=tap)
+        state.pop("stuck_front", None)
+        return _stuck_line(
+            state,
+            "passenger",
+            f"{seller} saved travellers for the {which}",
+            "tick a name, fill any red fields, then Continue — that is not a Confirm popup",
+            nxt,
+        )
     if shown not in {"error", "unavailable", "pay", "otp", "login"} and (
         shown == "review" or re.search(r"\breview details\b", page or "", re.I)
     ):

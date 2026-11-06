@@ -128,9 +128,34 @@ def is_paid_upsell(page: str) -> bool:
     return bool(re.search(r"secure my trip|buy this|assure my trip|no,?\s*thanks", hay, re.I))
 
 
+def is_saved_traveller_sheet(page: str) -> bool:
+    """Saved traveller checkboxes on Review Details. Continue advances — not a govt-ID Confirm modal."""
+    hay = page or ""
+    if re.search(
+        r"please ensure that your name|matches your (govt|name)|govt\.?\s*id|aadhaar|driver.?s license",
+        hay,
+        re.I,
+    ):
+        return False
+    # Free-cancellation / Assured radio owns the sheet even when a saved name sits behind it.
+    if is_paid_upsell(hay) or re.search(
+        r"free cancellation|i don'?t want free cancellation|buy this|secure my trip|"
+        r"assured flex|please select an option before proceeding",
+        hay,
+        re.I,
+    ):
+        return False
+    people = len(re.findall(r"\b(?:mr|ms|mrs|mx)\.?\b", hay, re.I))
+    return people >= 1 and bool(
+        re.search(r"\bcontinue\b|traveller details|review details|adult\s*1|first\s*&\s*middle", hay, re.I)
+    )
+
+
 def is_name_confirm(page: str) -> bool:
     """Name-check overlay (govt-id / Confirm). Wins over contact copy behind the modal."""
     hay = page or ""
+    if is_saved_traveller_sheet(hay):
+        return False
     if not re.search(r"\b(?:confirm|continue)\b", hay, re.I):
         return False
     return bool(
@@ -296,9 +321,16 @@ def decide_sheet(
             return {"action": "click", "tap": tap, "missing": [], "fills": []}
         return empty
     missing, fills = _sheet_fields(hay, facts)
+    # forward_tap owns Continue-before-Confirm on saved traveller lists; ground_tap
+    # with an empty preferred label would otherwise grab Confirm from control order.
+    sheet_kind = (
+        "passenger"
+        if is_saved_traveller_sheet(hay)
+        else ("form" if is_contact_form(hay) or form_sheet(hay) else "")
+    )
     tap = (
-        ground_tap("", list(parse_control_labels(controls or hay)), hay)
-        or forward_tap(hay)
+        forward_tap(hay)
+        or ground_tap("", list(parse_control_labels(controls or hay)), hay, kind=sheet_kind)
         or decline_tap(hay)
     )
     if missing:
@@ -312,13 +344,25 @@ def decide_sheet(
 
 def forward_tap(page: str) -> str:
     """Confirm / Continue / Proceed when that label is on this sheet."""
-    for label in (
-        "Continue with 1-step checkout",
-        "Continue to payment",
-        "Confirm",
-        "Continue",
-        "Proceed",
-    ):
+    # Saved traveller list: Continue is the real advance; Confirm may linger in DOM noise.
+    labels = (
+        (
+            "Continue with 1-step checkout",
+            "Continue to payment",
+            "Continue",
+            "Proceed",
+            "Confirm",
+        )
+        if is_saved_traveller_sheet(page)
+        else (
+            "Continue with 1-step checkout",
+            "Continue to payment",
+            "Confirm",
+            "Continue",
+            "Proceed",
+        )
+    )
+    for label in labels:
         hit = safe_tap(label, page)
         if hit:
             return hit

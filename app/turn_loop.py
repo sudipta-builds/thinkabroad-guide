@@ -258,7 +258,8 @@ def _local_turn(text: str, page: str, state: dict[str, Any]) -> dict[str, Any]:
             "source": "local",
         }
     if re.search(
-        r"\b(?:click|pick|select|tick|choose|use|tap)\b.+\b(?:name|names|traveller|traveler|profile|saved|one of)\b"
+        r"\b(?:click|pick|select\w*|tick|choose|use|tap)\b.+\b(?:name|names|traveller|traveler|profile|saved|one of)\b"
+        r"|\b(?:traveller|traveler)\s+as\b"
         r"|\bpick one\b|\bthat one\b|\bone of the names\b|\bsaved (?:traveller|traveler|profile)\b"
         r"|\buse (?:the |an? )?existing\b|\bdon'?t create (?:a )?new\b|\banyone (?:of them|listed)\b",
         raw,
@@ -273,7 +274,7 @@ def _local_turn(text: str, page: str, state: dict[str, Any]) -> dict[str, Any]:
             "recommend": "tick one saved traveller",
             "tap": "__select_traveller__",
             "auto": "",
-            "reply": "I'll tick one saved traveller. I won't create a new profile. Nothing paid.",
+            "reply": "I'll tick one saved traveller, fill what's needed, then Continue. Nothing paid.",
             "facts": [],
             "source": "local",
         }
@@ -669,7 +670,8 @@ def _message_implies_action(text: str) -> bool:
     if re.search(
         r"\b(?:delete|remove|erase|clear)\b.+\b(?:travellers?|travelers?|profiles?|names?|passengers?|duplicates?)\b"
         r"|\bget rid of\b.+\b(?:profile|name|traveller|traveler|duplicate)\b"
-        r"|\b(?:click|pick|select|tick|choose|use|tap)\b.+\b(?:name|names|traveller|traveler|profile|saved|one of)\b"
+        r"|\b(?:click|pick|select\w*|tick|choose|use|tap)\b.+\b(?:name|names|traveller|traveler|profile|saved|one of)\b"
+        r"|\b(?:traveller|traveler)\s+as\b"
         r"|\bpick one\b|\bone of the names\b|\bsaved (?:traveller|traveler|profile)\b"
         r"|\buse (?:the |an? )?existing\b"
         r"|\b(?:continue|go on|skip(?:\s+add)?|confirm|book it|book this)\b"
@@ -773,7 +775,8 @@ def _intent_first(text: str, state: dict[str, Any], turn: dict[str, Any]) -> tup
     ) or goal == "delete_traveller" or tap in {"__delete_traveller__", "__remove_traveller__"}:
         return "delete_traveller", "book"
     if re.search(
-        r"\b(?:click|pick|select|tick|choose|use|tap)\b.+\b(?:name|names|traveller|traveler|profile|saved|one of)\b"
+        r"\b(?:click|pick|select\w*|tick|choose|use|tap)\b.+\b(?:name|names|traveller|traveler|profile|saved|one of)\b"
+        r"|\b(?:traveller|traveler)\s+as\b"
         r"|\bpick one\b|\bone of the names\b|\bsaved (?:traveller|traveler|profile)\b"
         r"|\buse (?:the |an? )?existing\b",
         raw,
@@ -1049,8 +1052,9 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
     on_this_sheet = goal in {"forward", "skip", "details"} or bool(
         re.search(r"\b(?:continue|go on|yes|yeah|ok|okay|confirm)\b", text or "", re.I)
     )
-    # Covering sheet: yes/confirm/continue presses that sheet's button — never fill behind it.
-    cover_kinds = {"name_confirm", "upsell", "addons", "review"}
+    # Covering / front sheet: yes/confirm/continue presses that sheet's button — never fill behind it.
+    # passenger = saved-traveller list (Continue), not a govt-id Confirm modal.
+    cover_kinds = {"name_confirm", "upsell", "addons", "review", "passenger"}
     if (
         on_this_sheet
         and str(state.get("stuck_kind") or "") in cover_kinds
@@ -1140,15 +1144,15 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
 
     if sheet in {"form", "passenger"} or str(state.get("stuck_kind") or "") in {"form", "passenger"}:
         if goal in {"forward", "skip", "login"} or intent in {"book", "select"} or re.search(
-            r"\b(?:continue|go on|skip(?:\s+add)?|confirm)\b", text or "", re.I
+            r"\b(?:continue|go on|skip(?:\s+add)?|confirm|yes|yeah|yep|ok|okay|sure)\b", text or "", re.I
         ):
-            from app.step_read import visible_forward
+            from app.step_read import forward_tap, visible_forward
 
             page = str(state.get("stuck_page") or "")
             return _plan(
                 do="book",
                 kind="book",
-                tap=tap or visible_forward(page) or "Continue",
+                tap=tap or forward_tap(page) or visible_forward(page) or "Continue",
                 turn=turn,
                 goal="forward",
                 intent="book",

@@ -1741,12 +1741,19 @@ class SellerChoiceAndProxy(unittest.TestCase):
         """Saved list: Continue + fill conscience. Never Confirm; free-cancellation stays upsell."""
         import inspect
 
-        from app.step_read import decide_sheet, forward_tap, is_name_confirm, is_saved_traveller_sheet
+        from app.step_read import (
+            classify_sheet,
+            decide_sheet,
+            forward_tap,
+            is_name_confirm,
+            is_saved_traveller_sheet,
+        )
         from app.travel_agent import _booking_page_reply
 
         saved_list = (
             "Review Details Traveller Details Adult 1 Mr Sudipta Saikia Ms Anita Continue Confirm"
         )
+        self.assertEqual(classify_sheet(saved_list), "traveller")
         self.assertTrue(is_saved_traveller_sheet(saved_list))
         self.assertFalse(is_name_confirm(saved_list))
         self.assertEqual(forward_tap(saved_list), "Continue")
@@ -1754,6 +1761,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
             saved_list,
             {"email": "a@b.co", "name": "Sudipta Saikia", "phone": "8876233052"},
         )
+        self.assertEqual(ready.get("sheet"), "traveller")
         self.assertEqual(ready.get("action"), "click")
         self.assertEqual(ready.get("tap"), "Continue")
         # Empty contact boxes → fill first; never jump to Confirm.
@@ -1778,10 +1786,12 @@ class SellerChoiceAndProxy(unittest.TestCase):
             "Please ensure that your name matches your govt ID such as Aadhaar "
             "Billing Address Pincode State Continue Confirm Edit"
         )
+        self.assertEqual(classify_sheet(buried), "traveller")
         self.assertTrue(is_saved_traveller_sheet(buried))
         self.assertFalse(is_name_confirm(buried))
         self.assertEqual(forward_tap(buried), "Continue")
         billing_ask = decide_sheet(buried, {"email": "a@b.co", "name": "Sudipta Saikia"})
+        self.assertEqual(billing_ask.get("sheet"), "traveller")
         self.assertEqual(billing_ask.get("action"), "ask")
         self.assertEqual(set(billing_ask.get("missing") or []), {"pincode", "state"})
         filled_billing = decide_sheet(
@@ -1795,6 +1805,24 @@ class SellerChoiceAndProxy(unittest.TestCase):
         )
         self.assertEqual(filled_billing.get("action"), "fill")
         self.assertEqual(filled_billing.get("tap"), "Continue")
+        # decide_sheet is the stuck narrative owner — no parallel name-check branch.
+        spoken_buried = _booking_page_reply(
+            {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-12-04",
+                "seller": "ixigo",
+                "selected_hint": "2:20",
+                "name": "Sudipta Saikia",
+                "email": "a@b.co",
+            },
+            "2:20",
+            buried,
+            type("S", (), {"page": None})(),
+        )
+        self.assertIn("saved travellers", spoken_buried.lower())
+        self.assertNotIn("name check", spoken_buried.lower())
+        self.assertNotIn("wants Confirm", spoken_buried)
         # continue never reuses a stale pick-traveller tap on this sheet.
         from unittest.mock import patch
 

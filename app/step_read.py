@@ -129,15 +129,61 @@ def is_paid_upsell(page: str) -> bool:
 
 
 def _traveller_form_open(page: str) -> bool:
-    """Adult/billing/saved-list form is the job. Ixigo often leaves govt-ID disclaimer text in the DOM."""
+    """Adult/billing/saved-list form is the job. Ixigo often leaves govt-ID disclaimer text in the DOM.
+
+    Billing alone on a contact step is still contact. A govt-ID Confirm modal with a Mr name
+    behind it is still name_confirm — need Adult 1, saved list, or billing next to a titled name.
+    """
     hay = page or ""
-    return bool(
-        re.search(
-            r"billing address|\bpincode\b|pin code|adult\s*1|choose from the saved list",
+    if re.search(r"adult\s*1|choose from the saved list", hay, re.I):
+        return True
+    people = len(re.findall(r"\b(?:mr|ms|mrs|mx)\.?\b", hay, re.I))
+    if people >= 1 and re.search(r"billing address|\bpincode\b|pin code", hay, re.I):
+        return True
+    return False
+
+
+def classify_sheet(page: str) -> str:
+    """One ordered sheet kind. First match wins — no overlapping detectors fighting."""
+    hay = page or ""
+    if not hay.strip():
+        return "other"
+    if re.search(r"pay to complete|enter card number|\bpay now\b", hay, re.I):
+        return "pay"
+    if re.search(r"enter otp|otp sent|verify your mobile", hay, re.I):
+        return "otp"
+    if re.search(r"no longer available|sold out", hay, re.I) and re.search(
+        r"search again|no longer available|sold out", hay, re.I
+    ):
+        return "unavailable"
+    if is_paid_upsell(hay) or (
+        re.search(r"free cancellation|\bassured\b", hay, re.I)
+        and re.search(
+            r"i don'?t want free cancellation|please select an option before proceeding|buy this|secure my trip",
             hay,
             re.I,
         )
-    )
+    ):
+        return "upsell"
+    # Traveller/billing before name_confirm — buried govt-ID copy must not win.
+    if is_saved_traveller_sheet(hay) or _traveller_form_open(hay):
+        return "traveller"
+    if is_name_confirm(hay):
+        return "name_confirm"
+    if is_contact_form(hay) or (
+        re.search(r"contact details|please enter (?:a )?valid email", hay, re.I)
+        and not _fare_list_sheet(hay)
+    ):
+        return "contact"
+    if addons_sheet(hay):
+        return "addons"
+    if on_review_itinerary(hay) or re.search(r"\breview details\b", hay, re.I):
+        return "review"
+    if _fare_list_sheet(hay):
+        return "results"
+    if form_sheet(hay):
+        return "contact"
+    return "other"
 
 
 def is_saved_traveller_sheet(page: str) -> bool:
@@ -320,77 +366,205 @@ def decide_sheet(
     """One rule for every sheet: fill, ask, reply, or click whatever is actually on it.
 
     When a covering dialog is open, only that dialog's fields and buttons count.
+    Always returns sheet=classify_sheet(...) so callers never re-detect.
     """
-    empty: dict[str, object] = {"action": "none", "tap": "", "missing": [], "fills": []}
+    empty: dict[str, object] = {"action": "none", "tap": "", "missing": [], "fills": [], "sheet": "other"}
     hay, cover = active_sheet_hay(page, front=front, controls=controls, overlay=overlay)
     facts = profile or {}
+    sheet = classify_sheet(hay)
+    empty = {**empty, "sheet": sheet}
     if not hay.strip():
         return empty
-    if re.search(r"pay to complete|enter card number|\bpay now\b", hay, re.I):
-        return {**empty, "action": "stop"}
-    if re.search(r"enter otp|otp sent|verify your mobile", hay, re.I):
-        return {**empty, "action": "reply", "missing": ["the SMS code"]}
-    if re.search(r"no longer available|sold out|search again", hay, re.I) and re.search(
-        r"search again|no longer available|sold out", hay, re.I
-    ):
-        tap = safe_tap("Search Again", hay)
-        return {**empty, "action": "reply", "tap": tap}
-    if not cover and _fare_list_sheet(hay):
-        return {**empty, "action": "pick"}
-    if is_paid_upsell(hay):
+
+    def _done(action: str, **extra: object) -> dict[str, object]:
+        out: dict[str, object] = {**empty, "action": action, "tap": "", "missing": [], "fills": []}
+        out.update(extra)
+        out["sheet"] = sheet
+        return out
+
+    if sheet == "pay":
+        return _done("stop")
+    if sheet == "otp":
+        return _done("reply", missing=["the SMS code"])
+    if sheet == "unavailable":
+        return _done("reply", tap=safe_tap("Search Again", hay) or "Search Again")
+    if sheet == "results" and not cover:
+        return _done("pick")
+    if sheet == "upsell":
         tap = decline_tap(hay) or ground_tap("", page=hay, kind="upsell")
-        return {**empty, "action": "ask", "tap": tap}
-    if addons_sheet(hay):
+        # Bare Continue on a paid extra is not a safe decline — ask with No, Thanks wording.
+        if tap and re.fullmatch(r"continue|proceed|confirm", tap, re.I):
+            tap = ""
+        return _done("ask", tap=tap)
+    if sheet == "addons":
         tap = visible_forward(hay) or ground_tap("Skip add-ons", page=hay, kind="addons")
         if tap:
-            return {**empty, "action": "click", "tap": tap}
-    # Covering name-check / dialog: click its button. Never fill the form behind it.
-    if is_name_confirm(hay) or (cover and re.search(r"\bconfirm\b", hay, re.I) and re.search(
-        r"govt|aadhaar|edit\b", hay, re.I
-    )):
+            return _done("click", tap=tap)
+    if sheet == "name_confirm" or (
+        cover
+        and re.search(r"\bconfirm\b", hay, re.I)
+        and re.search(r"govt|aadhaar|edit\b", hay, re.I)
+        and sheet not in {"traveller", "contact"}
+    ):
         tap = (
             ground_tap("", list(parse_control_labels(controls or hay)), hay, kind="name_confirm")
             or forward_tap(hay)
             or safe_tap("Confirm", hay)
             or "Confirm"
         )
-        return {"action": "click", "tap": tap, "missing": [], "fills": []}
-    if cover and not is_contact_form(hay) and not form_sheet(hay):
-        # Generic overlay: press a visible safe control from this sheet only.
+        return _done("click", tap=tap)
+    if cover and sheet not in {"contact", "traveller"} and not form_sheet(hay):
         tap = (
             ground_tap("", list(parse_control_labels(controls or hay)), hay)
             or decline_tap(hay)
             or forward_tap(hay)
         )
         if tap:
-            return {"action": "click", "tap": tap, "missing": [], "fills": []}
+            return _done("click", tap=tap)
         return empty
     missing, fills = _sheet_fields(hay, facts)
-    # forward_tap owns Continue-before-Confirm on saved traveller lists; ground_tap
-    # with an empty preferred label would otherwise grab Confirm from control order.
-    sheet_kind = (
-        "passenger"
-        if is_saved_traveller_sheet(hay)
-        else ("form" if is_contact_form(hay) or form_sheet(hay) else "")
-    )
+    ground_kind = "passenger" if sheet == "traveller" else ("form" if sheet in {"contact", "review"} else sheet)
     tap = (
         forward_tap(hay)
-        or ground_tap("", list(parse_control_labels(controls or hay)), hay, kind=sheet_kind)
+        or ground_tap("", list(parse_control_labels(controls or hay)), hay, kind=ground_kind)
         or decline_tap(hay)
     )
-    # Type what we already have first; ask for gaps only after fills are done.
     if fills:
-        return {"action": "fill", "tap": tap, "missing": missing, "fills": fills}
+        return _done("fill", tap=tap, missing=missing, fills=fills)
     if missing:
-        return {"action": "ask", "tap": "", "missing": missing, "fills": fills}
+        return _done("ask", missing=missing, fills=fills)
     if tap:
-        return {"action": "click", "tap": tap, "missing": [], "fills": []}
+        return _done("click", tap=tap)
     return empty
+
+
+def sheet_stuck_kind(move: dict[str, object]) -> str:
+    """stuck_kind / pending kind from a decide_sheet move."""
+    sheet = str(move.get("sheet") or "other")
+    return {
+        "traveller": "passenger",
+        "contact": "form",
+        "name_confirm": "name_confirm",
+        "upsell": "addon_buy",
+        "addons": "addons",
+        "review": "review",
+        "results": "results",
+        "pay": "pay",
+        "otp": "otp",
+        "unavailable": "unavailable",
+    }.get(sheet, "form" if move.get("action") in {"ask", "fill"} else sheet or "other")
+
+
+def format_sheet_move(
+    move: dict[str, object],
+    *,
+    seller: str,
+    which: str,
+    trip: str = "",
+    name: str = "",
+) -> tuple[str, str, str]:
+    """what / why / recommend for a decide_sheet move. Single stuck narrative."""
+    sheet = str(move.get("sheet") or "other")
+    action = str(move.get("action") or "none")
+    tap = str(move.get("tap") or "")
+    missing = [str(item) for item in (move.get("missing") or [])]
+    fills = [str(item) for item in (move.get("fills") or [])]
+    who = (name or "").strip() or "the name on screen"
+    trip_bit = f" on {trip}" if trip else ""
+
+    if sheet == "traveller":
+        what = f"{seller} saved travellers for the {which}"
+        why = "tick a name, fill any red fields, then Continue — that is not a Confirm popup"
+        if action == "ask" and missing:
+            fields = " and ".join(missing)
+            nxt = f"send your {fields}, or say pick traveller {who} — then I'll press {tap or 'Continue'}".strip()
+        elif action == "fill":
+            nxt = f"I'll fill {', '.join(fills) or 'saved details'}, then press {tap or 'Continue'}"
+        else:
+            nxt = (
+                f"say pick traveller {who} if none is ticked, "
+                f"or reply yes and I'll press {tap or 'Continue'}"
+            )
+        return what, why, nxt
+
+    if sheet == "contact":
+        what = f"{seller} contact details for the {which}"
+        why = "this is the email and mobile step, not a name Confirm and not payment"
+        if action == "ask" and missing:
+            fields = " and ".join(missing)
+            nxt = f"send your {fields} — that box is empty, so I won't press {tap or 'the button on this page'}"
+        elif action == "fill":
+            nxt = f"I'll type the saved {', '.join(fills) or 'details'}, then press {tap or 'Continue'}"
+        else:
+            nxt = f"reply yes and I'll press {tap or 'Continue'}"
+        return what, why, nxt
+
+    if sheet == "name_confirm":
+        label = tap or "Confirm"
+        return (
+            f"{seller} name check for the {which}",
+            f"Review Details wants {label} — that is not payment",
+            f"reply yes or confirm and I'll press {label}, then move toward add-ons",
+        )
+
+    if sheet == "upsell":
+        label = tap or "No, Thanks"
+        return (
+            f"{seller}'s paid Free Cancellation / Assured pop-up on the {which}",
+            "an extra they want to sell — not payment yet",
+            f"reply yes or skip and I'll press {label}",
+        )
+
+    if sheet == "addons":
+        return (
+            f"Choose add-ons for the {which}{trip_bit}",
+            "seats and bags are optional",
+            f"I'll press {tap or 'Skip add-ons'}",
+        )
+
+    if sheet == "review":
+        return (
+            f"{seller} review for the {which}{trip_bit}",
+            "the next control is on this page",
+            f"reply yes and I'll press {tap or 'Continue'}",
+        )
+
+    if sheet == "unavailable":
+        return (
+            f"{seller} saying the {which}{trip_bit} is no longer available",
+            "Search Again is on screen — travellers and payment are blocked",
+            "reply search again (or name EaseMyTrip / Cleartrip / Ixigo) and I'll re-search",
+        )
+
+    if action == "ask" and missing:
+        fields = " and ".join(missing)
+        return (
+            f"the open {seller} page for the {which}",
+            f"this step needs {fields} before I can type",
+            f"send your {fields} and I'll fill them",
+        )
+    if action == "fill":
+        return (
+            f"the open {seller} page for the {which}",
+            "saved values can go into the boxes on screen",
+            f"I'll fill {', '.join(fills) or 'saved details'}, then press {tap or 'Continue'}",
+        )
+    if action in {"click", "ask"} and tap:
+        return (
+            f"the open {seller} page for the {which}{trip_bit}",
+            "the next control is the one written on this page",
+            f"reply yes and I'll press {tap}",
+        )
+    return (
+        f"the open {seller} page for the {which}{trip_bit}",
+        "the page has not moved on",
+        "tell me what to press, or send a missing field",
+    )
 
 
 def forward_tap(page: str) -> str:
     """Confirm / Continue / Proceed when that label is on this sheet."""
-    # Saved traveller list: Continue is the real advance; Confirm may linger in DOM noise.
+    # Traveller/billing: Continue advances; Confirm may linger in DOM noise.
     labels = (
         (
             "Continue with 1-step checkout",
@@ -399,7 +573,7 @@ def forward_tap(page: str) -> str:
             "Proceed",
             "Confirm",
         )
-        if is_saved_traveller_sheet(page)
+        if classify_sheet(page) == "traveller" or is_saved_traveller_sheet(page)
         else (
             "Continue with 1-step checkout",
             "Continue to payment",

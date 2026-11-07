@@ -3200,106 +3200,92 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             "the Where from / Search flights screen (or a cookie banner on it)",
             "say go on and I'll open the fare list for that time",
         )
-    # Cleartrip "Review your itinerary" — keep that wording (not Ixigo name-check).
-    # Never override a site error / pay sheet that still mentions itinerary in the DOM.
-    if shown not in {"error", "unavailable", "pay", "otp", "login"} and re.search(
-        r"review your itinerary", page or "", re.I
-    ):
-        from app.step_read import forward_tap as _fwd_itin
+    # One sheet plan owns contact / traveller / name-check / review / upsell stuck copy.
+    # Wins over a mis-shown fare-list stage when the open DOM is clearly a form sheet.
+    if shown not in {"error", "unavailable", "pay", "otp", "login", "home", "cookie"}:
+        from app.step_read import (
+            arm_pending_step,
+            classify_sheet,
+            decide_sheet,
+            format_sheet_move,
+            sheet_stuck_kind,
+        )
 
-        tap = _fwd_itin(page or "") or "Continue"
-        return _stuck_line(
-            state,
+        sheet_now = classify_sheet(page or "")
+        form_sheets = {
+            "traveller",
+            "contact",
+            "name_confirm",
+            "upsell",
             "review",
-            f"{seller} Review your itinerary for the {which} on {trip}",
-            "the next control is Continue on this page",
-            f"I'll press {tap}",
-        )
-    from app.step_read import decide_sheet, is_contact_form
-
-    if shown not in {"error", "unavailable", "pay", "otp", "login"} and is_contact_form(page or ""):
-        move = decide_sheet(page or "", state)
-        email_error = bool(re.search(r"please enter (?:a )?valid email", page or "", re.I))
-        # A generic contact step with a non-Indian mobile still uses the +91 reply below.
-        if move.get("action") == "fill" or (move.get("action") == "ask" and email_error):
-            visible = str(move.get("tap") or "") or "the button on this page"
-            if move.get("action") == "ask":
-                fields = " and ".join(str(item) for item in (move.get("missing") or []))
-                nxt = f"send your {fields} — that box is empty, so I won't press {visible}"
-            else:
-                saved_email = str(state.get("email") or "").strip()
-                nxt = f"I'll type {saved_email} into the email box, then press {visible}"
-            return _stuck_line(
-                state,
-                "form",
-                f"{seller} contact details for the {which}",
-                "this is the email and mobile step, not a name Confirm and not payment",
-                nxt,
-            )
-    from app.step_read import is_saved_traveller_sheet
-
-    if shown not in {"error", "unavailable", "pay", "otp", "login"} and is_saved_traveller_sheet(page or ""):
-        from app.step_read import arm_pending_step, forward_tap
-
-        tap = forward_tap(page or "") or "Continue"
-        move = decide_sheet(page or "", state)
-        if move.get("action") == "ask" and move.get("missing"):
-            fields = " and ".join(str(item) for item in move["missing"])
-            nxt = f"send your {fields}, or say pick traveller {state.get('name') or ''} — then I'll press {tap}".strip()
-        elif move.get("action") == "fill":
-            nxt = f"I'll fill what's saved, then press {tap}"
-        else:
-            nxt = (
-                f"say pick traveller {state.get('name') or 'the name on screen'} "
-                f"if none is ticked, or reply yes and I'll press {tap}"
-            ).strip()
-        arm_pending_step(state, page or "", "passenger", tap=tap)
-        state.pop("stuck_front", None)
-        return _stuck_line(
-            state,
-            "passenger",
-            f"{seller} saved travellers for the {which}",
-            "tick a name, fill any red fields, then Continue — that is not a Confirm popup",
-            nxt,
-        )
-    if shown not in {"error", "unavailable", "pay", "otp", "login"} and (
-        shown == "review" or re.search(r"\breview details\b", page or "", re.I)
-    ):
-        from app.step_read import arm_pending_step, forward_tap, ground_tap, is_name_confirm
-
-        # Paid upsell on top of review copy — let the upsell / decide_front path handle it.
-        if re.search(r"free cancellation|buy this|secure my trip|no,?\s*thanks", page or "", re.I):
-            pass
-        else:
+            "addons",
+            "unavailable",
+        }
+        if sheet_now in form_sheets or (
+            shown not in {"results", "loading"}
+            and re.search(r"review your itinerary|\breview details\b", page or "", re.I)
+        ):
             vision_controls = list((vision_seen or {}).get("controls") or [])
-            preferred = str((vision_seen or {}).get("tap") or "")
-            tap = (
-                ground_tap(preferred, vision_controls, page or "", kind="name_confirm")
-                or forward_tap(page or "")
-                or ("Confirm" if re.search(r"\bconfirm\b", page or "", re.I) else "Continue")
+            move = decide_sheet(
+                page or "",
+                state,
+                front=str(surface.get("text") or ""),
+                controls=str(surface.get("controls") or "")
+                or "\n".join(str(c) for c in vision_controls),
+                overlay=bool(surface.get("overlay")),
             )
-            if is_name_confirm(page or ""):
+            # Cleartrip itinerary wording when classify lands on review.
+            if sheet_now == "review" and re.search(r"review your itinerary", page or "", re.I):
+                tap = str(move.get("tap") or "Continue")
+                return _stuck_line(
+                    state,
+                    "review",
+                    f"{seller} Review your itinerary for the {which} on {trip}",
+                    "the next control is Continue on this page",
+                    f"I'll press {tap}",
+                )
+            if move.get("action") != "none" or move.get("missing") or move.get("tap"):
+                # Cleartrip/Ixigo contact only accepts +91 — surface that before email fills.
+                if (
+                    sheet_now == "contact"
+                    and state.get("phone")
+                    and not _indian_mobile(str(state.get("phone")))
+                    and re.search(r"mobile|phone", page or "", re.I)
+                ):
+                    return _stuck_line(
+                        state,
+                        "phone_in",
+                        f"{seller} contact phone only accepts +91, and {state.get('phone')} will not go in",
+                        "the airline wants an Indian mobile for flight updates",
+                        "send a 10-digit Indian mobile (family's is fine)",
+                    )
+                what, why, recommend = format_sheet_move(
+                    move,
+                    seller=seller,
+                    which=which,
+                    trip=trip,
+                    name=str(state.get("name") or ""),
+                )
+                # Prefer concrete email in the fill line when that's the only fill.
+                if (
+                    move.get("action") == "fill"
+                    and list(move.get("fills") or []) == ["email"]
+                    and state.get("email")
+                ):
+                    recommend = (
+                        f"I'll type {state.get('email')} into the email box, "
+                        f"then press {move.get('tap') or 'Continue'}"
+                    )
+                kind = sheet_stuck_kind(move)
                 arm_pending_step(
                     state,
                     page or "",
-                    "name_confirm",
-                    tap=tap,
+                    kind,
+                    tap=str(move.get("tap") or ""),
                     controls=vision_controls or None,
                 )
-                return _stuck_line(
-                    state,
-                    "name_confirm",
-                    f"{seller} name check for the {which}",
-                    f"Review Details wants {tap} — that is not payment",
-                    f"reply yes or confirm and I'll press {tap}, then move toward add-ons",
-                )
-            return _stuck_line(
-                state,
-                "review",
-                f"{seller} review for the {which} on {trip}",
-                "the next control is on this page",
-                f"reply yes and I'll press {tap}",
-            )
+                state.pop("stuck_front", None)
+                return _stuck_line(state, kind, what, why, recommend)
     if shown in {"results", "loading"}:
         # Instinct: recommend / book a clock — never "send the exact button" on a fare list.
         options = fare_options(page)
@@ -3572,40 +3558,44 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
                 f"reply {which} (or go on) and I'll Book that row — I won't ask which button",
             )
         # Ask the traveller when conscience wants a yes (upsell / unknown). Safe auto-clicks run in checkout.
+        # Name-confirm / traveller / contact stuck copy already came from decide_sheet above.
         if decision.get("kind") != "pay" and (
             decision.get("action") == "ask" or decision.get("kind") == "upsell"
         ):
-            kind = decision.get("kind") or "other"
-            what = decision.get("what") or f"a {seller} step for {which}"
-            why = decision.get("why") or "the page has not moved on"
-            recommend = decision.get("recommend") or "tell me what to press"
-            tap = decision.get("tap") or ""
-            arm_pending_step(state, hay, kind, tap=tap)
-            # Keep Stuck / Still the same block, then how to answer.
-            spoken = _stuck_line(state, kind if kind != "other" else "upsell" if "extra" in what.lower() or "assured" in what.lower() else kind, what, why, recommend)
-            if tap:
-                spoken = spoken.replace(
-                    "Nothing paid.",
-                    f"Reply yes and I'll press {tap}. Or send the exact button you want. I haven't tapped anything. Nothing paid.",
-                )
-            else:
-                spoken = spoken.replace(
-                    "Nothing paid.",
-                    "Send the exact button you want pressed. I haven't tapped anything. Nothing paid.",
-                )
-            state["last_stuck"] = spoken
-            return spoken
-        from app.step_read import is_name_confirm
+            from app.step_read import classify_sheet as _cls_front
 
-        if decision.get("action") == "click" and decision.get("tap") and is_name_confirm(hay):
-            arm_pending_step(state, hay, "name_confirm", tap=decision["tap"])
-            return _stuck_line(
-                state,
-                "name_confirm",
-                f"{seller} name check for the {which}",
-                "Review Details wants Confirm — that is not payment",
-                f"reply yes or confirm and I'll press {decision['tap']}, then move toward add-ons",
-            )
+            if _cls_front(hay) in {"name_confirm", "traveller", "contact"}:
+                pass
+            else:
+                kind = decision.get("kind") or "other"
+                what = decision.get("what") or f"a {seller} step for {which}"
+                why = decision.get("why") or "the page has not moved on"
+                recommend = decision.get("recommend") or "tell me what to press"
+                tap = decision.get("tap") or ""
+                arm_pending_step(state, hay, kind, tap=tap)
+                spoken = _stuck_line(
+                    state,
+                    kind
+                    if kind != "other"
+                    else "upsell"
+                    if "extra" in what.lower() or "assured" in what.lower()
+                    else kind,
+                    what,
+                    why,
+                    recommend,
+                )
+                if tap:
+                    spoken = spoken.replace(
+                        "Nothing paid.",
+                        f"Reply yes and I'll press {tap}. Or send the exact button you want. I haven't tapped anything. Nothing paid.",
+                    )
+                else:
+                    spoken = spoken.replace(
+                        "Nothing paid.",
+                        "Send the exact button you want pressed. I haven't tapped anything. Nothing paid.",
+                    )
+                state["last_stuck"] = spoken
+                return spoken
     missing: list[str] = []
     if needs_email and not state.get("email"):
         missing.append("Gmail")

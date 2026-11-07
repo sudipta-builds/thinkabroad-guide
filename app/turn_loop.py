@@ -1054,6 +1054,12 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
         controls=str(state.get("stuck_controls") or ""),
         overlay=bool(state.get("stuck_front")),
     )
+    move_sheet = str(sheet_move.get("sheet") or "")
+    # Prefer decide_sheet's sheet over a stale stuck_kind when the page is still open.
+    if move_sheet and stuck_page:
+        from app.step_read import sheet_stuck_kind
+
+        sheet = sheet_stuck_kind(sheet_move) if move_sheet not in {"other", ""} else sheet
     # Only the open sheet. A new time, seller, or login is a different request.
     on_this_sheet = goal in {"forward", "skip", "details"} or bool(
         re.search(r"\b(?:continue|go on|yes|yeah|ok|okay|confirm)\b", text or "", re.I)
@@ -1071,49 +1077,9 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
         if str(state.get("chosen_tap") or "") in {"__select_traveller__", "__pick_traveller__"}:
             state.pop("chosen_tap", None)
 
-    # Covering / front sheet: yes/confirm/continue presses that sheet's button — never fill behind it.
-    # passenger = saved-traveller list (Continue), not a govt-id Confirm modal.
-    # If the open sheet still needs fields, ask/fill first — do not mash Confirm.
-    cover_kinds = {"name_confirm", "upsell", "addons", "review", "passenger"}
-    if (
-        on_this_sheet
-        and str(state.get("stuck_kind") or "") in cover_kinds
-        and sheet_move.get("action") not in {"ask", "fill", "reply", "stop"}
-        and re.search(r"\b(?:confirm|yes|yep|yeah|ok|okay|sure|continue)\b", text or "", re.I)
-    ):
-        pending = state.get("pending_step") if isinstance(state.get("pending_step"), dict) else {}
-        from app.step_read import forward_tap, is_saved_traveller_sheet
-
-        page_now = stuck_page
-        cover_tap = str((pending or {}).get("tap") or sheet_move.get("tap") or tap or "")
-        if is_saved_traveller_sheet(page_now) or re.search(r"billing address|adult\s*1", page_now, re.I):
-            cover_tap = forward_tap(page_now) or "Continue"
-        if sheet_move.get("action") == "click" and cover_tap:
-            return _plan(
-                do="book",
-                kind="book",
-                tap=cover_tap,
-                turn=turn,
-                goal="forward",
-                intent="book",
-            )
-        # Upsell-style ask already named a safe decline/forward control.
-        if (
-            sheet_move.get("action") == "ask"
-            and cover_tap
-            and not sheet_move.get("missing")
-        ):
-            return _plan(
-                do="book",
-                kind="book",
-                tap=cover_tap,
-                turn=turn,
-                goal="skip" if re.search(r"skip|no.?thanks", cover_tap, re.I) else "forward",
-                intent="book",
-            )
+    # decide_sheet owns the next act on this sheet (fill / ask / click).
     if on_this_sheet and sheet_move.get("action") in {"ask", "reply", "stop"}:
         if sheet_move.get("action") == "stop":
-            fields = "payment"
             reply = "This is the payment page. I won't press Pay unless you say pay with card or you'll pay yourself. Nothing paid."
         elif sheet_move.get("missing"):
             fields = " and ".join(str(item) for item in sheet_move["missing"])
@@ -1142,6 +1108,23 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
             tap=str(sheet_move["tap"]),
             turn=turn,
             goal="skip" if goal == "skip" else "forward",
+            intent="book",
+        )
+    # Upsell ask with a named safe decline — yes presses that tap.
+    if (
+        on_this_sheet
+        and move_sheet == "upsell"
+        and sheet_move.get("action") == "ask"
+        and sheet_move.get("tap")
+        and not sheet_move.get("missing")
+        and re.search(r"\b(?:confirm|yes|yep|yeah|ok|okay|sure|continue|skip)\b", text or "", re.I)
+    ):
+        return _plan(
+            do="book",
+            kind="book",
+            tap=str(sheet_move["tap"]),
+            turn=turn,
+            goal="skip",
             intent="book",
         )
 

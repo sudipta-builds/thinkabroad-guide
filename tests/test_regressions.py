@@ -715,6 +715,46 @@ class MetaWebhookVerify(unittest.TestCase):
             get_settings.cache_clear()
 
 
+class LocalLabMatchesProdAgent(unittest.TestCase):
+    """GUIDE_LOCAL captures WhatsApp; agent path stays the same as prod."""
+
+    def test_send_whatsapp_goes_to_lab_outbox_when_local(self) -> None:
+        from app.config import get_settings
+        from app.lab import capture_outbound, lab_enabled, outbox_since
+        from app.reply import Reply
+        from app.twilio_wa import send_whatsapp
+
+        get_settings.cache_clear()
+        os.environ["GUIDE_LOCAL"] = "1"
+        get_settings.cache_clear()
+        try:
+            self.assertTrue(lab_enabled())
+            before = max((item["id"] for item in outbox_since(0)), default=0)
+            ok = send_whatsapp("919999000001", Reply.of("Lab capture check.", "http://127.0.0.1:8000/media/x.png"))
+            self.assertTrue(ok)
+            items = outbox_since(before)
+            self.assertTrue(items)
+            self.assertEqual(items[-1]["text"], "Lab capture check.")
+            self.assertIn("http://127.0.0.1:8000/media/x.png", items[-1]["media_urls"])
+        finally:
+            os.environ.pop("GUIDE_LOCAL", None)
+            get_settings.cache_clear()
+
+    def test_lab_routes_and_runner_exist(self) -> None:
+        from app.lab import router as lab_router
+
+        paths = {getattr(route, "path", "") for route in lab_router.routes}
+        self.assertIn("/lab", paths)
+        self.assertIn("/lab/message", paths)
+        self.assertIn("/lab/outbox", paths)
+        self.assertIn("/lab/health", paths)
+        main_src = Path("app/main.py").read_text(encoding="utf-8")
+        self.assertIn("lab_router", main_src)
+        self.assertTrue(Path("scripts/run_local.py").is_file())
+        self.assertTrue(Path("LOCAL.md").is_file())
+        self.assertIn("GUIDE_LOCAL", Path(".env.example").read_text(encoding="utf-8"))
+
+
 class MetaReactionOutbound(unittest.TestCase):
     def test_strip_leading_emoji_keeps_plain_text(self) -> None:
         from app.reply import for_send, strip_leading_emoji

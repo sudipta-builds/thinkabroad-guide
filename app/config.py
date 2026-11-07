@@ -28,6 +28,9 @@ class Settings(BaseSettings):
 
     guide_public_url: str = ""
     guide_db_path: str = "data/guide.db"
+    # Local lab on :8000 — same agent/browser/Kernel as prod; WhatsApp I/O goes to /lab.
+    guide_local: bool = Field(default=False, validation_alias=AliasChoices("GUIDE_LOCAL"))
+    guide_lab_phone: str = Field(default="919999000001", validation_alias=AliasChoices("GUIDE_LAB_PHONE"))
 
     # DeepSeek — chat, CV, cover drafts
     deepseek_api_key: str = ""

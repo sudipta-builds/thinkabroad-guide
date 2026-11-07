@@ -56,6 +56,8 @@ def composing(phone: str):
 
 def send_typing(message_sid: str) -> bool:
     settings = get_settings()
+    if settings.guide_local:
+        return True
     if settings.meta_wa_ready:
         from app.meta_wa import send_typing as meta_typing
 
@@ -100,6 +102,8 @@ def send_reaction(to_phone: str, message_sid: str, emoji: str) -> bool:
     message_sid = (message_sid or "").strip()
     if not emoji or not message_sid:
         return False
+    if settings.guide_local:
+        return True
     if settings.meta_wa_ready:
         from app.meta_wa import send_reaction as meta_reaction
 
@@ -142,8 +146,15 @@ def send_whatsapp_text(to_phone: str, body: str) -> bool:
 
 
 def send_whatsapp(to_phone: str, reply: Reply) -> bool:
-    """Send text and optional media via Meta Cloud API when configured, else Twilio."""
+    """Send text and optional media via Meta Cloud API when configured, else Twilio.
+
+    GUIDE_LOCAL=1: capture into the lab outbox (same agent path, no live WhatsApp).
+    """
     settings = get_settings()
+    if settings.guide_local:
+        from app.lab import capture_outbound
+
+        return capture_outbound(to_phone, reply)
     if settings.meta_wa_ready:
         from app.meta_wa import send_whatsapp as meta_send
 

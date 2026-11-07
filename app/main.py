@@ -16,6 +16,10 @@ logger = logging.getLogger("guide")
 app = FastAPI(title="Guide", version=__version__, docs_url=None, redoc_url=None)
 app.include_router(whatsapp_router)
 
+from app.lab import router as lab_router
+
+app.include_router(lab_router)
+
 
 @app.on_event("startup")
 def on_startup() -> None:
@@ -72,6 +76,8 @@ def health() -> JSONResponse:
             "booking_worker": settings.booking_worker_ready,
             "memory": "persistent" if str(db_path).startswith("/var/data") else "ephemeral",
             "db": str(db_path),
+            "local_lab": bool(settings.guide_local),
+            "lab": "/lab" if settings.guide_local else "",
         }
     )
 

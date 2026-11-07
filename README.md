@@ -36,6 +36,14 @@ Optional shortcuts:
 | **Twilio / Meta** | WhatsApp delivery |
 | **Vault** | Per-number encrypted logins, UPI, and card. No CVV or OTP |
 
+## Local lab (prod-matching, before push)
+
+```bash
+python scripts/run_local.py
+```
+
+Open http://127.0.0.1:8000/lab — same agent/browser/Kernel as prod; WhatsApp goes to the lab outbox only. See [LOCAL.md](LOCAL.md).
+
 ## Deploy
 
 See [DEPLOY.md](DEPLOY.md). Health should show `"version": "0.5.0"`, `"chromium": true`, and `"proxy": true` when `PROXY_*` is set.

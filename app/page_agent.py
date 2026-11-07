@@ -3267,6 +3267,10 @@ def box_slot(row: dict) -> str:
         return "phone"
     if re.search(r"date of birth|\bdob\b", blob):
         return "dob"
+    if re.search(r"pin\s*code|pincode|postal", blob):
+        return "pincode"
+    if re.search(r"\bstate\b", blob) and not re.search(r"statement|status|estate", blob):
+        return "billing_state"
     if re.search(r"last name", blob):
         return "last"
     if re.search(r"first name|full name|traveller name", blob):
@@ -3398,7 +3402,12 @@ def _phone_box(boxes: list[dict]) -> dict | None:
     return left[-1][1]
 
 
-def fill_profile_slots(page, profile: dict, *, keys: tuple[str, ...] = ("email", "phone", "name", "dob")) -> list[str]:
+def fill_profile_slots(
+    page,
+    profile: dict,
+    *,
+    keys: tuple[str, ...] = ("email", "phone", "name", "dob", "pincode", "billing_state"),
+) -> list[str]:
     """Type saved facts into whatever boxes this sheet actually shows.
 
     Matching uses label, placeholder, aria-name, and input type. A +91 prefix
@@ -3410,6 +3419,12 @@ def fill_profile_slots(page, profile: dict, *, keys: tuple[str, ...] = ("email",
     slots = profile_slots(profile or {})
     if slots.get("name") == "" and profile.get("name"):
         slots["name"] = str(profile.get("name") or "").strip()
+    if not slots.get("pincode") and profile.get("pincode"):
+        pin = re.sub(r"\D", "", str(profile.get("pincode") or ""))
+        if len(pin) == 6:
+            slots["pincode"] = pin
+    if not slots.get("billing_state") and profile.get("billing_state"):
+        slots["billing_state"] = str(profile.get("billing_state") or "").strip()
     reveal_form_step(page)
     notes: dict[str, str] = {}
 
@@ -3444,7 +3459,7 @@ def fill_profile_slots(page, profile: dict, *, keys: tuple[str, ...] = ("email",
                 if re.fullmatch(r"\d{10}", re.sub(r"\D", "", got) or "") and "@" not in got:
                     _set_box(page, int(row["index"]), "")
         # Fill phone before email. Re-resolve boxes before every field — wake/Tab shifts indexes.
-        order = [key for key in ("phone", "email", "name", "dob") if key in keys]
+        order = [key for key in ("phone", "email", "name", "dob", "pincode", "billing_state") if key in keys]
         for key in order:
             value = slots.get(key) or ""
             if not value:
@@ -3528,13 +3543,18 @@ def fill_profile_slots(page, profile: dict, *, keys: tuple[str, ...] = ("email",
 
 
 def type_saved_contact(page, profile: dict) -> list[str]:
-    """Type email or mobile only when that value is already saved or just sent."""
-    from app.step_read import is_contact_form
+    """Type email/mobile/billing only when that value is already saved or just sent."""
+    from app.step_read import _traveller_form_open, is_contact_form, is_saved_traveller_sheet
 
     text, _url = _read(page)
-    if not is_contact_form(text or ""):
+    hay = text or ""
+    if not (is_contact_form(hay) or is_saved_traveller_sheet(hay) or _traveller_form_open(hay)):
         return []
-    keys = tuple(key for key in ("email", "phone") if str((profile or {}).get(key) or "").strip())
+    keys = tuple(
+        key
+        for key in ("email", "phone", "pincode", "billing_state")
+        if str((profile or {}).get(key) or "").strip()
+    )
     if not keys:
         return []
     return fill_profile_slots(page, profile, keys=keys)
@@ -4199,9 +4219,15 @@ def run_checkout_agent(
             return CheckoutOutcome("ask", text, url, log, facts=facts, checks=checks, handoff=handoff)
         if sheet_move.get("action") == "fill" and not surface_now.get("overlay"):
             keys = tuple(
-                str(item) for item in (sheet_move.get("fills") or []) if str(item) in {"email", "phone", "name", "dob"}
+                str(item)
+                for item in (sheet_move.get("fills") or [])
+                if str(item) in {"email", "phone", "name", "dob", "pincode", "billing_state"}
             )
-            typed = fill_profile_slots(page, profile, keys=keys or ("email", "phone"))
+            typed = fill_profile_slots(
+                page,
+                profile,
+                keys=keys or ("email", "phone", "pincode", "billing_state"),
+            )
             log.extend(typed)
             text, url, stage, facts = _snapshot()
             email_state = _field_state(typed, "email")
@@ -4440,9 +4466,13 @@ def run_checkout_agent(
                         keys = tuple(
                             str(item)
                             for item in (move.get("fills") or [])
-                            if str(item) in {"email", "phone", "name", "dob"}
+                            if str(item) in {"email", "phone", "name", "dob", "pincode", "billing_state"}
                         )
-                        more = fill_profile_slots(page, profile, keys=keys or ("email", "phone"))
+                        more = fill_profile_slots(
+                            page,
+                            profile,
+                            keys=keys or ("email", "phone", "pincode", "billing_state"),
+                        )
                         log.extend(more)
                         text, url, stage, facts = _snapshot()
                     label_next = str(move.get("tap") or "") or forward_tap(text or "") or "Continue"

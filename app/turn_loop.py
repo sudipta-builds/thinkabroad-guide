@@ -552,16 +552,22 @@ def has_live_facts(state: dict[str, Any]) -> bool:
 
 def _contact_value_in(text: str) -> bool:
     from app.kernel_otp import indian_national
+    from app.step_read import INDIAN_STATES
 
-    return bool(indian_national(text or "")) or bool(
-        re.search(r"@|\bmale\b|\bfemale\b|\d{1,2}/\d{1,2}/\d{2,4}", text or "", re.I)
+    raw = text or ""
+    return bool(indian_national(raw)) or bool(
+        re.search(
+            rf"@|\bmale\b|\bfemale\b|\d{{1,2}}/\d{{1,2}}/\d{{2,4}}|\b\d{{6}}\b|\b(?:{INDIAN_STATES})\b",
+            raw,
+            re.I,
+        )
     )
 
 
 def _wants_fill_field(text: str) -> bool:
     return bool(
         re.search(
-            r"\b(?:fill|type|enter|put)\b.+\b(?:e-?mail|mail|mobile|phone|name|dob|gender)\b"
+            r"\b(?:fill|type|enter|put)\b.+\b(?:e-?mail|mail|mobile|phone|name|dob|gender|pin(?:\s*code)?|state|billing)\b"
             r"|\bfill my e-?mail\b|\btype (?:my )?e-?mail\b",
             text or "",
             re.I,
@@ -1052,16 +1058,36 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
     on_this_sheet = goal in {"forward", "skip", "details"} or bool(
         re.search(r"\b(?:continue|go on|yes|yeah|ok|okay|confirm)\b", text or "", re.I)
     )
+    # Explicit continue/yes is forward — never reuse a stale pick-traveller tap.
+    if re.fullmatch(
+        r"continue|go on|yes|yeah|yep|ok|okay|sure|confirm",
+        (text or "").strip(),
+        re.I,
+    ):
+        if goal == "pick_traveller" or tap in {"__select_traveller__", "__pick_traveller__"}:
+            goal = "forward"
+            tap = ""
+            turn = {**turn, "goal": "forward", "tap": ""}
+        if str(state.get("chosen_tap") or "") in {"__select_traveller__", "__pick_traveller__"}:
+            state.pop("chosen_tap", None)
+
     # Covering / front sheet: yes/confirm/continue presses that sheet's button — never fill behind it.
     # passenger = saved-traveller list (Continue), not a govt-id Confirm modal.
+    # If the open sheet still needs fields, ask/fill first — do not mash Confirm.
     cover_kinds = {"name_confirm", "upsell", "addons", "review", "passenger"}
     if (
         on_this_sheet
         and str(state.get("stuck_kind") or "") in cover_kinds
+        and sheet_move.get("action") not in {"ask", "fill", "reply", "stop"}
         and re.search(r"\b(?:confirm|yes|yep|yeah|ok|okay|sure|continue)\b", text or "", re.I)
     ):
         pending = state.get("pending_step") if isinstance(state.get("pending_step"), dict) else {}
+        from app.step_read import forward_tap, is_saved_traveller_sheet
+
+        page_now = stuck_page
         cover_tap = str((pending or {}).get("tap") or sheet_move.get("tap") or tap or "")
+        if is_saved_traveller_sheet(page_now) or re.search(r"billing address|adult\s*1", page_now, re.I):
+            cover_tap = forward_tap(page_now) or "Continue"
         if sheet_move.get("action") == "click" and cover_tap:
             return _plan(
                 do="book",

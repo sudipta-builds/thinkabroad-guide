@@ -713,8 +713,10 @@ def handle_turn(
                 trip = _spoken_trip(state)
                 held_tap = str(state.get("chosen_tap") or tap or "")
                 if held_tap in {"__select_traveller__", "__pick_traveller__"}:
+                    who = str(state.get("name") or "").strip()
                     canned = (
-                        f"Ticking one saved traveller on {_seller_label(book_seller)} for the {chosen or 'open flight'}. "
+                        f"Ticking {who or 'one saved traveller'} on {_seller_label(book_seller)} "
+                        f"for the {chosen or 'open flight'}, then filling gaps and Continue. "
                         "I will not create a new profile. Nothing paid."
                     )
                 elif held_tap in {"__delete_traveller__", "__remove_traveller__"}:
@@ -2262,6 +2264,20 @@ def absorb_details(state: dict[str, Any], text: str) -> dict[str, Any]:
         digits = re.sub(r"\D", "", phone.group(0))
         if 10 <= len(digits) <= 15 and not looks_like_card(phone.group(0)):
             data["phone"] = re.sub(r"\s+", " ", phone.group(0)).strip()
+    pin = re.search(r"(?:\bpin(?:\s*code)?\b[:\s-]*)?(\d{6})\b", raw, re.I)
+    if pin and not looks_like_card(pin.group(0)):
+        # Bare 6 digits on a billing ask, or explicit pincode — not a phone fragment.
+        digits = pin.group(1)
+        phone_digits = re.sub(r"\D", "", str(data.get("phone") or ""))
+        if digits not in phone_digits and not re.fullmatch(r"\d{10,}", re.sub(r"\D", "", raw) or ""):
+            data["pincode"] = digits
+        elif re.search(r"\bpin(?:\s*code)?\b", raw, re.I):
+            data["pincode"] = digits
+    from app.step_read import INDIAN_STATES
+
+    state_hit = re.search(rf"\b({INDIAN_STATES})\b", raw, re.I)
+    if state_hit:
+        data["billing_state"] = state_hit.group(1).strip().title()
     if re.search(r"\b(anyway|use it|use this|only number)\b", raw, re.I):
         data["phone_ok"] = True
     if re.search(r"\bcheapest\b", raw, re.I):
@@ -4028,7 +4044,7 @@ def _run_kernel_login(
     profile = {
         **{
             key: str(loaded.get(key) or "")
-            for key in ("name", "email", "phone", "dob", "gender")
+            for key in ("name", "email", "phone", "dob", "gender", "pincode", "billing_state")
         },
         "auth_mode": str(loaded.get("kernel_auth_mode") or ""),
     }

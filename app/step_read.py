@@ -128,15 +128,21 @@ def is_paid_upsell(page: str) -> bool:
     return bool(re.search(r"secure my trip|buy this|assure my trip|no,?\s*thanks", hay, re.I))
 
 
+def _traveller_form_open(page: str) -> bool:
+    """Adult/billing/saved-list form is the job. Ixigo often leaves govt-ID disclaimer text in the DOM."""
+    hay = page or ""
+    return bool(
+        re.search(
+            r"billing address|\bpincode\b|pin code|adult\s*1|choose from the saved list",
+            hay,
+            re.I,
+        )
+    )
+
+
 def is_saved_traveller_sheet(page: str) -> bool:
     """Saved traveller checkboxes on Review Details. Continue advances — not a govt-ID Confirm modal."""
     hay = page or ""
-    if re.search(
-        r"please ensure that your name|matches your (govt|name)|govt\.?\s*id|aadhaar|driver.?s license",
-        hay,
-        re.I,
-    ):
-        return False
     # Free-cancellation / Assured radio owns the sheet even when a saved name sits behind it.
     if is_paid_upsell(hay) or re.search(
         r"free cancellation|i don'?t want free cancellation|buy this|secure my trip|"
@@ -146,15 +152,28 @@ def is_saved_traveller_sheet(page: str) -> bool:
     ):
         return False
     people = len(re.findall(r"\b(?:mr|ms|mrs|mx)\.?\b", hay, re.I))
-    return people >= 1 and bool(
-        re.search(r"\bcontinue\b|traveller details|review details|adult\s*1|first\s*&\s*middle", hay, re.I)
-    )
+    listed = people >= 1 or bool(re.search(r"choose from the saved list|adult\s*1", hay, re.I))
+    if not listed:
+        return False
+    if not re.search(r"\bcontinue\b|traveller details|review details|first\s*&\s*middle", hay, re.I):
+        return False
+    # Open traveller/billing form wins over buried govt-ID copy next to Confirm.
+    if _traveller_form_open(hay):
+        return True
+    if re.search(
+        r"please ensure that your name|matches your (govt|name)|govt\.?\s*id|aadhaar|driver.?s license",
+        hay,
+        re.I,
+    ):
+        return False
+    return people >= 1
 
 
 def is_name_confirm(page: str) -> bool:
     """Name-check overlay (govt-id / Confirm). Wins over contact copy behind the modal."""
     hay = page or ""
-    if is_saved_traveller_sheet(hay):
+    # Billing / Adult 1 / saved list is Continue work — never a Confirm modal.
+    if is_saved_traveller_sheet(hay) or _traveller_form_open(hay):
         return False
     if not re.search(r"\b(?:confirm|continue)\b", hay, re.I):
         return False
@@ -197,6 +216,15 @@ def _fare_list_sheet(page: str) -> bool:
     return len(times) >= 2 and books >= 2
 
 
+INDIAN_STATES = (
+    "andhra pradesh|arunachal pradesh|assam|bihar|chhattisgarh|goa|gujarat|haryana|"
+    "himachal pradesh|jharkhand|karnataka|kerala|madhya pradesh|maharashtra|manipur|"
+    "meghalaya|mizoram|nagaland|odisha|punjab|rajasthan|sikkim|tamil nadu|telangana|"
+    "tripura|uttar pradesh|uttarakhand|west bengal|delhi|nct of delhi|"
+    "jammu and kashmir|ladakh|puducherry|chandigarh|andaman|lakshadweep|dadra"
+)
+
+
 def _sheet_fields(page: str, facts: dict) -> tuple[list[str], list[str]]:
     """Empty fields this sheet is showing. missing = we lack the value. fills = we can type it."""
     hay = page or ""
@@ -204,8 +232,10 @@ def _sheet_fields(page: str, facts: dict) -> tuple[list[str], list[str]]:
     fills: list[str] = []
     formish = bool(
         is_contact_form(hay)
+        or _traveller_form_open(hay)
         or re.search(
-            r"add contact|contact details|add traveller|first name|first\s*&\s*middle|please enter",
+            r"add contact|contact details|add traveller|first name|first\s*&\s*middle|please enter|"
+            r"billing address",
             hay,
             re.I,
         )
@@ -240,6 +270,21 @@ def _sheet_fields(page: str, facts: dict) -> tuple[list[str], list[str]]:
             missing.append("date of birth")
         elif dob.lower() not in hay.lower():
             fills.append("dob")
+    if re.search(r"billing address|\bpincode\b|pin code", hay, re.I):
+        pin = re.sub(r"\D", "", str(facts.get("pincode") or ""))
+        if re.search(r"\bpincode\b|pin code", hay, re.I):
+            on_page = bool(pin) and len(pin) == 6 and pin in re.sub(r"\D", "", hay)
+            if len(pin) != 6:
+                missing.append("pincode")
+            elif not on_page:
+                fills.append("pincode")
+        billing_state = str(facts.get("billing_state") or "").strip()
+        if re.search(r"\bstate\b", hay, re.I):
+            on_page = bool(billing_state) and billing_state.lower() in hay.lower()
+            if not billing_state:
+                missing.append("state")
+            elif not on_page:
+                fills.append("billing_state")
     return missing, fills
 
 
@@ -333,10 +378,11 @@ def decide_sheet(
         or ground_tap("", list(parse_control_labels(controls or hay)), hay, kind=sheet_kind)
         or decline_tap(hay)
     )
+    # Type what we already have first; ask for gaps only after fills are done.
+    if fills:
+        return {"action": "fill", "tap": tap, "missing": missing, "fills": fills}
     if missing:
         return {"action": "ask", "tap": "", "missing": missing, "fills": fills}
-    if fills:
-        return {"action": "fill", "tap": tap, "missing": [], "fills": fills}
     if tap:
         return {"action": "click", "tap": tap, "missing": [], "fills": []}
     return empty
@@ -914,11 +960,14 @@ def profile_slots(profile: dict) -> dict[str, str]:
         phone = raw[2:]
     elif len(raw) == 10:
         phone = raw
+    pin = re.sub(r"\D", "", str((profile or {}).get("pincode") or ""))
     return {
         "email": str((profile or {}).get("email") or "").strip(),
         "phone": phone,
         "name": str((profile or {}).get("name") or "").strip(),
         "dob": str((profile or {}).get("dob") or "").strip(),
+        "pincode": pin if len(pin) == 6 else "",
+        "billing_state": str((profile or {}).get("billing_state") or "").strip(),
     }
 
 

@@ -1772,6 +1772,69 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertFalse(is_saved_traveller_sheet(confirm_page))
         self.assertTrue(is_name_confirm(confirm_page))
         self.assertEqual(forward_tap(confirm_page), "Confirm")
+        # Buried govt-ID disclaimer + billing/Adult 1 is Continue work, not Confirm.
+        buried = (
+            "Review Details Traveller Details Adult 1 Mr Sudipta Saikia "
+            "Please ensure that your name matches your govt ID such as Aadhaar "
+            "Billing Address Pincode State Continue Confirm Edit"
+        )
+        self.assertTrue(is_saved_traveller_sheet(buried))
+        self.assertFalse(is_name_confirm(buried))
+        self.assertEqual(forward_tap(buried), "Continue")
+        billing_ask = decide_sheet(buried, {"email": "a@b.co", "name": "Sudipta Saikia"})
+        self.assertEqual(billing_ask.get("action"), "ask")
+        self.assertEqual(set(billing_ask.get("missing") or []), {"pincode", "state"})
+        filled_billing = decide_sheet(
+            buried,
+            {
+                "email": "a@b.co",
+                "name": "Sudipta Saikia",
+                "pincode": "781001",
+                "billing_state": "Assam",
+            },
+        )
+        self.assertEqual(filled_billing.get("action"), "fill")
+        self.assertEqual(filled_billing.get("tap"), "Continue")
+        # continue never reuses a stale pick-traveller tap on this sheet.
+        from unittest.mock import patch
+
+        from app.travel_agent import absorb_details
+        from app.turn_loop import align_action
+
+        absorbed = absorb_details({}, "781001 Assam")
+        self.assertEqual(absorbed.get("pincode"), "781001")
+        self.assertEqual(absorbed.get("billing_state"), "Assam")
+        cont_state = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "ixigo",
+            "selected_hint": "2:20",
+            "stage": "booking",
+            "stuck_kind": "name_confirm",
+            "stuck_page": buried,
+            "chosen_tap": "__select_traveller__",
+            "name": "Sudipta Saikia",
+            "email": "a@b.co",
+            "pincode": "781001",
+            "billing_state": "Assam",
+            "last_vision": {"kind": "review"},
+        }
+        with patch(
+            "app.turn_loop.interpret_turn",
+            return_value={
+                "goal": "forward",
+                "intent": "book",
+                "kind": "review",
+                "reply": "Continuing.",
+                "tap": "",
+                "facts": [],
+                "source": "gemini",
+            },
+        ):
+            cont = align_action("continue", cont_state)
+        self.assertEqual(cont["do"], "details")
+        self.assertNotEqual(cont.get("tap"), "__select_traveller__")
         # Free-cancellation radio with a name behind it is not the saved-list sheet.
         radio = (
             "Add Free Cancellation Please select an option before proceeding "

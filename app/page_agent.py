@@ -953,6 +953,30 @@ def _ixigo_scroll_until_depart(page, hint: str, *, rounds: int = 16) -> bool:
     return False
 
 
+def ixigo_saved_traveller_sheet(text: str) -> bool:
+    """Saved people are listed and Continue is still the next click. Not payment."""
+    hay = text or ""
+    if ixigo_header_needs_login(hay):
+        return False
+    if re.search(
+        r"amount to be paid|pay via any upi|credit/debit card|please enter|please select your title|"
+        r"first\s*&\s*middle name|is required|is invalid|govt\.?\s*id|please ensure that your name",
+        hay,
+        re.I,
+    ):
+        return False
+    if _on_addons_page(hay, ""):
+        return False
+    if not re.search(r"\bcontinue\b", hay, re.I):
+        return False
+    if re.search(r"choose from the saved list", hay, re.I):
+        return True
+    return bool(
+        re.search(r"traveller details", hay, re.I)
+        and re.search(r"\b(?:mr|ms|mrs|mx)\.?\s+[a-z]", hay, re.I)
+    )
+
+
 def ixigo_filled_review(text: str) -> bool:
     """Review Details already has the traveller data and Continue is the next click.
 
@@ -6234,6 +6258,42 @@ def run_checkout_agent(
         page = _latest(page)
         text, url, stage, facts = _snapshot()
         log.append(f"{step}:stage:{stage}")
+        # Saved travellers are already on the review. Tick one and Continue to payment.
+        if seller == "ixigo" and ixigo_saved_traveller_sheet(text):
+            tries = sum(1 for line in log if line.startswith("saved_traveller_advance"))
+            if tries < 3:
+                picked = _select_saved_traveller(page, str((profile or {}).get("name") or ""))
+                log.append(f"saved_traveller_advance:{picked or 'miss'}")
+                moved = _safe_continue(page)
+                log.append(f"saved_traveller_continue:{int(bool(moved))}")
+                if moved:
+                    walked = _press_confirm_then_addons(page, log)
+                    if walked is not None:
+                        return walked
+                _poll_ready(page, {"addons", "pay", "review", "passenger", "error"}, budget_ms=5000)
+                try:
+                    now, _now_url = _read(page)
+                except Exception:
+                    now = ""
+                if payment_sheet_open(now, "") or re.search(
+                    r"amount to be paid|pay via any upi|credit/debit card", now or "", re.I
+                ):
+                    text, url, stage, facts = _snapshot()
+                    return CheckoutOutcome(
+                        "pay",
+                        text,
+                        url,
+                        log,
+                        facts=facts,
+                        checks=checks,
+                        handoff=(
+                            f"Payment handoff. Total {facts.get('total') or '?'}. "
+                            f"Link: {url}. No payment clicked."
+                        ),
+                    )
+                if _on_addons_page(now, ""):
+                    _leave_addons(page, log, rounds=2)
+                continue
         # Details already on Review Details: Continue, skip add-ons, stop on payment.
         if seller == "ixigo" and ixigo_filled_review(text):
             tries = sum(1 for line in log if line.startswith("filled_review_continue"))

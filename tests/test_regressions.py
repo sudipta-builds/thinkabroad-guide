@@ -5951,7 +5951,18 @@ class DirectIxigoCheckoutTests(unittest.TestCase):
         self.assertFalse(_checkout_summary_open(name_check, "pay"))
         popup = "Review Details Edit Continue Fare Summary Total Amount ₹9,823"
         self.assertFalse(_checkout_summary_open(popup, "pay"))
-        from app.page_agent import contact_report, ixigo_filled_review
+        saved_list = (
+            "Fare Summary Total Amount ₹9,823 Traveller Details "
+            "Choose from the saved list Mr Sudipta Saikia Continue"
+        )
+        self.assertFalse(_checkout_summary_open(saved_list, "review"))
+        self.assertFalse(_checkout_summary_open(saved_list, "pay"))
+        from app.page_agent import contact_report, ixigo_filled_review, ixigo_saved_traveller_sheet
+
+        self.assertTrue(ixigo_saved_traveller_sheet(saved_list))
+        self.assertFalse(ixigo_saved_traveller_sheet(
+            "Amount To Be Paid ₹10,328 Pay via any UPI app Credit/Debit card"
+        ))
 
         self.assertTrue(ixigo_filled_review(popup))
         self.assertFalse(

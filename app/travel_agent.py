@@ -3539,6 +3539,13 @@ def _checkout_summary_open(page: str, shown: str) -> bool:
         and not pay_words
     ):
         return False
+    # Saved-traveller list with Continue is the same step. The fare total beside it is not payment.
+    if (
+        re.search(r"traveller details|choose from the saved list", page or "", re.I)
+        and re.search(r"\bcontinue\b", page or "", re.I)
+        and not pay_words
+    ):
+        return False
     # Contact, GST, and billing are the review form. A total beside them is not payment.
     if re.search(
         r"contact details|billing address|gst details|email address|mobile number|add traveller",

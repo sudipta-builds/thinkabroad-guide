@@ -6240,6 +6240,26 @@ class DirectIxigoCheckoutTests(unittest.TestCase):
         self.assertTrue(_checkout_summary_open(pay, "pay"))
         self.assertFalse(_checkout_summary_open(review, "pay"))
 
+    def test_confirm_on_review_does_not_reopen_otp(self) -> None:
+        from app.travel_agent import ixigo_should_require_otp
+
+        review = {
+            "seller": "ixigo",
+            "login_phone": "+918638586171",
+            "phone": "8638586171",
+            "stuck_page": "Review Details Billing Address Continue Edit",
+            "selected_hint": "10:45",
+            "direct_checkout": True,
+        }
+        self.assertFalse(ixigo_should_require_otp(review, "confirm"))
+        self.assertTrue(ixigo_should_require_otp(review, "8638586171"))
+        self.assertTrue(
+            ixigo_should_require_otp(
+                {**review, "stuck_page": "Review Details Log in/Sign up Continue"},
+                "confirm",
+            )
+        )
+
     def test_ixigo_decline_login_stays_on_login(self) -> None:
         from app.turn_loop import align_action
 

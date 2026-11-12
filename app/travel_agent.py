@@ -907,15 +907,21 @@ def handle_turn(
             from app.kernel_otp import indian_national, login_phone_for
 
             chosen = str(state.get("selected_hint") or "").strip()
-            if book_seller == "ixigo":
+            if book_seller == "ixigo" and ixigo_should_require_otp(state, text):
                 sent = indian_national(text) or indian_national(
                     str(state.get("login_phone") or state.get("phone") or "")
                 )
-                if sent and not ixigo_session_for_number(state, sent):
-                    state["require_otp"] = True
-                    state["kernel_auth_mode"] = "login"
-                    state.pop("kernel_logged_in", None)
+                state["require_otp"] = True
+                state["kernel_auth_mode"] = "login"
+                state.pop("kernel_logged_in", None)
+                if sent:
                     state["login_phone"] = "+91" + sent
+            elif book_seller == "ixigo" and re.fullmatch(
+                r"confirm|continue|go on|yes", (text or "").strip(), re.I
+            ):
+                state.pop("require_otp", None)
+                if not str(state.get("chosen_tap") or "").strip():
+                    state["chosen_tap"] = "Continue"
             signed_in = str(state.get("kernel_logged_in") or "") == book_seller
             auth_mode = str(state.get("kernel_auth_mode") or "").strip().lower()
             if book_seller == "ixigo" and not signed_in:
@@ -1046,8 +1052,14 @@ def handle_turn(
             reply = canned or _usable_reply(state, spoken, _booking_ack(state, kind, text))
         else:
             reply = _usable_reply(state, spoken, _booking_ack(state, kind, text))
-        if state.get("direct_checkout"):
+        if state.get("direct_checkout") and not re.fullmatch(
+            r"confirm|continue|go on|yes", (text or "").strip(), re.I
+        ):
             reply = direct_checkout_ack(state)
+        elif re.fullmatch(r"confirm|continue|go on|yes", (text or "").strip(), re.I):
+            reply = (
+                f"Pressing Continue on the open {_seller_label(book_seller)} review. Nothing paid."
+            )
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="✈️")
     if (
@@ -4134,6 +4146,27 @@ def ixigo_saved_mobile(state: dict[str, Any]) -> str:
 
 def ixigo_signed_in(state: dict[str, Any]) -> bool:
     return str(state.get("kernel_logged_in") or "") == "ixigo"
+
+
+def ixigo_should_require_otp(state: dict[str, Any], text: str) -> bool:
+    """OTP only for a new mobile or a page that still says Log in/Sign up.
+
+    Confirm/Continue on an open Review Details sheet presses that sheet.
+    It must not throw away the booking and hunt for an OTP screen.
+    """
+    from app.kernel_otp import indian_national
+    from app.page_agent import ixigo_header_needs_login
+
+    raw = (text or "").strip()
+    page = str(state.get("stuck_page") or "")
+    on_review = bool(re.search(r"review details|billing address|contact details", page, re.I))
+    if re.fullmatch(r"confirm|continue|go on|yes", raw, re.I) and on_review and not ixigo_header_needs_login(page):
+        return False
+    sent = indian_national(raw)
+    if not sent and not ixigo_header_needs_login(page):
+        return False
+    number = sent or indian_national(str(state.get("login_phone") or state.get("phone") or ""))
+    return bool(number) and not ixigo_session_for_number(state, number)
 
 
 def ixigo_session_for_number(state: dict[str, Any], national: str) -> bool:

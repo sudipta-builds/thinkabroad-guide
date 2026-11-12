@@ -26,6 +26,9 @@ _STOP = {
     "i", "me", "my", "you", "want", "need", "go", "fly", "flying", "book", "get",
     "the", "a", "an", "to", "from", "please", "flight", "flights", "ticket", "tickets",
     "show", "find", "search", "for", "and", "with", "that", "this", "one", "way",
+    # Checkout commands — "skip to payment" must never become a route pair.
+    "skip", "payment", "pay", "continue", "confirm", "addons", "add-ons", "seats",
+    "meals", "insurance", "thanks", "decline", "extras", "without",
 }
 _BOOK_NUM = re.compile(
     r"(?:book|apply|take|choose)\s*(?:option\s*|flight\s*)?(?:#|number\s*)?(\d+)"
@@ -340,12 +343,21 @@ def explicit_date(text: str) -> str | None:
 def parse_updates(text: str) -> dict[str, Any]:
     """Slots this message actually contains. Missing fields are omitted."""
     out: dict[str, Any] = {}
-    origin, destination = _route_pair(text)
+    raw = text or ""
+    # Mid-booking taps are not city pairs ("skip to payment", "continue without add-ons").
+    if re.search(
+        r"\bskip to payment\b|\bcontinue without add|\bskip add-?ons?\b|"
+        r"\bi don'?t want (?:seats?|meals?|add-?ons?)\b",
+        raw,
+        re.I,
+    ):
+        return out
+    origin, destination = _route_pair(raw)
     if origin and destination:
         out["origin"] = origin
         out["destination"] = destination
     else:
-        names = mentioned_places(text)
+        names = mentioned_places(raw)
         if len(names) >= 2:
             out["origin"], out["destination"] = names[0], names[1]
         elif len(names) == 1:

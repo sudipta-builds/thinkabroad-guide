@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from typing import Any
 
@@ -59,9 +60,11 @@ def format_book_quotes(
     """WhatsApp lines: per-site prices + cheapest bookable recommendation."""
     usable = [q for q in quotes if int(q.get("price_n") or 0) > 0]
     if not usable:
+        when = f" for {hint}" if hint else ""
+        where = f" ({trip})" if trip else ""
         return (
-            f"I couldn't pull live book-site prices{(f' for {trip}' if trip else '')}. "
-            "Say a departure time and I'll book on Cleartrip, or name Ixigo or EaseMyTrip."
+            f"I couldn't pull live Cleartrip, Ixigo, or EaseMyTrip prices{when}{where}. "
+            "Reply Ixigo, Cleartrip, or EaseMyTrip and I'll open that site for this flight. Nothing paid."
         )
     when = hint or "that flight"
     bits = [f"{q['label']} ₹{int(q['price_n']):,}" for q in usable]
@@ -101,11 +104,30 @@ def collect_book_quotes(
     if not kernel_configured():
         return []
     sellers = quote_sellers_for_route(origin, destination)
-    try:
-        return _kernel_collect(phone=phone, origin=origin, destination=destination, depart=depart, hint=hint, sellers=sellers)
-    except Exception:
-        logger.exception("Book-site quote pass failed")
-        return []
+    # Shared so a slow last site does not throw away prices already read.
+    found: list[dict[str, Any]] = []
+
+    def _run() -> None:
+        try:
+            _kernel_collect(
+                phone=phone,
+                origin=origin,
+                destination=destination,
+                depart=depart,
+                hint=hint,
+                sellers=sellers,
+                quotes_out=found,
+            )
+        except Exception:
+            logger.exception("Book-site quote pass failed")
+
+    worker = threading.Thread(target=_run, name="book-quotes-kernel", daemon=True)
+    worker.start()
+    # The chat turn already returned. Wait long enough for Kernel to open the three sites.
+    worker.join(180)
+    if worker.is_alive():
+        logger.warning("Book-site quotes still running after 180s; sending %s prices already read", len(found))
+    return list(found)
 
 
 def _kernel_collect(
@@ -116,6 +138,7 @@ def _kernel_collect(
     depart: str,
     hint: str,
     sellers: list[str],
+    quotes_out: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     from playwright.sync_api import sync_playwright
 
@@ -138,7 +161,7 @@ def _kernel_collect(
                 if not url:
                     continue
                 try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=120_000)
+                    page.goto(url, wait_until="domcontentloaded", timeout=45_000)
                 except Exception:
                     logger.warning("Quote goto failed for %s", seller_id)
                     continue
@@ -155,24 +178,29 @@ def _kernel_collect(
                 if price_n < 1500:
                     rupees = [n for n in prices_in(text or "") if n >= 3000]
                     price_n = min(rupees) if rupees else 0
-                if price_n < 1500:
-                    continue
-                if re.search(r"something went wrong|too many requests|502 bad|servers are stumped|no data available", text or "", re.I):
+                if price_n < 1500 or re.search(
+                    r"something went wrong|too many requests|502 bad|servers are stumped|no data available",
+                    text or "",
+                    re.I,
+                ):
+                    logger.info("Quote %s had no fare (price=%s chars=%s)", seller_id, price_n, len(text or ""))
                     continue
                 from app.travel_agent import _seller_label
 
-                quotes.append(
-                    {
-                        "seller": seller_id,
-                        "label": _seller_label(seller_id),
-                        "price_n": price_n,
-                        "price": f"{price_n:,}",
-                        "depart": str((pick or {}).get("depart") or hint or ""),
-                        "airline": str((pick or {}).get("airline") or ""),
-                        "bookable": seller_can_book(seller_id),
-                        "url": live or url,
-                    }
-                )
+                row = {
+                    "seller": seller_id,
+                    "label": _seller_label(seller_id),
+                    "price_n": price_n,
+                    "price": f"{price_n:,}",
+                    "depart": str((pick or {}).get("depart") or hint or ""),
+                    "airline": str((pick or {}).get("airline") or ""),
+                    "bookable": seller_can_book(seller_id),
+                    "url": live or url,
+                }
+                quotes.append(row)
+                if quotes_out is not None:
+                    quotes_out.append(row)
+                logger.info("Quote %s ₹%s depart=%s", seller_id, price_n, row["depart"])
             try:
                 pw.close()
             except Exception:
@@ -201,7 +229,7 @@ def _wait_fares(page, seller_id: str) -> str:
     from app.kernel_otp import _book_count, _read_visible
     from app.travel_agent import fare_options, prices_in
 
-    rounds = 90 if seller_id == "cleartrip" else (50 if seller_id == "ixigo" else 40)
+    rounds = 36 if seller_id == "cleartrip" else 24
     text = ""
     for _ in range(rounds):
         try:

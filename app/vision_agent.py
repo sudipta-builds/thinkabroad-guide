@@ -23,6 +23,8 @@ _VISION_READ = (
     '"seat_map":false,"meals_offered":false,'
     '"controls":[],'
     '"facts":[],'
+    '"errors":[],'
+    '"fields":[],'
     '"best_depart":"","best_price":""}\n'
     "Rules:\n"
     "- kind is the PRIMARY sheet. A fare summary ₹ on Review Details is NOT results.\n"
@@ -41,7 +43,9 @@ _VISION_READ = (
     "(Confirm, Continue, Edit, Skip add-ons, No Thanks, Book, …). Max 8. Exact on-screen text.\n"
     "- tap MUST be one of controls (or empty). Never invent a button.\n"
     "- Never set tap to Pay, Buy, Secure My Trip, Assure My Trip, Insure My Trip, or anything that spends money.\n"
-    "- facts: 1-4 short phrases. what/why/recommend: one short sentence each."
+    "- facts: 1-4 short phrases. what/why/recommend: one short sentence each.\n"
+    "- errors: visible validation lines, exact text (e.g. Please enter a valid pincode). Empty if none.\n"
+    "- fields: labels of visible inputs that are empty or showing an error (Pin code, Address, City). Max 6."
 )
 
 _SPEND_TAP = re.compile(
@@ -143,6 +147,16 @@ def see_step(
         "meals_offered": meals,
         "controls": controls,
         "facts": facts,
+        "errors": [
+            re.sub(r"\s+", " ", str(item or "")).strip()[:120]
+            for item in (data.get("errors") if isinstance(data.get("errors"), list) else [])[:4]
+            if str(item or "").strip()
+        ],
+        "fields": [
+            re.sub(r"\s+", " ", str(item or "")).strip()[:60]
+            for item in (data.get("fields") if isinstance(data.get("fields"), list) else [])[:6]
+            if str(item or "").strip()
+        ],
         "best_depart": re.sub(r"\s+", "", str(data.get("best_depart") or ""))[:8],
         "best_price": re.sub(r"\s+", " ", str(data.get("best_price") or "")).strip()[:24],
         "source": "vision",
@@ -199,8 +213,49 @@ def see_step(
     return out
 
 
+def _clear_page_for_user_shot(page) -> None:
+    """Drop text selection, focus rings, and Guide overlays so traveller shots stay readable.
+
+    Internal vision may still call settle/scroll separately — this only cleans paint.
+    """
+    try:
+        page.evaluate(
+            """() => {
+              try { window.getSelection() && window.getSelection().removeAllRanges(); } catch (e) {}
+              const ae = document.activeElement;
+              if (ae && typeof ae.blur === 'function') ae.blur();
+              // Remove any prior Guide debug overlays (never leave them for the traveller).
+              document.querySelectorAll(
+                '[data-guide-hl],[data-guide-debug-overlay],[data-guide-fill],[data-guide-temp]'
+              ).forEach((el) => {
+                if (el.hasAttribute('data-guide-fill') || el.hasAttribute('data-guide-temp')) {
+                  el.style.outline = '';
+                  el.removeAttribute('data-guide-fill');
+                  el.removeAttribute('data-guide-temp');
+                } else {
+                  el.remove();
+                }
+              });
+              // Neutralize selection paint if a prior read left a range selected.
+              let style = document.getElementById('guide-user-shot-style');
+              if (!style) {
+                style = document.createElement('style');
+                style.id = 'guide-user-shot-style';
+                style.setAttribute('data-guide-debug-overlay', '1');
+                style.textContent = '::selection,::-moz-selection{background:transparent!important;color:inherit!important;}';
+                (document.head || document.documentElement).appendChild(style);
+              }
+            }"""
+        )
+    except Exception:
+        pass
+
+
 def capture_page_shot(page) -> str:
-    """Write a viewport PNG for vision. Empty string on failure."""
+    """Write a viewport PNG for *internal* vision. May settle/scroll the sheet first.
+
+    Not for WhatsApp/lab delivery — use capture_user_shot for traveller-facing images.
+    """
     if page is None or not vision_enabled():
         return ""
     import os
@@ -227,6 +282,56 @@ def capture_page_shot(page) -> str:
         if name:
             try:
                 Path(name).unlink(missing_ok=True)
+            except Exception:
+                pass
+        return ""
+
+
+def capture_user_shot(page, *, dest: str | Path = "", tag: str = "user") -> str:
+    """Clean traveller-facing viewport shot — no debug overlays, no text selection.
+
+    Higher JPEG quality than Kernel OTP thumbs so prices and labels stay legible.
+    Does not settle or scroll the sheet; that scroll is for internal vision only.
+    """
+    if page is None:
+        return ""
+    import os
+
+    path_str = ""
+    try:
+        _clear_page_for_user_shot(page)
+        try:
+            page.wait_for_timeout(120)
+        except Exception:
+            pass
+        if dest:
+            path = Path(dest)
+            path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            from app.media_files import ensure_media_dir
+
+            path = ensure_media_dir() / f"{tag}-{os.getpid()}.jpg"
+        # Prefer JPEG for WhatsApp size limits; quality high enough to read ₹ amounts.
+        kwargs = {
+            "path": str(path),
+            "full_page": False,
+            "timeout": 12000,
+            "type": "jpeg",
+            "quality": 92,
+        }
+        try:
+            page.screenshot(**kwargs, animations="disabled", caret="hide")
+        except TypeError:
+            page.screenshot(**kwargs)
+        if path.is_file() and path.stat().st_size > 200:
+            return str(path)
+        path.unlink(missing_ok=True)
+        return ""
+    except Exception as exc:
+        logger.info("user screenshot skipped: %s", type(exc).__name__)
+        if path_str:
+            try:
+                Path(path_str).unlink(missing_ok=True)
             except Exception:
                 pass
         return ""
@@ -285,6 +390,19 @@ def classify_with_vision(
         return "addons", seen
     if seen.get("sold_out"):
         return "unavailable", seen
+    # A header Log in/Sign up must not rename the open fare/review sheet.
+    if mapped == "login" and re.search(
+        r"fare summary|review & traveller|refund on cancellation|add free cancellation|total amount",
+        page_text or "",
+        re.I,
+    ) and re.search(r"\bcontinue\b", page_text or "", re.I) and not re.search(
+        r"enter otp|otp sent|enter mobile number|log in to ixigo|get otp",
+        page_text or "",
+        re.I,
+    ):
+        seen["kind"] = "review"
+        seen["tap"] = seen.get("tap") or "Continue"
+        return "review", seen
     # Review / form / upsell / passenger never become results via fares_visible.
     if kind in {"review", "form", "upsell", "passenger"}:
         return mapped, seen

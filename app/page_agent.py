@@ -1,8 +1,8 @@
 """Observe a booking page, act once, verify, recover.
 
-This is the execution layer Guide was missing: one step at a time, then a check
-that the page actually changed. DeepSeek is used only when the page is not an
-obvious cookie, results, fare sheet, or error screen.
+One step at a time, then a check that the page actually changed. Known sheets
+(cookie, results, fare, login, OTP, review) use fixed clicks. Gemini vision
+reads the screenshot when the DOM is ambiguous; WhatsApp copy should match that shot.
 """
 
 from __future__ import annotations
@@ -31,7 +31,10 @@ _CLICK_TIME = """(hint) => {
 
     const isBook = (b) => /^(book|book now|select|view fares)$/i.test((b.innerText || '').trim());
     const departOf = (card) => {
-        const times = (card.match(/\\b\\d{1,2}:\\d{2}\\b/g) || []);
+        const cleaned = String(card || '').replace(/\\b\\d{1,2}:\\d{2}\\s*-\\s*\\d{1,2}:\\d{2}\\b/g, ' ');
+        const gau = cleaned.match(/\\b(\\d{1,2}:\\d{2})\\b(?:\\s+\\S+){0,12}\\s+GAU\\b/i);
+        if (gau) return gau[1];
+        const times = cleaned.match(/\\b\\d{1,2}:\\d{2}\\b/g) || [];
         return times[0] || '';
     };
     const departMatches = (card) => needles.some(n => departOf(card) === n);
@@ -104,16 +107,25 @@ def _clock_needles(hint: str) -> list[str]:
     return sorted(needles)
 
 
+def _without_time_ranges(text: str) -> str:
+    """Drop Ixigo filter chips like '12:40 - 13:40' so they are not departures."""
+    return re.sub(r"\b\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}\b", " ", text or "")
+
+
 def card_matches_depart_hint(card: str, hint: str) -> bool:
-    """Match the flight's departure (first clock), not the arrival.
+    """Match the flight's departure (the clock before GAU), not the arrival or a filter chip.
 
     Ixigo cards look like '12:30 GAU … 15:15 DEL'. Hint 1:15 must not pick
     that row via arrival 15:15, and must accept a card whose first time is 13:15.
     """
-    times = re.findall(r"\b\d{1,2}:\d{2}\b", card or "")
-    if not times:
+    cleaned = _without_time_ranges(card or "")
+    gau = re.search(r"\b(\d{1,2}:\d{2})\b(?:\s+\S+){0,12}\s+GAU\b", cleaned, re.I)
+    depart = gau.group(1) if gau else ""
+    if not depart:
+        times = re.findall(r"\b\d{1,2}:\d{2}\b", cleaned)
+        depart = times[0] if times else ""
+    if not depart:
         return False
-    depart = times[0]
     return depart in set(_clock_needles(hint))
 
 
@@ -155,6 +167,8 @@ def extract_trip_facts(text: str, url: str = "") -> dict[str, str]:
                 arrive_time = times[1]
     total = ""
     tm = re.search(r"Total Amount\s*₹\s*([0-9,]+)", text or "", re.I)
+    if not tm:
+        tm = re.search(r"Amount To Be Paid\s*₹\s*([0-9,]+)", text or "", re.I)
     if not tm:
         tm = re.search(r"₹\s*([0-9,]+)\s*(?:\n|).*?(?:Continue|Lock Price)", text or "", re.I)
     if tm:
@@ -278,9 +292,36 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         r"\+91|continue|review traveller", hay, re.I
     ):
         return "other"
+    # The Ixigo sign-in drawer sits on top of Fare Summary. The drawer owns the step.
+    if re.search(r"log in to ixigo", hay, re.I) and re.search(
+        r"enter mobile number|continue|google", hay, re.I
+    ) and not re.search(r"verify your mobile|enter the otp|enter otp|otp sent", hay, re.I):
+        return "login"
+    # Empty title / name form beats review stepper copy ("Review & Traveller Details").
+    if re.search(r"please select your title|first & middle name|first name|last name", hay, re.I) and re.search(
+        r"\bcontinue\b|male|female|title|nationality|mobile", hay, re.I
+    ):
+        return "passenger"
+    # Header "Log in/Sign up" on a fare/review sheet is not the login step.
+    if re.search(
+        r"fare summary|review & traveller|refund on cancellation|add free cancellation|total amount",
+        hay,
+        re.I,
+    ) and re.search(r"\bcontinue\b", hay, re.I) and not re.search(
+        r"enter otp|otp sent|enter mobile number|log in to ixigo|get otp|loginVisible=true",
+        hay,
+        re.I,
+    ):
+        # Only the blocking Assured radio gate is "other". Marketing
+        # "Add Free Cancellation to your trip" still sits on Review Details.
+        from app.step_read import _assured_radio_gate
+
+        if _assured_radio_gate(hay):
+            return "other"
+        return "review"
     if re.search(r"log in to ixigo|loginVisible=true", hay, re.I) and re.search(
         r"continue|google", hay, re.I
-    ):
+    ) and not re.search(r"fare summary|review & traveller|total amount", hay, re.I):
         return "login"
     if (
         re.search(r"enter mobile number", hay, re.I)
@@ -309,13 +350,24 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
     if _looks_like_fare_sheet(hay):
         return "fare_sheet"
     # Cleartrip "Review your itinerary" (flex Add cards) is review — never Skip-addons.
-    if re.search(r"review your itinerary", hay, re.I):
-        return "review"
-    # Empty title / name form beats review stepper copy ("Review & Traveller Details").
-    if re.search(r"please select your title|first & middle name|first name|last name", hay, re.I) and re.search(
-        r"\bcontinue\b|male|female|title|nationality|mobile", hay, re.I
+    # Flex "Add meals" / Skip on that sheet must not become the add-ons stage; only the
+    # dedicated Choose add-ons / missed-adding sheet overrides this heading.
+    if re.search(r"review your itinerary", hay, re.I) and not re.search(
+        r"choose add-ons|missed adding",
+        hay,
+        re.I,
     ):
-        return "passenger"
+        return "review"
+    # Live Skip / Choose add-ons / Ixigo "Skip to Payment" beat review-stepper copy.
+    # Fare Summary + flight code still sit in the Add-ons sidebar and used to
+    # false-classify this sheet as review, so leave_addons returned without clicking.
+    if re.search(
+        r"choose add-ons|missed adding|skip add-?ons|skip to payment|"
+        r"meal selection|seat selection|seat map|add seats|add meals|add extra luggage",
+        hay,
+        re.I,
+    ):
+        return "addons"
     # Ixigo/Cleartrip Review Details (name check / billing) BEFORE fare-list heuristics.
     # ₹ + clock + a nav "Book" on this sheet used to false-trigger results.
     if re.search(r"\breview details\b", hay, re.I) and re.search(
@@ -340,9 +392,6 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         # Single itinerary review — not a multi-row fare list or paid upsell.
         if not (has_time and book_count >= 2):
             return "review"
-    # Live Skip / Choose add-ons beats a lone "Book" word left on the itinerary sheet.
-    if re.search(r"choose add-ons|missed adding|skip add-?ons", hay, re.I):
-        return "addons"
     fare_list = bool(
         has_time and priced and (book_count >= 1 or re.search(r"\b(Book|Select|View fares)\b", hay))
     )
@@ -350,7 +399,12 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
     if fare_list and not flight_unavailable(hay):
         return "results"
     # Meals/luggage sheet without a review heading (Skip already handled above).
-    if re.search(r"add seats|add meals|add extra luggage|choose your seat|add meal", hay, re.I):
+    if re.search(
+        r"add seats|add meals|add extra luggage|choose your seat|add meal|"
+        r"meal selection|seat selection",
+        hay,
+        re.I,
+    ):
         return "addons"
     if re.search(r"first name|last name|date of birth|add adult|primary passenger", hay, re.I) and re.search(
         r"mobile|email|gender", hay, re.I
@@ -582,12 +636,35 @@ def _looks_like_fare_sheet(hay: str) -> bool:
     return False
 
 
+def _depart_clocks_on_fare_list(page: str) -> list[str]:
+    """Departure before GAU on each Book card. Filter ranges are not departures."""
+    out: list[str] = []
+    parts = re.split(r"\bBook\b", _without_time_ranges(page or ""))
+    for part in parts[:-1]:
+        gau = re.search(r"\b(\d{1,2}:\d{2})\b(?:\s+\S+){0,12}\s+GAU\b", part, re.I)
+        if gau:
+            out.append(gau.group(1))
+            continue
+        times = re.findall(r"\b(\d{1,2}:\d{2})\b", part)
+        if times:
+            out.append(times[0])
+    return out
+
+
 def nearest_depart_hint(page: str, hint: str) -> str:
-    """Exact clock, else the closest departure within 45 minutes (18:20 → 18:25)."""
+    """Exact departure clock, else the closest departure within 15 minutes (18:20 → 18:25).
+
+    Never matches an arrival (1:15 must not latch onto 13:15 on a 10:20→13:15 card).
+    """
     raw = (hint or "").strip()
     if not raw:
         return ""
-    if any(re.search(rf"(^|[^0-9]){re.escape(n)}([^0-9]|$)", page or "") for n in _clock_needles(raw)):
+    departs = _depart_clocks_on_fare_list(page)
+    needles = set(_clock_needles(raw))
+    if any(dep in needles for dep in departs):
+        return raw
+    if any(re.search(rf"(^|[^0-9]){re.escape(n)}([^0-9]|$)", page or "") for n in needles) and not departs:
+        # No Book cards parsed — keep the raw hint; do not invent a neighbor from arrivals.
         return raw
     match = re.match(r"(\d{1,2}):(\d{2})", raw)
     if not match:
@@ -599,14 +676,15 @@ def nearest_depart_hint(page: str, hint: str) -> str:
     elif int(match.group(1)) >= 13:
         alts.add(want - 12 * 60)
     best = ""
-    best_gap = 46
-    for clock in re.findall(r"\b(\d{1,2}):(\d{2})\b", page or ""):
-        mins = int(clock[0]) * 60 + int(clock[1])
+    best_gap = 16
+    for clock in departs or []:
+        hh, mm = clock.split(":")
+        mins = int(hh) * 60 + int(mm)
         for target in alts:
             gap = abs(mins - target)
             if gap < best_gap:
                 best_gap = gap
-                best = f"{int(clock[0])}:{clock[1]}"
+                best = clock
     return best or raw
 
 
@@ -699,8 +777,10 @@ def _clear_front_sheet(page, chosen_tap: str = "", *, seller: str = "", hint: st
         return "front_ask" if decision.get("action") == "ask" else "front_none"
     label = str(decision.get("tap") or "")
     front_copy = str(surface.get("text") or "")
-    if re.search(r"skip add|continue without add", label, re.I) or re.search(
-        r"missed adding|skip add-?ons|choose add-ons|add seats", front_copy, re.I
+    if re.search(r"skip add|skip to payment|continue without add", label, re.I) or re.search(
+        r"missed adding|skip add-?ons|skip to payment|choose add-ons|add seats|meal selection",
+        front_copy,
+        re.I,
     ):
         notes: list[str] = []
         if _leave_addons(page, notes, rounds=3):
@@ -871,6 +951,46 @@ def _ixigo_scroll_until_depart(page, hint: str, *, rounds: int = 16) -> bool:
         except Exception:
             break
     return False
+
+
+def ixigo_header_needs_login(text: str) -> bool:
+    """True when the Ixigo header still says Log in/Sign up. Hey Ixigoer is already in."""
+    hay = text or ""
+    if re.search(r"ixigoer|\blog\s*out\b", hay, re.I):
+        return False
+    if re.search(r"enter the otp|enter otp|otp sent|enter mobile number|log in to ixigo", hay, re.I):
+        return False
+    return bool(re.search(r"log\s*in\s*/\s*sign\s*up|login/signup", hay, re.I))
+
+
+def _click_ixigo_header_login(page) -> bool:
+    """Open the sign-in drawer from the header. Do not fill the passenger form first."""
+    try:
+        clicked = page.evaluate(
+            """() => {
+              const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 8 && r.height > 8 && r.bottom > 0 && r.top < innerHeight
+                  && s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              const nodes = [...document.querySelectorAll('button,a,[role=button],span,div')];
+              const hits = nodes.filter((el) => {
+                const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                return t.length > 0 && t.length < 40 && /log\\s*in\\s*\\/\\s*sign\\s*up/i.test(t) && vis(el);
+              });
+              const el = hits[hits.length - 1];
+              if (!el) return false;
+              el.click();
+              return true;
+            }"""
+        )
+        if not clicked:
+            return False
+        page.wait_for_timeout(1200)
+        return True
+    except Exception:
+        return False
 
 
 def _click_ixigo_depart(page, hint: str) -> str:
@@ -1465,6 +1585,58 @@ _ALT_FORWARD = (
 )
 
 
+def _click_confirm_only(page) -> bool:
+    """Mouse/JS click the Confirm control only — never a sibling Continue."""
+    try:
+        point = page.evaluate(
+            """() => {
+              const nodes = [...document.querySelectorAll('button,a,[role=button]')];
+              const hits = [];
+              for (const el of nodes) {
+                const text = (el.innerText || el.getAttribute('aria-label') || '')
+                  .replace(/\\s+/g, ' ').trim();
+                if (!/^confirm$/i.test(text)) continue;
+                if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
+                const style = window.getComputedStyle(el);
+                if (style.visibility === 'hidden' || style.display === 'none') continue;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 24 || rect.height < 18) continue;
+                hits.push(el);
+              }
+              if (!hits.length) return null;
+              hits.sort((a, b) => {
+                const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+                return (rb.width * rb.height) - (ra.width * ra.height);
+              });
+              const btn = hits[0];
+              btn.scrollIntoView({block: 'center', inline: 'nearest'});
+              const r = btn.getBoundingClientRect();
+              const x = Math.round(r.x + r.width / 2);
+              const y = Math.round(r.y + r.height / 2);
+              if (x < 1 || y < 1 || x >= window.innerWidth || y >= window.innerHeight) return null;
+              return {x, y};
+            }"""
+        )
+    except Exception:
+        point = None
+    if isinstance(point, dict) and point.get("x") is not None and point.get("y") is not None:
+        try:
+            page.mouse.click(float(point["x"]), float(point["y"]))
+            return True
+        except Exception:
+            pass
+    try:
+        btn = page.get_by_role("button", name=re.compile(r"^Confirm$", re.I)).last
+        box = btn.bounding_box()
+        if box and box.get("width", 0) > 8 and box.get("height", 0) > 8:
+            page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            return True
+        btn.click(timeout=4000)
+        return True
+    except Exception:
+        return False
+
+
 def advance_forward_control(
     page,
     preferred: str = "",
@@ -1484,12 +1656,26 @@ def advance_forward_control(
     target = ground_tap(preferred, pool, text_before, kind=kind)
     if not target:
         return ""
+    _aim_mark_before = _aim_mark(page, target)
 
     def _try(label: str) -> bool:
-        if re.search(r"^(confirm|continue|proceed)\b", label, re.I):
-            if _js_continue(page) or _safe_continue(page):
-                return True
-        return _click_label(page, label)
+        # True only when the sheet fingerprint changes. A JS click that Ixigo ignores
+        # (Continue while a Free Cancellation radio is empty) is not a success.
+        before = _aim_mark(page, label)
+        fired = False
+        # Confirm modal: click Confirm itself. Generic continue helpers prefer the
+        # Continue under the overlay and leave the govt-ID popup stuck.
+        if re.search(r"^confirm\b", label, re.I):
+            fired = bool(_click_label(page, "Confirm") or _click_confirm_only(page))
+        elif re.search(r"^(continue|proceed)\b", label, re.I):
+            fired = bool(_js_continue(page) or _safe_continue(page) or _click_label(page, label))
+        else:
+            fired = bool(_click_label(page, label))
+        if not fired:
+            return False
+        if _aim_mark(page, label) != before:
+            return True
+        return _sheet_moved(page, label, before, wait_s=1.2)
 
     moved = _try(target)
     clicked = target if moved else ""
@@ -1508,12 +1694,16 @@ def advance_forward_control(
     }
     if sticky or not moved:
         alts: list[str] = []
-        for primary, others in _ALT_FORWARD:
-            if re.fullmatch(re.escape(primary), target, re.I):
-                alts.extend(others)
-                break
-        if not alts and re.search(r"confirm|continue|proceed", target, re.I):
-            alts = ["Confirm", "Continue", "Proceed"]
+        # Name Confirm must not fall through to Continue under the overlay.
+        if kind == "name_confirm" or re.search(r"^confirm\b", target, re.I):
+            alts = []
+        else:
+            for primary, others in _ALT_FORWARD:
+                if re.fullmatch(re.escape(primary), target, re.I):
+                    alts.extend(others)
+                    break
+            if not alts and re.search(r"confirm|continue|proceed", target, re.I):
+                alts = ["Confirm", "Continue", "Proceed"]
         pool_after = parse_control_labels(text_after) or pool
         for alt in alts:
             if alt.lower() == target.lower():
@@ -1528,6 +1718,8 @@ def advance_forward_control(
                 except Exception:
                     pass
                 break
+    if _aim_mark(page, target) == _aim_mark_before:
+        return ""
     return clicked
 
 
@@ -1563,11 +1755,15 @@ def _reopen_cleartrip_results(page, origin: str, destination: str, depart: str, 
 def _skip_addons(page) -> str:
     """Leave Cleartrip/Ixigo optional extras, including the missed meals/seats nag.
 
-    Scrolls to find Skip when the seat map fills the viewport. Returns the label
-    clicked, or empty when nothing matched. Cleartrip Skip ignores el.click() and
-    CDP/mouse — invoke React fiber onClick instead (verified live on Kernel).
+    Ixigo seat/meal sheets use "Skip to Payment >" (not "Skip add-ons"). Scrolls to find
+    Skip when the seat map fills the viewport. Returns the label clicked, or empty when
+    nothing matched. Cleartrip Skip ignores el.click() and CDP/mouse — invoke React fiber
+    onClick instead (verified live on Kernel).
     """
     labels = (
+        "Skip to Payment",
+        "Skip to payment",
+        "Skip to Payment >",
         "Skip add-ons",
         "Skip add ons",
         "Continue without add-ons",
@@ -1579,10 +1775,12 @@ def _skip_addons(page) -> str:
 
     def _js_skip() -> str:
         try:
-            # Buttons only — scanning every span/div on Cleartrip's seat map stalls Kernel CDP.
+            # Buttons + links — Ixigo "Skip to Payment >" is often an <a>/span control.
             hit = page.evaluate(
                 """(labels) => {
-                  const nodes = [...document.querySelectorAll('button,a,[role=button]')];
+                  const nodes = [...document.querySelectorAll(
+                    'button,a,[role=button],span,div,p'
+                  )];
                   const fakeEvt = (el) => ({
                     preventDefault() {},
                     stopPropagation() {},
@@ -1615,12 +1813,25 @@ def _skip_addons(page) -> str:
                       el.onclick(new MouseEvent('click', { bubbles: true, cancelable: true }));
                       return 'dom';
                     }
-                    return '';
+                    el.click();
+                    return 'click';
+                  };
+                  const norm = (s) => String(s || '').replace(/\\s+/g,' ').trim().toLowerCase()
+                    .replace(/[>›»]+$/g, '').trim();
+                  const matchWant = (text, want) => {
+                    const t = norm(text);
+                    const w = norm(want);
+                    if (!t || t.length > 56) return false;
+                    if (t === w) return true;
+                    // "Skip to Payment >" vs "skip to payment"
+                    if (w.startsWith('skip to payment') && t.startsWith('skip to payment')) return true;
+                    if (w.startsWith('skip add') && t.startsWith('skip add')) return true;
+                    return false;
                   };
                   for (const want of labels) {
                     const el = nodes.find(n => {
                       const t = (n.innerText || n.getAttribute('aria-label') || '').replace(/\\s+/g,' ').trim();
-                      return t && t.length < 48 && t.toLowerCase() === String(want).toLowerCase();
+                      return matchWant(t, want);
                     });
                     if (!el) continue;
                     // Footer sits inside .oy-scroll — scroll that first or Skip stays below the fold.
@@ -1633,12 +1844,13 @@ def _skip_addons(page) -> str:
                       p = p.parentElement;
                     }
                     el.scrollIntoView({block:'center', inline:'nearest'});
-                    if (fireReact(el)) return want;
+                    const label = (el.innerText || want).replace(/\\s+/g,' ').trim().slice(0, 40);
+                    if (fireReact(el)) return label || want;
                     const r = el.getBoundingClientRect();
                     if (r.width < 8 || r.height < 8) continue;
                     if (r.top < 0 || r.bottom > innerHeight) continue;
                     return {
-                      label: want,
+                      label: label || want,
                       x: r.x + r.width / 2,
                       y: r.y + r.height / 2,
                     };
@@ -1660,12 +1872,25 @@ def _skip_addons(page) -> str:
             return ""
 
     def _playwright_skip() -> str:
-        for label in ("Skip add-ons", "Skip add ons", "Continue without add-ons"):
+        for pattern in (
+            r"skip to payment",
+            r"skip add-?ons",
+            r"continue without add-?ons",
+        ):
             try:
-                btn = page.get_by_role("button", name=re.compile(rf"^{re.escape(label)}$", re.I)).last
+                btn = page.get_by_role(
+                    "button", name=re.compile(pattern, re.I)
+                ).last
                 btn.scroll_into_view_if_needed(timeout=3000)
                 btn.click(timeout=5000, force=True)
-                return label
+                return (btn.inner_text(timeout=1000) or pattern)[:40]
+            except Exception:
+                pass
+            try:
+                link = page.get_by_text(re.compile(pattern, re.I)).first
+                link.scroll_into_view_if_needed(timeout=3000)
+                link.click(timeout=5000, force=True)
+                return (link.inner_text(timeout=1000) or pattern)[:40]
             except Exception:
                 continue
         return ""
@@ -1749,7 +1974,8 @@ def settle_visible_sheet(page, budget_ms: int = 8000) -> None:
                 """() => {
                   // Buttons only — span/div scans on Cleartrip seat maps stall Kernel CDP.
                   const nodes = [...document.querySelectorAll('button, a, [role="button"]')];
-                  const hit = nodes.find(n => /skip add-?ons|continue without add-?ons/i.test((n.innerText || '').trim())
+                  const hit = nodes.find(n =>
+                    /skip to payment|skip add-?ons|continue without add-?ons/i.test((n.innerText || '').trim())
                     && (n.innerText || '').trim().length < 40);
                   if (!hit) return {ok:false, sh:0};
                   let p = hit.parentElement;
@@ -1898,7 +2124,10 @@ def _dismiss_overlays(page) -> None:
 
 
 def _ixigo_buy_this_visible(page) -> bool:
-    """Paid Assured / Free Cancellation sheet sits on top of Continue."""
+    """Paid Assured / Free Cancellation sheet sits on top of Continue.
+
+    Closed only when Secure My Trip / No, Thanks are no longer a visible control.
+    """
     try:
         return bool(
             page.evaluate(
@@ -1907,19 +2136,92 @@ def _ixigo_buy_this_visible(page) -> bool:
                     const r = el.getBoundingClientRect();
                     const s = getComputedStyle(el);
                     return r.width > 8 && r.height > 8 && s.visibility !== 'hidden'
-                      && s.display !== 'none' && r.bottom > 0 && r.top < innerHeight;
+                      && s.display !== 'none' && s.opacity !== '0'
+                      && r.bottom > 0 && r.top < innerHeight;
                   };
-                  const label = (el) => (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                  const label = (el) => (el.innerText || el.getAttribute('aria-label') || '')
+                    .replace(/\\s+/g, ' ').trim();
                   const hits = [...document.querySelectorAll('button,a,[role=button],span,p,div')].filter(vis);
                   return hits.some((el) => {
                     const t = label(el);
-                    return /^(buy this|secure my trip|no,?\\s*thanks)$/i.test(t);
+                    if (!t || t.length > 48) return false;
+                    return /^(buy this|secure my trip|no,?\\s*thanks)$/i.test(t)
+                      || /^with(?:out)? assured$/i.test(t);
                   });
                 }"""
             )
         )
     except Exception:
         return False
+
+
+def _ixigo_click_no_thanks(page) -> str:
+    """Click No, Thanks and require the Assured sheet to close before returning success."""
+    if not _ixigo_buy_this_visible(page):
+        return ""
+
+    def _closed() -> bool:
+        try:
+            page.wait_for_timeout(350)
+        except Exception:
+            pass
+        return not _ixigo_buy_this_visible(page)
+
+    # Bring the sheet's decline control into view, then click the node itself.
+    try:
+        clicked = page.evaluate(
+            """() => {
+              const onPage = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 4 && r.height > 4 && s.visibility !== 'hidden'
+                  && s.display !== 'none' && s.opacity !== '0';
+              };
+              const labelOf = (el) => (el.innerText || el.textContent || el.getAttribute('aria-label') || '')
+                .replace(/\\s+/g, ' ').trim();
+              const isNo = (text) => /^no,?\\s*thanks$/i.test(text) && text.length < 40;
+              const nodes = [...document.querySelectorAll(
+                'button,a,[role=button],span,p,div,label'
+              )];
+              const hit = nodes
+                .map((el) => ({el, text: labelOf(el)}))
+                .filter(({el, text}) => isNo(text) && onPage(el))
+                .sort((a, b) => (a.el.innerText || '').length - (b.el.innerText || '').length)[0];
+              const target = hit ? hit.el : nodes.find((el) => onPage(el) && /^secure my trip$/i.test(labelOf(el)));
+              if (target) target.scrollIntoView({block: 'center', inline: 'nearest'});
+              if (!hit) return '';
+              hit.el.click();
+              return 'js';
+            }"""
+        )
+        if clicked and _closed():
+            return "optout_no_thanks"
+    except Exception:
+        pass
+    for clicker in (
+        lambda: page.get_by_role("button", name=re.compile(r"^no,?\s*thanks$", re.I)).first.click(
+            timeout=2000, force=True
+        ),
+        lambda: page.get_by_text(re.compile(r"^no,?\s*thanks$", re.I)).first.click(timeout=2000, force=True),
+        lambda: page.locator("button, a, [role=button], span, div").filter(
+            has_text=re.compile(r"^no,?\s*thanks$", re.I)
+        ).first.click(timeout=2000, force=True),
+    ):
+        try:
+            clicker()
+            if _closed():
+                return "optout_no_thanks"
+        except Exception:
+            continue
+    try:
+        box = page.get_by_text(re.compile(r"no,?\s*thanks", re.I)).first.bounding_box()
+        if box and box.get("width", 0) > 4:
+            page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            if _closed():
+                return "optout_no_thanks"
+    except Exception:
+        pass
+    return "optout_no_thanks_miss" if _ixigo_buy_this_visible(page) else "optout_no_thanks"
 
 
 def _tap_step_decline(page) -> str:
@@ -1937,77 +2239,411 @@ def _tap_step_decline(page) -> str:
     return ""
 
 
-def _select_saved_traveller(page, name: str = "") -> str:
-    """Tick one existing person on the front page. Never invent another profile.
-
-    Returns behind_sheet when a dialog covers the list, traveller_unticked when
-    people are listed but none matched, or traveller_clicked / already / card.
-    """
-    if read_surface(page).get("overlay"):
-        return "behind_sheet"
+def _clean_traveller_name(name: str) -> str:
+    """Strip pick/click fluff and title so 'Pick Mr Sudipta Saikia' → 'sudipta saikia'."""
     wanted = re.sub(r"\s+", " ", (name or "").strip()).lower()
+    wanted = re.sub(
+        r"^(?:pick|click|press|tap|select|choose|use)\s+",
+        "",
+        wanted,
+        flags=re.I,
+    )
     wanted = re.sub(r"^(mr|ms|mrs|mx)\.?\s+", "", wanted)
+    return wanted.strip()
+
+
+def _traveller_name_parts(name: str) -> tuple[str, str, str]:
+    """Return (title, first, last) from dirty profile text like 'Pick Mr Sudipta Saikia'."""
+    raw = re.sub(r"\s+", " ", (name or "").strip())
+    raw = re.sub(
+        r"^(?:pick|click|press|tap|select|choose|use)\s+",
+        "",
+        raw,
+        flags=re.I,
+    ).strip()
+    title = ""
+    m = re.match(r"^(mr|ms|mrs|mx)\.?\s+(.+)$", raw, re.I)
+    if m:
+        title = m.group(1).title().replace("Ms", "Ms").replace("Mx", "Mx")
+        if title.lower() == "mr":
+            title = "Mr"
+        elif title.lower() == "mrs":
+            title = "Mrs"
+        elif title.lower() == "ms":
+            title = "Ms"
+        raw = m.group(2).strip()
+    parts = [p for p in raw.split() if p]
+    if not parts:
+        return title, "", ""
+    if len(parts) == 1:
+        return title, parts[0], ""
+    return title, parts[0], " ".join(parts[1:])
+
+
+def _adult_traveller_gaps(page) -> list[str]:
+    """Mandatory Adult form gaps from live DOM — not from having a saved name listed."""
     try:
-        picked = page.evaluate(
-            """(want) => {
+        gaps = page.evaluate(
+            """() => {
+              const hay = (document.body && document.body.innerText || '').replace(/\\s+/g, ' ');
+              const out = [];
               const vis = (el) => {
                 const r = el.getBoundingClientRect();
                 const s = getComputedStyle(el);
-                return r.width > 4 && r.height > 4 && s.visibility !== 'hidden'
-                  && s.display !== 'none' && r.bottom > 0 && r.top < innerHeight;
+                return r.width > 2 && r.height > 2 && s.visibility !== 'hidden'
+                  && s.display !== 'none' && s.opacity !== '0';
               };
-              const shortLine = (raw) => (raw || '').split('\\n').map(s => s.replace(/\\s+/g, ' ').trim())
-                .find(s => s.length >= 4 && s.length <= 60) || '';
-              const isPerson = (t) => {
-                const line = shortLine(t).toLowerCase();
+              if (/please select your title/i.test(hay)) out.push('title');
+              const labelOf = (el) => {
+                const id = el.getAttribute('id');
+                if (id) {
+                  const lab = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+                  if (lab) return (lab.innerText || '').replace(/\\s+/g, ' ').trim();
+                }
+                const wrap = el.closest('label') || el.parentElement;
+                return ((wrap && wrap.innerText) || el.getAttribute('aria-label') || el.placeholder || '')
+                  .replace(/\\s+/g, ' ').trim().slice(0, 80);
+              };
+              const empty = (el) => !String(el.value || '').trim();
+              const titleFilled = [...document.querySelectorAll('input, select, [role=combobox]')].filter(vis)
+                .some((el) => {
+                  const lab = labelOf(el).toLowerCase();
+                  if (!/\\btitle\\b/.test(lab) && el.getAttribute('aria-label') !== 'Title') return false;
+                  const v = String(el.value || el.getAttribute('aria-valuetext') || el.innerText || '')
+                    .replace(/\\s+/g, ' ').trim();
+                  return /^(mr|ms|mrs|mx)\\.?$/i.test(v);
+                });
+              // Title is often a <select> whose visible option is still the "Title" placeholder.
+              if (!titleFilled) {
+                for (const el of [...document.querySelectorAll('select')].filter(vis)) {
+                  const lab = labelOf(el).toLowerCase();
+                  if (!/title/.test(lab) && !/^title$/i.test((el.options[el.selectedIndex] || {}).text || '')) continue;
+                  const opt = (el.options[el.selectedIndex] || {});
+                  const optText = String(opt.text || '').trim();
+                  const optVal = String(el.value || '').trim();
+                  if (!optVal || /^title$/i.test(optText) || /^select/i.test(optText)) {
+                    if (!out.includes('title')) out.push('title');
+                  }
+                }
+              }
+              // Empty Title text input (Ixigo Adult 1 uses type=text, not select).
+              if (!titleFilled) {
+                for (const el of [...document.querySelectorAll('input')].filter(vis)) {
+                  const lab = labelOf(el).toLowerCase();
+                  if (!/^title\\b|\\btitle\\b/.test(lab)) continue;
+                  if (empty(el) || /^title$/i.test(String(el.value || '').trim())) {
+                    if (!out.includes('title')) out.push('title');
+                  }
+                }
+              }
+              // Combobox / button that still shows only "Title" — ignore static labels when input is filled.
+              if (!titleFilled) {
+                for (const el of [...document.querySelectorAll('button,[role=combobox]')].filter(vis)) {
+                  const t = (el.innerText || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+                  if (/^title$/i.test(t) && t.length <= 12) {
+                    if (!out.includes('title')) out.push('title');
+                    break;
+                  }
+                }
+              }
+              const inputs = [...document.querySelectorAll('input, textarea')].filter(vis)
+                .filter((el) => !/hidden|radio|checkbox|submit|button/i.test(el.type || ''));
+              for (const el of inputs) {
+                const lab = labelOf(el).toLowerCase();
+                if (!lab) continue;
+                if (/first|& middle|given name|traveller name/i.test(lab) && !/last|surname/i.test(lab) && empty(el)) {
+                  if (!out.includes('first name')) out.push('first name');
+                }
+                if (/last name|surname/i.test(lab) && empty(el)) {
+                  if (!out.includes('last name')) out.push('last name');
+                }
+              }
+              // Saved-list checkboxes exist but none checked while Adult form is empty.
+              const personLine = (el) => {
+                let node = el;
+                for (let i = 0; i < 6 && node; i++) {
+                  const t = (node.innerText || '').replace(/\\s+/g, ' ').trim();
+                  if (/\\b(mr|ms|mrs|mx)\\.?\\b/i.test(t) && t.length < 80) return t;
+                  node = node.parentElement;
+                }
+                return '';
+              };
+              const boxes = [...document.querySelectorAll('input[type=checkbox],[role=checkbox]')].filter(vis)
+                .filter((el) => personLine(el));
+              const anyOn = boxes.some((el) => el.checked || el.getAttribute('aria-checked') === 'true');
+              if (boxes.length && !anyOn && (out.includes('title') || out.includes('first name') || out.includes('last name'))) {
+                out.push('saved traveller not selected');
+              }
+              return out;
+            }"""
+        )
+        return [str(item) for item in (gaps or []) if str(item).strip()]
+    except Exception:
+        text, _url = _read(page)
+        hay = text or ""
+        out: list[str] = []
+        if re.search(r"please select your title", hay, re.I):
+            out.append("title")
+        if re.search(r"adult\s*1|first\s*&\s*middle name|first name", hay, re.I) and re.search(
+            r"please select your title|clear details", hay, re.I
+        ):
+            if "first name" not in out:
+                out.append("first name")
+            if "last name" not in out:
+                out.append("last name")
+        return out
+
+
+def _traveller_form_populated(page) -> bool:
+    """True when Adult form has title + names (saved tick applied or typed)."""
+    gaps = _adult_traveller_gaps(page)
+    return not any(g in {"title", "first name", "last name", "saved traveller not selected"} for g in gaps)
+
+
+def _select_saved_traveller(page, name: str = "") -> str:
+    """Tick one existing person on the front page. Never invent another profile.
+
+    Ixigo often renders saved people as role=listitem cards (not checkboxes), and the
+    list sits above the viewport under Offers / Free Cancellation until scrolled.
+    """
+    # Secure My Trip / Assured covers the list — decline first, then tick.
+    if _ixigo_buy_this_visible(page):
+        _ixigo_click_no_thanks(page)
+    if read_surface(page).get("overlay") and _ixigo_buy_this_visible(page):
+        return "behind_sheet"
+    wanted = _clean_traveller_name(name)
+    try:
+        # Scroll the saved list into view — cards are often at negative Y until this runs.
+        try:
+            page.evaluate(
+                """() => {
+                  const hit = [...document.querySelectorAll('h1,h2,h3,h4,div,span,p,label,[role=listitem]')]
+                    .find((el) => {
+                      const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                      return t.length < 80 && (
+                        /choose from the saved list|traveller details/i.test(t)
+                        || /^\\s*(mr|ms|mrs|mx)\\.?\\s+\\w+/i.test(t)
+                      );
+                    });
+                  if (hit) hit.scrollIntoView({block: 'center', inline: 'nearest'});
+                }"""
+            )
+            page.wait_for_timeout(400)
+        except Exception:
+            pass
+        picked = page.evaluate(
+            """(want) => {
+              const present = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                // Include off-screen cards — we scrollIntoView before click.
+                return r.width > 2 && r.height > 2 && s.visibility !== 'hidden'
+                  && s.display !== 'none' && s.opacity !== '0';
+              };
+              const personFrom = (raw) => {
+                const lines = (raw || '').split('\\n').map(s => s.replace(/\\s+/g, ' ').trim())
+                  .filter(s => s.length >= 4 && s.length <= 60);
+                const titled = lines.find(s => /\\b(mr|ms|mrs|mx)\\.?\\b/i.test(s));
+                return (titled || lines[0] || '').toLowerCase();
+              };
+              const isPerson = (line) => {
                 if (!line || line.length > 60) return false;
-                if (/pay|assured|cancellation|seat|meal|baggage|continue|gst|email|mobile|contact|add new|gender|first/.test(line)) return false;
+                if (/pay|assured|cancellation|reschedul|seat|meal|baggage|continue|gst|email|mobile|contact|add new|gender|first name|last name|clear details/i.test(line)) return false;
                 return /\\b(mr|ms|mrs|mx)\\.?\\b/.test(line) || /^[a-z]{2,}\\s+[a-z]{2,}/.test(line);
               };
               const personLine = (el) => {
                 let node = el;
                 for (let i = 0; i < 6 && node; i++) {
-                  const t = shortLine((node.innerText || node.getAttribute?.('aria-label') || '')).toLowerCase();
-                  if (isPerson(t)) return t;
+                  const own = (node.innerText || node.getAttribute?.('aria-label') || '');
+                  const t = personFrom(own);
+                  if (isPerson(t) && (node === el || own.length < 120)) return t;
                   node = node.parentElement;
                 }
                 return '';
               };
+              // Traveller ticks are checkboxes — never Assured / fare-type radios.
               const boxes = [...document.querySelectorAll(
-                'input[type=checkbox],[role=checkbox],input[type=radio]'
-              )].filter(vis);
+                'input[type=checkbox],[role=checkbox]'
+              )].filter(present);
               const adults = boxes.filter((el) => isPerson(personLine(el)));
               const named = want
                 ? adults.filter((el) => personLine(el).includes(want))
                 : adults;
               const pool = named.length ? named : adults;
               const alreadyOn = pool.find((el) => el.checked || el.getAttribute('aria-checked') === 'true');
-              if (alreadyOn) return 'already:' + adults.length;
+              if (alreadyOn) return {status: 'already', n: adults.length};
               const match = pool[0];
-              if (!match && adults.length) return 'unticked:' + adults.length;
               if (match) {
-                const lab = match.closest('label') || match;
-                lab.click();
-                if (!match.checked && match.getAttribute('aria-checked') !== 'true') match.click();
-                return 'clicked:' + adults.length;
+                const host = match.closest('label') || match;
+                host.scrollIntoView({block: 'center', inline: 'nearest'});
+                const r = host.getBoundingClientRect();
+                return {
+                  status: 'click',
+                  n: adults.length,
+                  x: Math.round(r.x + Math.min(18, r.width / 2)),
+                  y: Math.round(r.y + r.height / 2),
+                };
               }
-              const cards = [...document.querySelectorAll('label,button,div,li,span')].filter(vis);
-              const card = cards.find((el) => {
-                const t = shortLine(el.innerText || '').toLowerCase();
-                if (!isPerson(t)) return false;
-                if ((el.innerText || '').length > 80) return false;
-                return !want || t.includes(want);
-              });
-              if (card) { card.click(); return 'card:' + adults.length; }
-              return adults.length ? 'unticked:' + adults.length : '';
+              // Ixigo saved list: role=listitem / compact cards with "Mr Name" only.
+              const cards = [...document.querySelectorAll(
+                '[role=listitem],label,button,li,div,span'
+              )].filter(present);
+              const seen = new Set();
+              const personCards = [];
+              for (const el of cards) {
+                const raw = (el.innerText || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+                if (!raw || raw.length > 80) continue;
+                const t = personFrom(raw);
+                if (!isPerson(t)) continue;
+                if (want && !t.includes(want)) continue;
+                const r = el.getBoundingClientRect();
+                const key = t + ':' + Math.round(r.x) + ':' + Math.round(r.y);
+                if (seen.has(key)) continue;
+                seen.add(key);
+                personCards.push({el, t, r, area: r.width * r.height});
+              }
+              // Prefer the compact card (listitem ~231x44), not a huge parent.
+              personCards.sort((a, b) => a.area - b.area);
+              const card = personCards[0];
+              if (card) {
+                card.el.scrollIntoView({block: 'center', inline: 'nearest'});
+                const r = card.el.getBoundingClientRect();
+                return {
+                  status: 'card',
+                  n: personCards.length,
+                  x: Math.round(r.x + Math.min(24, r.width / 2)),
+                  y: Math.round(r.y + r.height / 2),
+                };
+              }
+              return {status: adults.length ? 'unticked' : '', n: adults.length};
             }""",
             wanted,
         )
+        if isinstance(picked, dict):
+            status = str(picked.get("status") or "")
+            count = int(picked.get("n") or 0)
+            if status in {"click", "card"} and picked.get("x") is not None:
+                # Prefer a real checkbox.check — Ixigo duplicates Mr Name rows; mouse coords
+                # often hit a non-interactive clone while Adult 1 stays blank.
+                named_click = False
+                try:
+                    checked = page.evaluate(
+                        """(want) => {
+                          const wantL = String(want || '').toLowerCase();
+                          const boxes = [...document.querySelectorAll('input[type=checkbox],[role=checkbox]')];
+                          for (const el of boxes) {
+                            let label = '';
+                            let n = el;
+                            for (let i = 0; i < 6 && n; i++) {
+                              const t = (n.innerText || '').replace(/\\s+/g, ' ').trim();
+                              if (/\\b(mr|ms|mrs|mx)\\.?\\b/i.test(t) && t.length < 80) {
+                                label = t.toLowerCase();
+                                break;
+                              }
+                              n = n.parentElement;
+                            }
+                            if (!label || (wantL && !label.includes(wantL))) continue;
+                            if (el.checked || el.getAttribute('aria-checked') === 'true') {
+                              return 'already';
+                            }
+                            el.scrollIntoView({block: 'center', inline: 'nearest'});
+                            try { el.click(); } catch (e) {}
+                            try { el.checked = true; el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); } catch (e) {}
+                            return 'checked';
+                          }
+                          return '';
+                        }""",
+                        wanted,
+                    )
+                    if checked:
+                        named_click = True
+                        page.wait_for_timeout(500)
+                except Exception:
+                    named_click = False
+                if not named_click and wanted:
+                    try:
+                        card = page.get_by_role(
+                            "listitem", name=re.compile(re.escape(wanted), re.I)
+                        ).first
+                        card.scroll_into_view_if_needed(timeout=3000)
+                        card.click(timeout=4000, force=True)
+                        named_click = True
+                        page.wait_for_timeout(500)
+                    except Exception:
+                        try:
+                            loc = page.get_by_text(
+                                re.compile(rf"\b(Mr|Ms|Mrs|Mx)\.?\s+{re.escape(wanted)}", re.I)
+                            ).first
+                            loc.scroll_into_view_if_needed(timeout=3000)
+                            loc.click(timeout=4000, force=True)
+                            named_click = True
+                            page.wait_for_timeout(500)
+                        except Exception:
+                            named_click = False
+                if not named_click:
+                    try:
+                        page.mouse.click(float(picked["x"]), float(picked["y"]))
+                        page.wait_for_timeout(450)
+                    except Exception:
+                        pass
+                if _traveller_form_populated(page):
+                    return f"traveller_{'clicked' if status == 'click' else 'card'}:{count}"
+                # Checkbox click did not fill Adult 1 — force a second hit on the same point.
+                try:
+                    page.mouse.click(float(picked["x"]), float(picked["y"]))
+                    page.wait_for_timeout(450)
+                except Exception:
+                    pass
+                if _traveller_form_populated(page):
+                    return f"traveller_retry:{count}"
+                return f"traveller_clicked_empty:{count}"
+            if status == "already":
+                # Checkbox looks on, but Adult form may still say "Please select your title".
+                if _traveller_form_populated(page):
+                    return f"traveller_already:{count}"
+                return f"traveller_already_empty:{count}"
+            if status == "unticked":
+                return f"traveller_unticked:{count}"
+            return f"traveller_{status}:{count}" if status else ""
         if picked:
             return f"traveller_{picked}"
     except Exception:
         return ""
     return ""
+
+
+def _ensure_review_traveller(page, profile: dict | None, log: list[str] | None = None) -> list[str]:
+    """Select a saved traveller (or type name) until Adult form is populated, or record gaps."""
+    notes: list[str] = []
+    name = str((profile or {}).get("name") or "")
+    for attempt in range(2):
+        if _traveller_form_populated(page):
+            notes.append("traveller_form_ok")
+            break
+        note = _select_saved_traveller(page, name)
+        notes.append(note or f"traveller_miss:{attempt}")
+        if note.startswith("traveller_already_empty") or note.startswith("traveller_clicked_empty"):
+            # Force another click by clearing the "already" path: click first visible person card.
+            try:
+                page.get_by_text(re.compile(r"\b(Mr|Ms|Mrs|Mx)\.?\s+\w+", re.I)).first.click(timeout=2000)
+                page.wait_for_timeout(400)
+            except Exception:
+                pass
+        if _traveller_form_populated(page):
+            notes.append("traveller_form_ok")
+            break
+    if not _traveller_form_populated(page) and name:
+        # Last resort: type title/first/last from the profile into Adult 1.
+        fill_notes = _fill_passenger_fields(page, profile or {})
+        notes.extend(fill_notes)
+        if _traveller_form_populated(page):
+            notes.append("traveller_form_filled")
+    gaps = _adult_traveller_gaps(page)
+    if gaps:
+        notes.append("traveller_gaps:" + ",".join(gaps))
+    if log is not None:
+        log.extend(notes)
+    return notes
 
 
 def _delete_saved_traveller(page, name: str = "") -> str:
@@ -2074,58 +2710,1088 @@ def _delete_saved_traveller(page, name: str = "") -> str:
     return "traveller_delete_miss"
 
 
-def _ixigo_opt_out_cancellation(page) -> str:
+def _close_ixigo_login_modal(page) -> str:
+    """Guest checkout: close the Log in to Ixigo dialog so the fare sheet behind it stays."""
     try:
-        page.locator("#standalone-none-fareType").check(timeout=2500)
-        return "optout_radio"
+        closed = page.evaluate(
+            """() => {
+              const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 8 && r.height > 8 && s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              const nodes = [...document.querySelectorAll('button,[role=button],div,span')].filter(vis);
+              const title = nodes.find(el => /^log in to ixigo$/i.test((el.innerText || '').trim()));
+              if (!title) return '';
+              const dialog = title.closest('[role=dialog], [class*=modal], [class*=Modal], [class*=popup]') || title.parentElement;
+              const root = dialog || document.body;
+              const labelled = [...root.querySelectorAll('button,[role=button]')].find(el => {
+                const aria = (el.getAttribute('aria-label') || '');
+                const t = (el.innerText || '').trim();
+                return /close|dismiss/i.test(aria) || t === '×' || t === '✕' || t === 'X';
+              });
+              if (labelled) { labelled.click(); return 'close'; }
+              const rect = (root.getBoundingClientRect && root.getBoundingClientRect()) || {top:0,right:0};
+              const corner = [...root.querySelectorAll('button,[role=button]')]
+                .filter(vis)
+                .map(el => ({el, r: el.getBoundingClientRect()}))
+                .filter(x => x.r.width > 8 && x.r.width < 72 && x.r.height < 72)
+                .filter(x => x.r.top < rect.top + 90 && x.r.right > rect.right - 90)
+                .sort((a, b) => a.r.top - b.r.top || b.r.right - a.r.right)[0];
+              if (corner) { corner.el.click(); return 'corner'; }
+              return '';
+            }"""
+        )
+        if not closed:
+            try:
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(300)
+                still = page.evaluate(
+                    """() => /log in to ixigo/i.test(document.body.innerText || '')"""
+                )
+                closed = "" if still else "escape"
+            except Exception:
+                closed = ""
+        if closed:
+            try:
+                page.wait_for_timeout(400)
+            except Exception:
+                pass
+            return f"closed:{closed}"
+    except Exception:
+        return "close_miss"
+    return "close_miss"
+
+
+def _decline_option_text(text: str) -> bool:
+    """True for the real decline radio copy — not the With/Without Assured marketing table."""
+    hay = re.sub(r"\s+", " ", (text or "").strip())
+    if not hay or len(hay) > 200:
+        return False
+    if re.search(r"^with(?:out)? assured$|^buy this$|^secure my trip$", hay, re.I):
+        return False
+    if re.search(r"don.?t want free cancellation", hay, re.I):
+        return True
+    if re.fullmatch(r"no,?\s*thanks", hay, re.I):
+        return True
+    if re.search(r"standalone-none", hay, re.I):
+        return True
+    return False
+
+
+def _decline_radio_checked(page) -> bool:
+    """True when the no-Free-Cancellation radio is actually selected (blue/checked)."""
+    try:
+        return bool(
+            page.evaluate(
+                """() => {
+                  const labelOf = (el) => (el.innerText || el.getAttribute('aria-label') || '')
+                    .replace(/\\s+/g, ' ').trim();
+                  const isDecline = (text) => {
+                    const t = String(text || '').replace(/\\s+/g, ' ').trim();
+                    if (!t || t.length > 200) return false;
+                    if (/^with(?:out)? assured$|^buy this$|^secure my trip$/i.test(t)) return false;
+                    if (/don.?t want free cancellation/i.test(t)) return true;
+                    if (/^no,?\\s*thanks$/i.test(t)) return true;
+                    return /standalone-none/i.test(t);
+                  };
+                  const selected = (el) => {
+                    if (!el) return false;
+                    if (el.checked === true || el.getAttribute('aria-checked') === 'true') return true;
+                    const cls = String(el.className || '');
+                    return /\\b(selected|active|checked|isSelected|is-selected)\\b/i.test(cls);
+                  };
+                  const hostText = (el) => {
+                    let node = el;
+                    for (let i = 0; i < 5 && node; i++) {
+                      const t = labelOf(node);
+                      if (t && t.length <= 200 && isDecline(t)) return t;
+                      node = node.parentElement;
+                    }
+                    return labelOf(el.closest('label') || el.parentElement || el);
+                  };
+                  const radios = [...document.querySelectorAll('input[type=radio],[role=radio]')];
+                  for (const el of radios) {
+                    if (!selected(el)) continue;
+                    const text = hostText(el) + ' ' + (el.id || '') + ' ' + (el.getAttribute('name') || '');
+                    if (isDecline(text)) return true;
+                  }
+                  for (const el of document.querySelectorAll('label,div,li,section,[role=radio],[role=option]')) {
+                    const text = labelOf(el);
+                    if (!isDecline(text)) continue;
+                    if (selected(el)) return true;
+                    const radio = el.querySelector('input[type=radio],[role=radio]');
+                    if (radio && selected(radio)) return true;
+                  }
+                  return false;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+def _ixigo_assured_comparison_open(page) -> bool:
+    """True when Review shows the With Assured / Without Assured comparison."""
+    try:
+        text, _url = _read(page)
+    except Exception:
+        text = ""
+    return bool(
+        re.search(r"without assured", text or "", re.I)
+        and re.search(r"with assured", text or "", re.I)
+    )
+
+
+def _ixigo_click_without_assured(page) -> str:
+    """Click the Without Assured card/CTA on the Assured comparison sheet.
+
+    Ixigo often wraps the label in a card whose innerText is longer than
+    'Without Assured' (price + bullets). Exact-label-only clicks miss.
+    """
+    try:
+        page.evaluate(
+            """() => {
+              const hit = [...document.querySelectorAll('h1,h2,h3,h4,div,span,p,label,button')]
+                .find((el) => {
+                  const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                  return t.length < 80 && /without\\s*assured/i.test(t);
+                });
+              if (hit) hit.scrollIntoView({block: 'center', inline: 'nearest'});
+            }"""
+        )
+        page.wait_for_timeout(250)
     except Exception:
         pass
     try:
-        page.get_by_text(re.compile(r"don.?t want Free Cancellation", re.I)).first.click(timeout=2500)
-        return "optout_text"
+        text, _url = _read(page)
     except Exception:
-        pass
-    for pattern in (r"^no,?\s*thanks$", r"^no thanks$"):
-        try:
-            page.get_by_text(re.compile(pattern, re.I)).first.click(timeout=2500)
-            return "optout_no_thanks"
-        except Exception:
-            pass
+        text = ""
+    if not re.search(r"without assured", text or "", re.I):
+        return ""
     try:
-        clicked = page.evaluate(
+        hit = page.evaluate(
             """() => {
               const vis = (el) => {
                 const r = el.getBoundingClientRect();
                 const s = getComputedStyle(el);
                 return r.width > 8 && r.height > 8 && s.visibility !== 'hidden'
-                  && s.display !== 'none' && r.bottom > 0 && r.top < innerHeight;
+                  && s.display !== 'none' && s.opacity !== '0'
+                  && r.bottom > 0 && r.top < innerHeight;
               };
               const label = (el) => (el.innerText || el.getAttribute('aria-label') || '')
                 .replace(/\\s+/g, ' ').trim();
-              const nodes = [...document.querySelectorAll('label, div, span, button, a, p, [role=button]')].filter(vis);
-              const skip = nodes.find((el) => {
-                const text = label(el);
-                if (!text || text.length > 90) return false;
-                if (/^buy this$|^secure my trip$/i.test(text) || /\\bpay\\b/i.test(text)) return false;
-                return /don.?t want free cancellation|no,? thanks|i don.?t want|continue without|skip (add-?on|this)|not now|maybe later|^none$|^no$/i.test(text);
-              });
-              if (skip) { skip.click(); return 'skip'; }
-              const none = document.querySelector('#standalone-none-fareType');
-              if (none) { none.click(); return 'radio'; }
-              const close = nodes.find((el) => {
-                const aria = (el.getAttribute('aria-label') || '');
-                const r = el.getBoundingClientRect();
-                return /close|dismiss/i.test(aria) && r.y > 60 && r.width < 64 && r.height < 64;
-              });
-              if (close) { close.click(); return 'close'; }
-              return '';
+              const nodes = [...document.querySelectorAll(
+                'button,a,[role=button],div,span,label,p,h3,h4'
+              )]
+                .filter(vis)
+                .map((el) => ({el, t: label(el)}))
+                .filter(({t}) => {
+                  if (!t || t.length > 160) return false;
+                  if (/^with assured$/i.test(t)) return false;
+                  // Exact header, or card that leads with Without Assured + price.
+                  return /^without assured\\b/i.test(t) || /\\bwithout assured\\b/i.test(t);
+                })
+                .sort((a, b) => a.t.length - b.t.length);
+              if (!nodes.length) return null;
+              const el = nodes[0].el;
+              el.scrollIntoView({block: 'center', inline: 'nearest'});
+              const r = el.getBoundingClientRect();
+              return {
+                x: r.x + Math.min(r.width / 2, 40),
+                y: r.y + Math.min(r.height / 2, 24),
+                t: nodes[0].t.slice(0, 80),
+              };
             }"""
         )
-        if clicked:
-            return f"optout_js:{clicked}"
+        if isinstance(hit, dict) and hit.get("x") is not None:
+            page.mouse.click(float(hit["x"]), float(hit["y"]))
+            page.wait_for_timeout(500)
+            # Prefer a real selection signal; comparison text can linger.
+            if _decline_radio_checked(page) or not _ixigo_assured_comparison_open(page):
+                return "optout_without_assured"
+            # Card click often selects without removing the comparison copy.
+            if not re.search(
+                r"please select an option before proceeding",
+                (_read(page)[0] or ""),
+                re.I,
+            ):
+                return "optout_without_assured"
     except Exception:
         pass
+    for pattern in (
+        re.compile(r"^without assured$", re.I),
+        re.compile(r"without assured", re.I),
+    ):
+        try:
+            loc = page.get_by_text(pattern).first
+            loc.scroll_into_view_if_needed(timeout=2000)
+            loc.click(timeout=2000, force=True)
+            page.wait_for_timeout(500)
+            return "optout_without_assured"
+        except Exception:
+            continue
+    return "optout_without_assured_miss"
+
+
+def _ixigo_opt_out_cancellation(page) -> str:
+    """Decline Free Cancellation on Review Details.
+
+    Ixigo UIs:
+    1) Secure My Trip sheet → click No, Thanks (modal dismisses; no radio to check).
+    2) Assured comparison → click Without Assured (user said no thanks / don't want).
+    3) Inline radios → select 'I don't want Free Cancellation. Pay ₹…'.
+    Never click With Assured or Secure My Trip buy.
+    """
+    # Popup sheet first — Continue is a no-op while Secure My Trip covers the form.
+    sheet = _ixigo_click_no_thanks(page)
+    if sheet == "optout_no_thanks":
+        return sheet
+    # Never treat the inline decline radio as "done" while No Thanks / Secure My Trip is open.
+    if sheet == "optout_no_thanks_miss" or _ixigo_buy_this_visible(page):
+        for _ in range(2):
+            again = _ixigo_click_no_thanks(page)
+            if again == "optout_no_thanks":
+                return again
+        if _ixigo_buy_this_visible(page):
+            return "optout_no_thanks_miss"
+    without = _ixigo_click_without_assured(page)
+    if without == "optout_without_assured":
+        return without
+    if without == "optout_without_assured_miss" and _ixigo_assured_comparison_open(page):
+        # Keep trying radios below, but remember the comparison is still the blocker.
+        pass
+    if (
+        _decline_radio_checked(page)
+        and not _ixigo_buy_this_visible(page)
+        and not _ixigo_assured_comparison_open(page)
+    ):
+        return "optout_already"
+    # Billing often fills the viewport — scroll the Free Cancellation block up first.
+    try:
+        page.evaluate(
+            """() => {
+              const hit = [...document.querySelectorAll('h1,h2,h3,h4,div,span,p,label')]
+                .find((el) => {
+                  const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                  return t.length < 160 && /add free cancellation|don.?t want free cancellation|please select an option before proceeding/i.test(t);
+                });
+              if (hit) hit.scrollIntoView({block: 'center', inline: 'nearest'});
+            }"""
+        )
+        page.wait_for_timeout(250)
+    except Exception:
+        pass
+    try:
+        page.locator("#standalone-none-fareType").check(timeout=1500)
+        try:
+            page.wait_for_timeout(300)
+        except Exception:
+            pass
+        if _decline_radio_checked(page):
+            return "optout_radio"
+    except Exception:
+        pass
+    # Exact modern copy: "I don't want Free Cancellation. Pay ₹3,999 fee…"
+    try:
+        pay_re = re.compile(
+            r"I don.?t want Free Cancellation\.?\s*Pay\s*₹?\s*[\d,]+\s*fee",
+            re.I,
+        )
+        row = page.locator("label, div, li, section").filter(has_text=pay_re).first
+        row.scroll_into_view_if_needed(timeout=2500)
+        box = None
+        try:
+            radio = row.locator("input[type=radio], [role=radio]").first
+            radio.scroll_into_view_if_needed(timeout=1500)
+            box = radio.bounding_box()
+            if box and box.get("width", 0) > 2:
+                try:
+                    radio.check(timeout=1200)
+                except Exception:
+                    pass
+        except Exception:
+            box = None
+        if not box:
+            loc = page.get_by_text(pay_re).first
+            box = loc.bounding_box()
+        if box and box.get("width", 0) > 2:
+            # Aim the radio circle on the left of the row, not the middle of long copy.
+            page.mouse.click(
+                box["x"] + min(14.0, max(6.0, box["width"] / 2)),
+                box["y"] + box["height"] / 2,
+            )
+        try:
+            page.wait_for_timeout(400)
+        except Exception:
+            pass
+        if _decline_radio_checked(page):
+            return "optout_exact_pay"
+    except Exception:
+        pass
+    try:
+        hit = page.evaluate(
+            """() => {
+              const onPage = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 2 && r.height > 2 && s.visibility !== 'hidden'
+                  && s.display !== 'none' && s.opacity !== '0';
+              };
+              const labelOf = (el) => (el.innerText || el.getAttribute('aria-label') || '')
+                .replace(/\\s+/g, ' ').trim();
+              const isDecline = (text) => {
+                const t = String(text || '').replace(/\\s+/g, ' ').trim();
+                if (!t || t.length > 200) return false;
+                if (/^with(?:out)? assured$|^buy this$|^secure my trip$/i.test(t)) return false;
+                if (/don.?t want free cancellation/i.test(t)) return true;
+                if (/^no,?\\s*thanks$/i.test(t)) return true;
+                return /standalone-none/i.test(t);
+              };
+              const pointFor = (el, how) => {
+                el.scrollIntoView({block: 'center', inline: 'nearest'});
+                const input = el.matches('input,[role=radio]') ? el
+                  : (el.querySelector('input[type=radio],[role=radio]') || el);
+                const r = input.getBoundingClientRect();
+                return {
+                  x: Math.round(r.x + Math.min(14, Math.max(6, r.width / 2))),
+                  y: Math.round(r.y + r.height / 2),
+                  how,
+                };
+              };
+              const none = document.querySelector('#standalone-none-fareType');
+              if (none && onPage(none)) return pointFor(none.closest('label') || none, 'id');
+              // Prefer the exact Pay-fee decline row.
+              const nodes = [...document.querySelectorAll('label,div,span,p,li,[role=radio],[role=option]')].filter(onPage);
+              const payRow = nodes
+                .map((el) => ({el, text: labelOf(el)}))
+                .filter(({text}) => /don.?t want free cancellation/i.test(text)
+                  && /pay\\s*₹?\\s*[\\d,]+\\s*fee/i.test(text)
+                  && text.length <= 200)
+                .sort((a, b) => a.text.length - b.text.length)[0];
+              if (payRow) return pointFor(payRow.el, 'pay_fee');
+              const radios = [...document.querySelectorAll('input[type=radio],[role=radio]')].filter(onPage);
+              for (const radio of radios) {
+                let node = radio;
+                let text = '';
+                for (let i = 0; i < 5 && node; i++) {
+                  text = labelOf(node);
+                  if (text && text.length <= 200 && isDecline(text)) break;
+                  node = node.parentElement;
+                }
+                if (!isDecline(text)) continue;
+                return pointFor(radio, 'radio');
+              }
+              const skip = nodes
+                .map((el) => ({el, text: labelOf(el)}))
+                .filter(({text}) => isDecline(text))
+                .sort((a, b) => a.text.length - b.text.length)[0];
+              if (!skip) return null;
+              return pointFor(skip.el, 'text');
+            }"""
+        )
+        if isinstance(hit, dict) and hit.get("x") is not None:
+            page.mouse.click(float(hit["x"]), float(hit["y"]))
+            try:
+                page.wait_for_timeout(400)
+            except Exception:
+                pass
+            if _decline_radio_checked(page):
+                return f"optout_mouse:{hit.get('how') or 'hit'}"
+    except Exception:
+        pass
+    try:
+        loc = page.get_by_text(re.compile(r"I don.?t want Free Cancellation", re.I)).first
+        loc.scroll_into_view_if_needed(timeout=2500)
+        box = loc.bounding_box()
+        if box and box.get("width", 0) > 4:
+            # Click near the left edge where the radio circle sits.
+            page.mouse.click(box["x"] + 12.0, box["y"] + box["height"] / 2)
+            try:
+                page.wait_for_timeout(400)
+            except Exception:
+                pass
+            if _decline_radio_checked(page):
+                return "optout_text_mouse"
+        else:
+            loc.click(timeout=2500)
+            try:
+                page.wait_for_timeout(400)
+            except Exception:
+                pass
+            if _decline_radio_checked(page):
+                return "optout_text"
+    except Exception:
+        pass
+    # Last chance: Secure My Trip may have opened after a radio attempt.
+    sheet = _ixigo_click_no_thanks(page)
+    if sheet == "optout_no_thanks":
+        return sheet
+    if sheet == "optout_no_thanks_miss":
+        return sheet
+    if without == "optout_without_assured_miss" or _ixigo_assured_comparison_open(page):
+        return "optout_without_assured_miss"
     return "optout_miss"
+
+
+def _cancellation_declined(page, opt: str = "") -> bool:
+    """True when Free Cancellation is cleared (radio selected or No Thanks sheet gone)."""
+    if _ixigo_buy_this_visible(page):
+        return False
+    if opt.startswith("optout_no_thanks") and opt != "optout_no_thanks_miss":
+        return True
+    if opt == "optout_without_assured":
+        # Without Assured was pressed — still fail if Secure My Trip covers Continue.
+        if _ixigo_buy_this_visible(page):
+            return False
+        return True
+    if opt == "optout_without_assured_miss":
+        return False
+    if opt == "optout_already":
+        return True
+    return _decline_radio_checked(page)
+
+
+def _ixigo_pin_invalid(page) -> bool:
+    text, _url = _read(page)
+    return bool(
+        re.search(r"please enter a valid pin\s*code|please enter a valid pincode", text or "", re.I)
+    )
+
+
+def _pin_retry_handoff(*, sheet_open: bool = False) -> str:
+    sheet = (
+        "Free Cancellation is still open (No, Thanks did not close it). "
+        if sheet_open
+        else ""
+    )
+    return (
+        f"{sheet}The pincode is incorrect. "
+        "Send the correct 6-digit pin and I'll replace it on this same page, then Continue. "
+        "Nothing paid."
+    )
+
+
+def named_form_issues(hay: str) -> tuple[list[str], list[str]]:
+    """Labels the open page is rejecting or still asking for. (missing, wrong)."""
+    text = hay or ""
+    missing: list[str] = []
+    wrong: list[str] = []
+
+    def add(bucket: list[str], label: str) -> None:
+        if label not in bucket:
+            bucket.append(label)
+
+    if re.search(
+        r"please enter a valid pin\s*code|please enter a valid pincode|pincode is invalid",
+        text,
+        re.I,
+    ):
+        add(wrong, "pin code")
+    elif re.search(r"please enter (?:a )?pin\s*code|pincode is required", text, re.I):
+        add(missing, "pin code")
+    if re.search(r"please enter a valid email|email is invalid", text, re.I):
+        add(wrong, "email")
+    elif re.search(r"please enter an email address|contact email is empty", text, re.I):
+        add(missing, "email")
+    if re.search(r"please select your title", text, re.I):
+        add(missing, "title")
+    if re.search(
+        r"please enter (?:your )?(?:first(?:\s*&\s*middle)? name|last name|full name)|name is required",
+        text,
+        re.I,
+    ):
+        add(missing, "full name")
+    if re.search(r"please enter (?:a )?(?:valid )?(?:mobile|phone)", text, re.I):
+        add(missing, "mobile")
+    address_hay = re.sub(r"e-?mail address", " ", text, flags=re.I)
+    if re.search(r"please enter (?:your |a )?(?:billing )?address", address_hay, re.I):
+        add(missing, "billing address")
+    if re.search(r"please enter (?:your |a )?city", text, re.I):
+        add(missing, "city")
+    if re.search(r"please (?:enter|select) (?:your |a )?state", text, re.I):
+        add(missing, "state")
+    if re.search(r"date of birth is required|please enter (?:your )?date of birth", text, re.I):
+        add(missing, "date of birth")
+    return missing, wrong
+
+
+def _review_continue_blocker(page) -> str:
+    """Why Continue stayed on Review Details — name the exact gap when possible."""
+    text, _url = _read(page)
+    hay = text or ""
+    # Seat map / Skip to payment still shows the Review stepper. That is not a stuck form.
+    if _on_addons_page(hay, "addons"):
+        return ""
+    sheet_open = _ixigo_buy_this_visible(page) or bool(re.search(r"secure my trip", hay, re.I))
+    gaps = _adult_traveller_gaps(page)
+    if gaps:
+        if "saved traveller not selected" in gaps:
+            return (
+                "Adult traveller details are incomplete — a saved traveller is listed but not applied "
+                f"(need {', '.join(g for g in gaps if g != 'saved traveller not selected') or 'title and name'}). "
+                "Reply with the passenger name (or yes) and I'll tick the saved profile, then Continue. "
+                "Nothing paid."
+            )
+        return (
+            "Adult traveller details are incomplete — missing "
+            f"{', '.join(gaps)}. "
+            "Reply with the passenger name or the missing fields and I'll fill them on this page. "
+            "Nothing paid."
+        )
+    if _email_input_empty(page) or re.search(
+        r"please enter an email address|please enter (?:a )?valid email", hay, re.I
+    ):
+        return (
+            "Contact email is empty — Please enter an email address. "
+            "Send the email and I'll type it into Contact Details on this page, then Continue. "
+            "Nothing paid."
+        )
+    if _ixigo_pin_invalid(page):
+        return _pin_retry_handoff(sheet_open=sheet_open)
+    if sheet_open:
+        return (
+            "Free Cancellation Secure My Trip is still open on Review Details after I tried No, Thanks. "
+            "Reply no thanks and I'll try again. Nothing paid."
+        )
+    if (
+        re.search(r"without assured", hay, re.I)
+        and re.search(r"with assured", hay, re.I)
+        and not _decline_radio_checked(page)
+    ):
+        return (
+            "Assured Free Cancellation is still open on Review Details after I tried Without Assured. "
+            "Reply no thanks and I'll try again, then Continue. Nothing paid."
+        )
+    if not _decline_radio_checked(page) and re.search(
+        r"don.?t want free cancellation|please select an option before proceeding", hay, re.I
+    ):
+        return (
+            "Free Cancellation is still unselected after the decline attempt, "
+            "so Continue stayed on Review Details. Nothing paid."
+        )
+    if re.search(r"please enter a valid pin\s*code|please enter a valid pincode", hay, re.I):
+        return (
+            "Continue stayed on Review Details — the pin code is wrong. "
+            "Send a different 6-digit pin and I'll replace it on this page. Nothing paid."
+        )
+    named_missing, named_wrong = named_form_issues(hay)
+    if named_missing or named_wrong:
+        bits = []
+        if named_wrong:
+            bits.append("wrong: " + ", ".join(named_wrong))
+        if named_missing:
+            bits.append("missing: " + ", ".join(named_missing))
+        return (
+            "Continue stayed on Review Details — "
+            + "; ".join(bits)
+            + ". Send the corrected values and I'll type them on this page. Nothing paid."
+        )
+    if re.search(r"please enter.*(mobile|phone|address|name)|is required", hay, re.I):
+        return "Continue stayed on Review Details — a required traveller/contact field is still invalid. Nothing paid."
+    if re.search(r"please select an option before proceeding", hay, re.I):
+        return (
+            "Continue stayed on Review Details — Ixigo still asks to select a Free Cancellation option. "
+            "Nothing paid."
+        )
+    return (
+        "Continue stayed on Review Details after the cancellation choice "
+        "(another required field may still be incomplete). Nothing paid."
+    )
+
+
+def _ixigo_execute_pending(page, profile: dict | None, plan: dict, log: list[str]) -> bool:
+    """Run AUTO_FILL actions the decision engine still wants. One pass, no pay clicks."""
+    did = False
+    profile = profile or {}
+    for item in plan.get("pending_fill") or []:
+        action = str(item.get("action") or "")
+        field = str(item.get("field") or "")
+        if action == "decline":
+            log.append(f"ixigo_auto:{_ixigo_opt_out_cancellation(page)}")
+            did = True
+        elif action == "select_saved":
+            log.append(_select_saved_traveller(page, str(profile.get("name") or "")))
+            did = True
+        elif action == "fill" and field == "email":
+            email = str(profile.get("email") or "").strip()
+            if email:
+                log.append("email:ok" if _commit_contact_email(page, email) else "email:miss")
+                did = True
+        elif action == "fill" and field in {"phone", "pincode", "billing_address", "city", "billing_state"}:
+            notes = fill_profile_slots(page, profile, keys=(field,))
+            if notes:
+                log.extend(notes)
+            did = True
+    return did
+
+
+def _ixigo_autonomous_gate(page, profile: dict | None, log: list[str]) -> str:
+    """Preconditions for Continue on a logged-in Ixigo checkout.
+
+    Empty string means Continue is allowed. Any other string is the handoff and
+    Continue must not be clicked. Guest checkout is unchanged.
+    """
+    if str((profile or {}).get("auth_mode") or "").lower() == "guest":
+        return ""
+    from app.ixigo_decisions import observe_ixigo_checkout, plan_ixigo_checkout
+
+    plan: dict = {}
+    for _attempt in range(2):
+        try:
+            obs = observe_ixigo_checkout(page, profile)
+            plan = plan_ixigo_checkout(obs, profile)
+        except Exception:
+            log.append("ixigo_decision_err")
+            return ""
+        log.append(
+            "ixigo_decision:"
+            + ",".join(plan.get("classes") or [])
+            + f":continue={int(bool(plan.get('continue_ok')))}"
+        )
+        if plan.get("continue_ok"):
+            return ""
+        pending = plan.get("pending_fill") or []
+        asks = plan.get("asks") or []
+        blocks = plan.get("blocks") or []
+        if pending and not blocks:
+            if not _ixigo_execute_pending(page, profile, plan, log):
+                break
+            continue
+        if asks or blocks:
+            return str(plan.get("handoff") or "Checkout needs a detail before Continue. Nothing paid.")
+        break
+    try:
+        obs = observe_ixigo_checkout(page, profile)
+        plan = plan_ixigo_checkout(obs, profile)
+    except Exception:
+        return ""
+    if plan.get("continue_ok"):
+        return ""
+    # Saved traveller was clicked and gaps remain — ask for what the DOM still lacks.
+    gaps = [str(g) for g in (obs.get("traveller_gaps") or []) if str(g)]
+    if gaps:
+        return (
+            "Adult traveller details are incomplete — missing "
+            + ", ".join(gaps)
+            + ". Send the missing fields. Nothing paid."
+        )
+    return str(plan.get("handoff") or "Checkout is not ready to Continue. Nothing paid.")
+
+
+def _retry_known_traveller(page, profile: dict | None, log: list[str]) -> bool:
+    """Direct checkout already has the traveller. Tick and fill again instead of asking."""
+    if str((profile or {}).get("direct_checkout") or "") != "1":
+        return False
+    if not str((profile or {}).get("name") or "").strip():
+        return False
+    if sum(1 for line in log if line == "direct_retick") >= 2:
+        return False
+    log.append("direct_retick")
+    _ixigo_prepare_review(page, profile, log)
+    return True
+
+
+def _ixigo_prepare_review(page, profile: dict | None, log: list[str] | None = None) -> list[str]:
+    """Before Continue on Ixigo Review Details: decline Assured, apply traveller, fill gaps.
+
+    Never assume a saved profile is on the form — tick, type, then DOM-verify.
+    """
+    notes: list[str] = []
+    profile = dict(profile or {})
+    # Prefer decline when preference unset — returning users should not be asked again.
+    if not str(profile.get("extras_preference") or "").strip():
+        profile["extras_preference"] = "decline"
+    # 1) Clear Assured / Secure My Trip so the traveller list is clickable.
+    notes.append(_ixigo_opt_out_cancellation(page))
+    if _ixigo_buy_this_visible(page) or _ixigo_assured_comparison_open(page):
+        notes.append(_ixigo_opt_out_cancellation(page))
+    # 2) Saved traveller → verify Adult 1. Fill cleaned name if the tick did not stick.
+    notes.extend(_ensure_review_traveller(page, profile))
+    if not _traveller_form_populated(page) and str(profile.get("name") or "").strip():
+        fill_notes = _fill_passenger_fields(page, profile)
+        notes.extend(fill_notes)
+        if _traveller_form_populated(page):
+            notes.append("traveller_form_filled")
+    # 3) Contact + billing from the same saved profile.
+    typed = type_saved_contact(page, profile)
+    if typed:
+        notes.extend(typed)
+    more = fill_profile_slots(
+        page,
+        profile,
+        # Email only via _commit_contact_email — slot fill can log email:ok then React wipes it.
+        keys=("phone", "pincode", "billing_address", "city", "billing_state"),
+    )
+    if more:
+        notes.extend(more)
+    # Re-check traveller after contact/billing fills (Ixigo sometimes clears Adult 1).
+    if not _traveller_form_populated(page):
+        notes.extend(_ensure_review_traveller(page, profile))
+        if not _traveller_form_populated(page) and str(profile.get("name") or "").strip():
+            notes.extend(_fill_passenger_fields(page, profile))
+    # Email last — traveller remounts wipe Contact; only trust a post-fill live read.
+    email = str(profile.get("email") or "").strip()
+    if email:
+        notes[:] = [n for n in notes if not n.startswith("email:")]
+        if _commit_contact_email(page, email):
+            notes.append("email:ok")
+        else:
+            notes.append("email:miss")
+    # 4) Decline again if Assured reopened while filling.
+    if _ixigo_buy_this_visible(page) or (
+        _ixigo_assured_comparison_open(page) and not _decline_radio_checked(page)
+    ):
+        notes.append(_ixigo_opt_out_cancellation(page))
+    if log is not None:
+        log.extend(notes)
+    return notes
+
+
+def _read_email_value(page) -> str:
+    """Live Contact email value. Ixigo uses type=text labeled Email, not type=email."""
+    try:
+        return str(
+            page.evaluate(
+                """() => {
+                  const vis = (el) => {
+                    const r = el.getBoundingClientRect();
+                    const s = getComputedStyle(el);
+                    return r.width > 4 && r.height > 4 && s.visibility !== 'hidden' && s.display !== 'none';
+                  };
+                  const boxes = [...document.querySelectorAll('input, textarea')].filter(vis);
+                  const labelOf = (el) => (
+                    (el.getAttribute('aria-label') || '') + ' ' +
+                    (el.placeholder || '') + ' ' +
+                    ((el.closest('label') || el.parentElement || {}).innerText || '')
+                  ).replace(/\\s+/g, ' ').trim().toLowerCase();
+                  let empty = '';
+                  for (const el of boxes) {
+                    const lab = labelOf(el);
+                    if (el.type === 'email' || (/\\bemail\\b/.test(lab) && !/mobile|phone|\\+91/.test(lab))) {
+                      const v = String(el.value || '').trim();
+                      if (v.includes('@')) return v;
+                      if (!empty) empty = v;
+                    }
+                  }
+                  return empty;
+                }"""
+            )
+            or ""
+        )
+    except Exception:
+        return ""
+
+
+def _react_set_input_value(page, email: str) -> bool:
+    """Set Ixigo Contact email through React's value tracker so Continue keeps it."""
+    try:
+        return bool(
+            page.evaluate(
+                """(value) => {
+                  const vis = (el) => {
+                    const r = el.getBoundingClientRect();
+                    const s = getComputedStyle(el);
+                    return r.width > 4 && r.height > 4 && s.visibility !== 'hidden' && s.display !== 'none';
+                  };
+                  const el = [...document.querySelectorAll('input')].find((node) => {
+                    if (!vis(node)) return false;
+                    const lab = (
+                      (node.getAttribute('aria-label') || '') + ' ' +
+                      (node.placeholder || '') + ' ' +
+                      ((node.closest('label') || node.parentElement || {}).innerText || '')
+                    ).replace(/\\s+/g, ' ').trim().toLowerCase();
+                    return node.type === 'email'
+                      || (lab === 'email' || (/^email\\b/.test(lab) && !/mobile|phone|\\+91/.test(lab)));
+                  });
+                  if (!el) return false;
+                  el.scrollIntoView({block: 'center'});
+                  el.focus();
+                  el.click();
+                  const proto = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                  );
+                  const last = el.value;
+                  if (proto && proto.set) proto.set.call(el, value);
+                  else el.value = value;
+                  // React controlled inputs ignore plain .value= unless the tracker is reset.
+                  const tracker = el._valueTracker;
+                  if (tracker && typeof tracker.setValue === 'function') tracker.setValue(last);
+                  el.dispatchEvent(new InputEvent('input', {
+                    bubbles: true, cancelable: true, data: value, inputType: 'insertText'
+                  }));
+                  el.dispatchEvent(new Event('input', {bubbles: true}));
+                  el.dispatchEvent(new Event('change', {bubbles: true}));
+                  el.blur();
+                  return (el.value || '').includes('@');
+                }""",
+                email,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _commit_contact_email(page, email: str) -> bool:
+    """Type email into the real Contact box and verify it still holds after React settles.
+
+    Ixigo wipes paste/fill/.value= on Continue unless each character goes through
+    the input's key path (press_sequentially). Live Kernel check: fill survives DOM
+    read then clears on Continue; press_sequentially keeps React state through Continue.
+    """
+    want = (email or "").strip()
+    if not want or "@" not in want:
+        return False
+    if _value_stuck(_read_email_value(page), want, "email") and not _email_input_empty(page):
+        return True
+    reveal_form_step(page)
+    for _attempt in (1, 2, 3):
+        _react_set_input_value(page, want)
+        try:
+            loc = page.locator("xpath=//*[normalize-space()='Email']/following::input[1]").first
+            if loc.count() > 0:
+                loc.scroll_into_view_if_needed(timeout=2000)
+                loc.click(timeout=2000)
+                loc.fill("")
+                loc.press_sequentially(want, delay=35)
+                page.keyboard.press("Tab")
+                page.wait_for_timeout(400)
+                got = (loc.input_value(timeout=1500) or "").strip()
+                if _value_stuck(got, want, "email") and not _email_input_empty(page):
+                    return True
+        except Exception:
+            pass
+        row = next(
+            (
+                b
+                for b in _field_boxes(page)
+                if _is_email_box(b) or box_slot(b) == "email"
+            ),
+            None,
+        )
+        if row is not None:
+            try:
+                page.mouse.click(float(row["x"]) + 8, float(row["y"]) + 8)
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Backspace")
+                page.keyboard.type(want, delay=35)
+                page.keyboard.press("Tab")
+            except Exception:
+                pass
+        try:
+            page.wait_for_timeout(450)
+        except Exception:
+            pass
+        if _value_stuck(_read_email_value(page), want, "email") and not _email_input_empty(page):
+            return True
+    return False
+
+
+def _on_addons_page(hay: str, shown: str = "") -> bool:
+    """True only on the real Add-ons sheet — not the Review Details progress-bar label."""
+    text = hay or ""
+    # Progress stepper always says "Add-ons" and "Review & Traveller Details".
+    # Skip to payment / the seat map is this step even when that stepper is still in the header.
+    if re.search(
+        r"skip to payment|seat selection|seat map|choose add-ons|missed adding|"
+        r"skip add-?ons|meal selection|add seats",
+        text,
+        re.I,
+    ):
+        return True
+    if re.search(
+        r"review & traveller|review details|please enter an email|billing address|"
+        r"please select your title|contact details",
+        text,
+        re.I,
+    ):
+        return False
+    if shown == "addons":
+        return True
+    from app.step_read import addons_sheet
+
+    return bool(addons_sheet(text))
+
+
+def _email_input_empty(page) -> bool:
+    """True when Contact email is blank. Prefer the live input over leftover error text."""
+    try:
+        empty = page.evaluate(
+            """() => {
+              const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 4 && r.height > 4 && s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              const boxes = [...document.querySelectorAll('input[type=email], input')].filter(vis);
+              let sawEmail = false;
+              for (const el of boxes) {
+                const lab = (
+                  (el.getAttribute('aria-label') || '') + ' ' +
+                  (el.placeholder || '') + ' ' +
+                  ((el.closest('label') || el.parentElement || {}).innerText || '')
+                ).toLowerCase();
+                if (el.type === 'email' || /e-?mail/.test(lab)) {
+                  sawEmail = true;
+                  const v = String(el.value || '').trim();
+                  if (v && v.includes('@')) return false;
+                }
+              }
+              if (sawEmail) return true;
+              const hay = (document.body && document.body.innerText || '');
+              return /please enter an email address|please enter (?:a )?valid email/i.test(hay);
+            }"""
+        )
+        return bool(empty)
+    except Exception:
+        text, _url = _read(page)
+        return bool(
+            re.search(r"please enter an email address|please enter (?:a )?valid email", text or "", re.I)
+        )
+
+
+def _dismiss_post_confirm_secure_trip(page, log: list[str]) -> str:
+    """Ixigo often opens Secure My Trip / No, Thanks right after Confirm.
+
+    Decline it automatically — do not ask the user to skip.
+    """
+    last = ""
+    for _ in range(3):
+        if not _ixigo_buy_this_visible(page):
+            break
+        last = _ixigo_click_no_thanks(page) or "optout_no_thanks_miss"
+        log.append(f"post_confirm_no_thanks:{last}")
+        if last == "optout_no_thanks_miss":
+            # Fallback through the full opt-out path (No Thanks / Without Assured / radios).
+            last = _ixigo_opt_out_cancellation(page)
+            log.append(f"post_confirm_optout:{last}")
+        try:
+            page.wait_for_timeout(450)
+        except Exception:
+            pass
+    if _ixigo_assured_comparison_open(page):
+        last = _ixigo_opt_out_cancellation(page)
+        log.append(f"post_confirm_assured:{last}")
+        try:
+            page.wait_for_timeout(400)
+        except Exception:
+            pass
+    return last
+
+
+def _press_confirm_then_addons(page, log: list[str]) -> CheckoutOutcome | None:
+    """After Continue leaves Review: Confirm → No Thanks → skip Add-ons → pay handoff.
+
+    Ixigo order after a filled Review decline:
+      Continue → name Confirm → Secure My Trip (No, Thanks) → Add-ons → Payment.
+    Auto-decline No Thanks and skip Add-ons; never ask the user to skip.
+    Never treats Confirm as payment — pay sheets are refused elsewhere.
+    """
+    from app.step_read import is_name_confirm
+
+    def _snap() -> tuple[str, str, str, dict]:
+        text, url = _read(page)
+        stage = classify_page(text, url)
+        facts = extract_trip_facts(text, url)
+        return text or "", url or "", stage, facts
+
+    def _pay_outcome(text: str, url: str, stage: str, facts: dict, *, why: str) -> CheckoutOutcome:
+        log.append(why)
+        return CheckoutOutcome(
+            "pay",
+            text,
+            url,
+            log,
+            facts=facts,
+            checks=[],
+            handoff=(
+                f"Payment handoff. Total {facts.get('total') or '?'}. "
+                f"Link: {url}. No payment clicked."
+            ),
+        )
+
+    def _after_confirm_walk() -> CheckoutOutcome | None:
+        """Dismiss Secure My Trip, skip Add-ons, stop at payment when possible."""
+        _dismiss_post_confirm_secure_trip(page, log)
+        text, url, stage, facts = _snap()
+        if stage == "pay" or payment_sheet_open(text, stage):
+            return _pay_outcome(text, url, stage, facts, why="reached_pay_after_confirm")
+        # Sheet may clear onto Add-ons, or still need one forward Continue.
+        if not _on_addons_page(text, stage) and stage not in {"addons", "pay"}:
+            if _ixigo_buy_this_visible(page):
+                _dismiss_post_confirm_secure_trip(page, log)
+                text, url, stage, facts = _snap()
+            elif re.search(r"\bcontinue\b", text, re.I) and not is_name_confirm(text):
+                moved = advance_forward_control(page, "Continue", kind="review")
+                log.append(f"post_confirm_continue:{int(bool(moved))}")
+                try:
+                    page.wait_for_timeout(500)
+                except Exception:
+                    pass
+                _dismiss_post_confirm_secure_trip(page, log)
+                text, url, stage, facts = _snap()
+                if stage == "pay" or payment_sheet_open(text, stage):
+                    return _pay_outcome(text, url, stage, facts, why="reached_pay_after_confirm")
+        if _on_addons_page(text, stage) or stage == "addons":
+            log.append("reached_addons_after_confirm")
+            left = _leave_addons(page, log, rounds=3)
+            # Another Secure My Trip can sit on top of Add-ons after Skip.
+            _dismiss_post_confirm_secure_trip(page, log)
+            text, url, stage, facts = _snap()
+            if stage == "pay" or payment_sheet_open(text, stage):
+                return _pay_outcome(text, url, stage, facts, why="reached_pay_after_addons")
+            if left and stage != "addons" and not _on_addons_page(text, stage):
+                log.append(f"left_addons_after_confirm:{stage}")
+                if stage == "pay" or payment_sheet_open(text, stage):
+                    return _pay_outcome(text, url, stage, facts, why="reached_pay_after_addons")
+                return CheckoutOutcome(
+                    stage,
+                    text,
+                    url,
+                    log,
+                    facts=facts,
+                    checks=[],
+                    handoff=(
+                        f"Left add-ons after Confirm (now {stage}). "
+                        f"Total {facts.get('total') or '?'}. Nothing paid."
+                    ),
+                )
+            # Still on Add-ons — keep looping via outer addons_fast; no "please skip" ask.
+            return None
+        return None
+
+    text, url, stage, facts = _snap()
+    # Already past Confirm (or landed on Add-ons / pay after a prior Continue).
+    if _on_addons_page(text, stage) or stage in {"addons", "pay"} or payment_sheet_open(text, stage):
+        walked = _after_confirm_walk()
+        if walked is not None:
+            return walked
+        if stage == "pay" or payment_sheet_open(text, stage):
+            return _pay_outcome(text, url, stage, facts, why="reached_pay_after_confirm")
+        # Add-ons still open — let the checkout loop's addons_fast keep skipping.
+        log.append("reached_addons_after_confirm")
+        return None
+
+    if not (is_name_confirm(text) or stage == "name_confirm"):
+        # Confirm already gone; Secure My Trip may be the next sheet.
+        if _ixigo_buy_this_visible(page):
+            walked = _after_confirm_walk()
+            if walked is not None:
+                return walked
+        return None
+
+    confirmed = advance_forward_control(page, "Confirm", kind="name_confirm")
+    log.append(f"user_tap_confirm_after_continue:{confirmed or 'miss'}")
+    if not confirmed:
+        return None
+    try:
+        page.wait_for_timeout(700)
+    except Exception:
+        pass
+    walked = _after_confirm_walk()
+    if walked is not None:
+        return walked
+    return None
 
 
 def _decline_cleartrip_protect(page) -> str:
@@ -2630,6 +4296,29 @@ def _snapshot_stage(page) -> tuple[str, str, str, dict[str, str]]:
     return t, u, s, f
 
 
+def _ixigo_login_value_has(page, national: str) -> bool:
+    """True when a visible input actually holds the 10 digits. fill() can lie on this React field."""
+    try:
+        return bool(
+            page.evaluate(
+                """(national) => {
+                  const vis = (el) => {
+                    const r = el.getBoundingClientRect();
+                    const s = getComputedStyle(el);
+                    return r.width > 8 && r.height > 8 && s.visibility !== 'hidden'
+                      && s.display !== 'none' && r.bottom > 0 && r.top < innerHeight;
+                  };
+                  return [...document.querySelectorAll('input')].filter(vis).some((el) =>
+                    (el.value || '').replace(/\\D/g, '').endsWith(national)
+                  );
+                }""",
+                national,
+            )
+        )
+    except Exception:
+        return False
+
+
 def _fill_ixigo_login_phone(page, phone: str) -> str:
     dial, national = parse_login_phone(phone)
     if not national or len(national) < 8:
@@ -2638,8 +4327,14 @@ def _fill_ixigo_login_phone(page, phone: str) -> str:
 
     def _type(locator) -> None:
         locator.click(timeout=3000)
-        locator.fill("")
-        locator.fill(national, timeout=3500)
+        try:
+            locator.fill("", timeout=1500)
+        except Exception:
+            pass
+        try:
+            locator.press_sequentially(national, delay=40, timeout=4000)
+        except Exception:
+            locator.fill(national, timeout=3500)
 
     for attempt in (
         lambda: _type(page.get_by_placeholder(re.compile(r"Enter Mobile Number", re.I)).last),
@@ -2649,9 +4344,10 @@ def _fill_ixigo_login_phone(page, phone: str) -> str:
     ):
         try:
             attempt()
-            return f"filled_mobile:{dial_note}"
         except Exception:
             continue
+        if _ixigo_login_value_has(page, national):
+            return f"filled_mobile:{dial_note}"
     return f"mobile_miss:{dial_note}"
 
 
@@ -3172,6 +4868,32 @@ def _title_selected(page, title: str) -> bool:
             return False
     except Exception:
         pass
+    want = (title or "").strip().lower().rstrip(".")
+    try:
+        hit = page.evaluate(
+            """(want) => {
+              const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              const labelOf = (el) => (
+                (el.getAttribute('aria-label') || '') + ' ' + (el.placeholder || '') + ' ' +
+                ((el.closest('label') || el.parentElement || {}).innerText || '')
+              ).replace(/\\s+/g, ' ').trim().toLowerCase();
+              for (const el of [...document.querySelectorAll('input, select')].filter(vis)) {
+                if (!/\\btitle\\b/.test(labelOf(el))) continue;
+                const v = String(el.value || '').trim().toLowerCase().replace(/\\.$/, '');
+                if (v === want || v.startsWith(want)) return true;
+              }
+              return false;
+            }""",
+            want,
+        )
+        if hit:
+            return True
+    except Exception:
+        pass
     wanted = re.compile(rf"\b{re.escape(title)}\b", re.I)
     for row in _field_boxes(page):
         blob = f"{row.get('label') or ''} {row.get('value') or ''}"
@@ -3184,11 +4906,102 @@ def _choose_title(page, title: str) -> tuple[str, str]:
     """Open the Title box and pick Mr or Ms. Returns (status, menu texts seen)."""
     if not title:
         return "skip", ""
+    # Native <select> Title (common on Ixigo Review Adult 1).
+    try:
+        selected = page.evaluate(
+            """(want) => {
+              const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              const labelOf = (el) => {
+                const id = el.getAttribute('id');
+                if (id) {
+                  const lab = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+                  if (lab) return (lab.innerText || '').replace(/\\s+/g, ' ').trim();
+                }
+                const wrap = el.closest('label') || el.parentElement;
+                return ((wrap && wrap.innerText) || el.getAttribute('aria-label') || '')
+                  .replace(/\\s+/g, ' ').trim().slice(0, 80);
+              };
+              const wantLc = String(want || '').toLowerCase();
+              for (const el of [...document.querySelectorAll('select')].filter(vis)) {
+                const lab = labelOf(el).toLowerCase();
+                if (!/title/.test(lab)) continue;
+                let idx = -1;
+                for (let i = 0; i < el.options.length; i++) {
+                  const t = String(el.options[i].text || '').trim().toLowerCase().replace(/\\.$/, '');
+                  const v = String(el.options[i].value || '').trim().toLowerCase();
+                  if (t === wantLc || v === wantLc || t.startsWith(wantLc + ' ')) { idx = i; break; }
+                }
+                if (idx < 0) continue;
+                el.selectedIndex = idx;
+                el.value = el.options[idx].value;
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                return String(el.options[el.selectedIndex].text || '').trim();
+              }
+              return '';
+            }""",
+            title,
+        )
+        if selected:
+            return "ok", str(selected)
+    except Exception:
+        pass
+    try:
+        page.locator("select").filter(has_text=re.compile(r"title|mr|ms|mrs", re.I)).first.select_option(
+            label=re.compile(rf"^{re.escape(title)}\.?$", re.I)
+        )
+        page.wait_for_timeout(200)
+        if _title_selected(page, title):
+            return "ok", title
+    except Exception:
+        pass
+    # Ixigo Adult 1 Title is often a text input that opens a Mr/Ms menu.
+    try:
+        typed = page.evaluate(
+            """(want) => {
+              const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              const labelOf = (el) => (
+                (el.getAttribute('aria-label') || '') + ' ' + (el.placeholder || '') + ' ' +
+                ((el.closest('label') || el.parentElement || {}).innerText || '')
+              ).replace(/\\s+/g, ' ').trim().toLowerCase();
+              const el = [...document.querySelectorAll('input')].filter(vis)
+                .find((node) => /\\btitle\\b/.test(labelOf(node)));
+              if (!el) return '';
+              el.scrollIntoView({block: 'center'});
+              el.focus();
+              el.click();
+              const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+              const last = el.value;
+              if (proto && proto.set) proto.set.call(el, want);
+              else el.value = want;
+              const tracker = el._valueTracker;
+              if (tracker && typeof tracker.setValue === 'function') tracker.setValue(last);
+              el.dispatchEvent(new Event('input', {bubbles: true}));
+              el.dispatchEvent(new Event('change', {bubbles: true}));
+              return String(el.value || '').trim();
+            }""",
+            title,
+        )
+        if typed and _title_selected(page, title):
+            return "ok", str(typed)
+    except Exception:
+        pass
     match = next(
         (row for row in _field_boxes(page) if str(row.get("label") or "").strip().lower() == "title"),
         None,
     )
     if match is None:
+        # Last chance: Title text box found by placeholder alone.
+        if _title_selected(page, title):
+            return "ok", title
         return "none", ""
     try:
         page.evaluate(
@@ -3271,6 +5084,10 @@ def box_slot(row: dict) -> str:
         return "pincode"
     if re.search(r"\bstate\b", blob) and not re.search(r"statement|status|estate", blob):
         return "billing_state"
+    if re.search(r"\bcity\b", blob) and not re.search(r"capacity|electricity", blob):
+        return "city"
+    if re.search(r"\baddress\b", blob) and not re.search(r"email|e-?mail", blob):
+        return "billing_address"
     if re.search(r"last name", blob):
         return "last"
     if re.search(r"first name|full name|traveller name", blob):
@@ -3289,7 +5106,7 @@ def reveal_form_step(page) -> bool:
                   const hit = nodes.find((node) => {
                     const text = (node.innerText || '').replace(/\\s+/g, ' ').trim();
                     return text.length > 3 && text.length < 80
-                      && /add contact|contact details|email address|mobile number|first name|traveller name|traveller details|add traveller/i.test(text);
+                      && /add contact|contact details|email address|mobile number|first name|traveller name|traveller details|add traveller|billing address|pin\\s*code|pincode/i.test(text);
                   });
                   if (!hit) return false;
                   hit.scrollIntoView({block: 'center'});
@@ -3406,7 +5223,16 @@ def fill_profile_slots(
     page,
     profile: dict,
     *,
-    keys: tuple[str, ...] = ("email", "phone", "name", "dob", "pincode", "billing_state"),
+    keys: tuple[str, ...] = (
+        "email",
+        "phone",
+        "name",
+        "dob",
+        "pincode",
+        "billing_address",
+        "city",
+        "billing_state",
+    ),
 ) -> list[str]:
     """Type saved facts into whatever boxes this sheet actually shows.
 
@@ -3423,6 +5249,12 @@ def fill_profile_slots(
         pin = re.sub(r"\D", "", str(profile.get("pincode") or ""))
         if len(pin) == 6:
             slots["pincode"] = pin
+    if not slots.get("billing_address") and (profile.get("billing_address") or profile.get("address")):
+        slots["billing_address"] = str(
+            profile.get("billing_address") or profile.get("address") or ""
+        ).strip()
+    if not slots.get("city") and profile.get("city"):
+        slots["city"] = str(profile.get("city") or "").strip()
     if not slots.get("billing_state") and profile.get("billing_state"):
         slots["billing_state"] = str(profile.get("billing_state") or "").strip()
     reveal_form_step(page)
@@ -3459,7 +5291,20 @@ def fill_profile_slots(
                 if re.fullmatch(r"\d{10}", re.sub(r"\D", "", got) or "") and "@" not in got:
                     _set_box(page, int(row["index"]), "")
         # Fill phone before email. Re-resolve boxes before every field — wake/Tab shifts indexes.
-        order = [key for key in ("phone", "email", "name", "dob", "pincode", "billing_state") if key in keys]
+        order = [
+            key
+            for key in (
+                "phone",
+                "email",
+                "name",
+                "dob",
+                "billing_address",
+                "pincode",
+                "city",
+                "billing_state",
+            )
+            if key in keys
+        ]
         for key in order:
             value = slots.get(key) or ""
             if not value:
@@ -3483,8 +5328,9 @@ def fill_profile_slots(
                 continue
             status = _set_box(page, int(row["index"]), value)
             # Cleartrip contact email often reports ok then shows "Please enter Email".
-            # Always reinforce email/phone with keyboard insert into the aimed box.
-            if key in {"email", "phone"}:
+            # Pin boxes keep a rejected value until it is selected and replaced.
+            # Always reinforce email/phone/pincode with keyboard insert into the aimed box.
+            if key in {"email", "phone", "pincode"}:
                 try:
                     page.mouse.click(float(row["x"]) + 8, float(row["y"]) + 8)
                     page.keyboard.press("Control+A")
@@ -3494,13 +5340,8 @@ def fill_profile_slots(
                     if again is not None and _value_stuck(str(again.get("value") or ""), value, key):
                         status = "ok"
                     elif key == "email":
-                        # Prefer the live type=email value over a stale index read.
-                        live = page.evaluate(
-                            """(email) => {
-                              const el = document.querySelector('input[type=email]');
-                              return el ? (el.value || '') : '';
-                            }"""
-                        )
+                        # Ixigo Contact email is type=text labeled Email — not input[type=email].
+                        live = _read_email_value(page)
                         if _value_stuck(str(live or ""), value, "email"):
                             status = "ok"
                         else:
@@ -3552,8 +5393,19 @@ def type_saved_contact(page, profile: dict) -> list[str]:
         return []
     keys = tuple(
         key
-        for key in ("email", "phone", "pincode", "billing_state")
-        if str((profile or {}).get(key) or "").strip()
+        for key in (
+            "email",
+            "phone",
+            "pincode",
+            "billing_address",
+            "city",
+            "billing_state",
+        )
+        if str(
+            (profile or {}).get(key)
+            or ((profile or {}).get("address") if key == "billing_address" else "")
+            or ""
+        ).strip()
     )
     if not keys:
         return []
@@ -3573,12 +5425,98 @@ def contact_report(notes: str, page: str) -> str:
     if misses or "contact_unready" in blob:
         fields = " and ".join(misses) or "a contact field"
         return f"The contact step is open, but {fields} did not stick. Nothing paid."
+    please_email = bool(
+        re.search(r"please enter an email address|please enter (?:a )?valid email", page or "", re.I)
+    )
+    still_review = bool(
+        re.search(r"review details|review & traveller|contact details", page or "", re.I)
+        and re.search(r"\bcontinue\b", page or "", re.I)
+    )
+    # Empty-email validation on the contact/review sheet wins over a stale email:ok log.
+    if please_email and (still_review or not re.search(r"\bemail:ok\b", blob)):
+        return (
+            "Contact email is empty — Please enter an email address. "
+            "Reply continue and I'll type the saved email again, then Continue. Nothing paid."
+        )
+    if re.search(r"please enter a valid pin\s*code|please enter a valid pincode", page or "", re.I):
+        if re.search(r"\bpincode:ok\b", blob):
+            return (
+                "I replaced the pin code, but it is still not valid. "
+                "The pincode is incorrect. Send another 6-digit pin and I'll type it in and continue. "
+                "Nothing paid."
+            )
+        return (
+            "The billing form rejected the pin code. The pincode is incorrect. "
+            "Send a valid 6-digit pin and I'll replace it and continue. Nothing paid."
+        )
+    if re.search(r"\bpincode:miss\b", blob):
+        return "The pin code box is on screen, but the new pin did not stick. Send the 6 digits again. Nothing paid."
     if re.search(r"\bemail:ok\b", blob) and re.search(r"\bphone:(?:ok|none)\b", blob):
-        if re.search(r"review traveller", page or "", re.I):
+        continue_tried = bool(
+            re.search(
+                r"user_tap_continue:|user_tap_upsell_continue:|optout_|continue_assured_retry",
+                blob,
+            )
+        )
+        continue_moved = bool(
+            re.search(r"user_tap_continue:1|user_tap_upsell_continue:1|user_tap_continue_retry:1", blob)
+        )
+        # Click registered but page still Review = Continue no-op — never claim success.
+        if still_review and continue_tried:
+            # Prefer Adult-form / email gaps over a Free Cancellation false blame.
+            adult_gap = re.search(
+                r"traveller_gaps:|traveller_clicked_empty|traveller_already_empty|traveller_miss",
+                blob,
+                re.I,
+            )
+            if adult_gap or re.search(
+                r"please select your title|first\s*&\s*middle name|please enter an email",
+                page or "",
+                re.I,
+            ):
+                if re.search(r"please enter an email", page or "", re.I):
+                    return (
+                        "Contact email is empty — Please enter an email address. "
+                        "Reply continue and I'll type the saved email again, then Continue. Nothing paid."
+                    )
+                return (
+                    "Adult traveller details are still incomplete on Review Details "
+                    "(saved profile did not stick on the form). "
+                    "Reply continue and I'll tick the saved traveller, fill gaps, then Continue. "
+                    "Nothing paid."
+                )
+            if re.search(r"optout_no_thanks_miss", blob) or (
+                re.search(r"secure my trip|no,?\s*thanks", page or "", re.I)
+                and re.search(r"with assured|without assured|buy this", page or "", re.I)
+            ):
+                return (
+                    "Free Cancellation Secure My Trip is still open on Review Details. "
+                    "Reply no thanks and I'll close it, then Continue. Nothing paid."
+                )
+            if re.search(r"optout_miss", blob) or re.search(
+                r"please select an option before proceeding|don.?t want free cancellation",
+                page or "",
+                re.I,
+            ):
+                return (
+                    "Free Cancellation is still unselected, so Continue stayed on Review Details. "
+                    "Nothing paid."
+                )
+            if re.search(r"free cancellation|assured", page or "", re.I):
+                return (
+                    "Continue stayed on Review Details (cancellation choice or another field still blocks). "
+                    "Nothing paid."
+                )
+            return "Contact is filled, but Continue did not leave Review Details. Nothing paid."
+        if re.search(r"review traveller", page or "", re.I) and not re.search(
+            r"skip add-?ons|choose add-ons", page or "", re.I
+        ):
             return "Contact is saved. The page is on Review traveller details. Nothing paid."
-        if re.search(r"\btap:1\b", blob):
+        if (re.search(r"\btap:1\b", blob) or continue_moved) and not still_review:
             return "I typed the contact details and pressed Continue. Nothing paid."
-        return "I typed the contact details. Nothing paid."
+        if not still_review:
+            return "I typed the contact details. Nothing paid."
+        return "Contact is filled, but Continue did not leave Review Details. Nothing paid."
     return ""
 
 
@@ -3751,16 +5689,26 @@ def _fill_cleartrip_name_pair(page, first: str, last: str) -> tuple[str, str]:
 
 def _fill_passenger_fields(page, profile: dict[str, str]) -> list[str]:
     """Type every traveller box we have. A label match is that box only, not a neighbour."""
-    name = (profile.get("name") or "").strip()
-    parts = name.split()
-    first, last = (parts[0], " ".join(parts[1:])) if len(parts) >= 2 else (name, "")
+    raw_name = (profile.get("name") or "").strip()
+    title_from_name, first, last = _traveller_name_parts(raw_name)
+    # Never type "Pick" / "Mr" into First Name — clean the saved profile first.
+    if not first and not last:
+        cleaned = _clean_traveller_name(raw_name)
+        parts = cleaned.split()
+        first, last = (parts[0], " ".join(parts[1:])) if len(parts) >= 2 else (cleaned, "")
+    first = first.title() if first else ""
+    last = last.title() if last else ""
     phone = re.sub(r"\D", "", profile.get("phone") or "")
     if phone.startswith("91") and len(phone) == 12:
         phone = phone[2:]
     dob = (profile.get("dob") or "").strip()
     gender = (profile.get("gender") or "").strip()
     # Ixigo leaves Title blank when we skip it; the Review Details sheet then blocks Continue.
-    title = {"male": "Mr", "female": "Ms", "m": "Mr", "f": "Ms"}.get(gender.lower(), "Mr" if name else "")
+    title = (
+        title_from_name
+        or {"male": "Mr", "female": "Ms", "m": "Mr", "f": "Ms"}.get(gender.lower(), "")
+        or ("Mr" if first or last else "")
+    )
     title_status, title_menu = _choose_title(page, title)
     gender_status = "skip"
     if title_status in {"none", "skip"} and (gender or name):
@@ -4145,7 +6093,9 @@ def run_checkout_agent(
     # Guest Cleartrip: recover a dead itinerary on the same site — never hop sellers here.
     max_recovers = 2 if seller == "cleartrip" else 1
     # Book → meals Skip → contact → traveller → pay needs a long Cleartrip pass.
-    deadline = time.monotonic() + (240 if seller == "cleartrip" else 90)
+    # A known-traveller Ixigo checkout walks the same distance in one turn.
+    direct_book = str((profile or {}).get("direct_checkout") or "") == "1"
+    deadline = time.monotonic() + (240 if seller == "cleartrip" or direct_book else 90)
     vision_down = False
     try:
         page.set_default_timeout(20_000)
@@ -4171,10 +6121,142 @@ def run_checkout_agent(
         f = extract_trip_facts(t, u)
         return t, u, s, f
 
+    def _stop_wrong_itinerary() -> CheckoutOutcome | None:
+        """Refuse Adult/contact work on a fare that is not the requested clock."""
+        if stage not in {"review", "passenger", "addons", "pay"}:
+            return None
+        if not (facts.get("flight") or facts.get("total") or facts.get("depart_time")):
+            return None
+        if not hint and not expect_flight:
+            return None
+        ok, problems = verify_trip_facts(
+            facts,
+            expect_hint=hint,
+            expect_origin=origin_code,
+            expect_dest=dest_code,
+            expect_flight=expect_flight,
+        )
+        check = f"{stage}:{'ok' if ok else 'mismatch'}:{facts}"
+        if check not in checks:
+            checks.append(check)
+        if ok:
+            return None
+        log.append(f"verify_fail:{';'.join(problems)}")
+        when = hint or expect_flight or "that time"
+        got = facts.get("depart_time") or "?"
+        flight = facts.get("flight") or ""
+        return CheckoutOutcome(
+            "wrong_flight",
+            text,
+            url,
+            log,
+            facts=facts,
+            checks=checks,
+            handoff=(
+                f"Stopped: on-screen itinerary is {got}"
+                + (f" {flight}" if flight else "")
+                + f", not the {when} you asked for. "
+                "Reply go on and I'll Book the right time from the fare list. Nothing paid."
+            ),
+        )
+
+    def _rebook_requested_time() -> bool:
+        """Leave a wrong review and Book the clock they asked for. One try."""
+        if "rebook_hint" in log or not hint:
+            return False
+        if seller != "ixigo" and "ixigo.com" not in (url or "").lower():
+            return False
+        log.append("rebook_hint")
+        from app.search import ixigo_results_url
+
+        try:
+            page.goto(
+                ixigo_results_url(origin, destination, depart),
+                wait_until="domcontentloaded",
+                timeout=90000,
+            )
+        except Exception:
+            log.append("rebook_nav_miss")
+            return False
+        _prepare_ixigo_results(page, hint)
+        card = ""
+        try:
+            card = _click_ixigo_depart(page, hint) or ""
+        except Exception:
+            card = ""
+        booked = bool(card) or _mouse_book_depart(page, hint)
+        if not booked:
+            try:
+                booked = bool(page.evaluate(_CLICK_TIME, hint))
+            except Exception:
+                booked = False
+        log.append(f"rebook_book:{int(bool(booked))}")
+        return bool(booked)
+
+    def _finish_wrong(wrong: CheckoutOutcome) -> CheckoutOutcome | None:
+        """None means Book for the asked time was clicked and the loop should continue."""
+        if _rebook_requested_time():
+            return None
+        text_now, url_now, stage_now, facts_now = _snapshot()
+        if stage_now in {"results", "loading", "home", "fare_sheet"} or _book_count(page) >= 1:
+            clocks = _depart_clocks_on_fare_list(text_now)
+            shown = ", ".join(clocks[:4]) if clocks else "the times in the screenshot"
+            return CheckoutOutcome(
+                "results",
+                text_now,
+                url_now,
+                log,
+                facts=facts_now,
+                checks=checks,
+                handoff=(
+                    f"The {hint} is not on this Ixigo list, so I did not book a different flight. "
+                    f"Departures I can see: {shown}. Reply with one of those times. Nothing paid."
+                ),
+            )
+        return wrong
+
     for step in range(max_steps):
         page = _latest(page)
         text, url, stage, facts = _snapshot()
         log.append(f"{step}:stage:{stage}")
+        # Logged-out header: OTP before any traveller or billing ask.
+        if seller == "ixigo" and ixigo_header_needs_login(text):
+            if sum(1 for line in log if line == "opened_header_login") < 2:
+                log.append("opened_header_login")
+                if _click_ixigo_header_login(page):
+                    continue
+            return CheckoutOutcome(
+                "login",
+                text,
+                url,
+                log,
+                facts=facts,
+                checks=checks,
+                handoff=(
+                    "Ixigo is not logged in. Log in/Sign up is still on the page, "
+                    "so I will not ask for passenger details yet. Nothing paid."
+                ),
+            )
+        # Known traveller: the seat map is not payment. Skip it before anything else.
+        if str((profile or {}).get("direct_checkout") or "") == "1" and _on_addons_page(text, stage):
+            tries = sum(1 for line in log if line == "direct_skip_addons")
+            log.append("direct_skip_addons")
+            if tries < 4:
+                _leave_addons(page, log, rounds=2)
+                try:
+                    text_now, url_now = _read(page)
+                    stage_now = classify_page(text_now, url_now)
+                except Exception:
+                    text_now, stage_now = "", stage
+                if _on_addons_page(text_now, stage_now) and not (
+                    _skip_addons(page) or _click_label(page, "Skip to Payment")
+                ):
+                    log.append("direct_skip_miss")
+                try:
+                    page.wait_for_timeout(900)
+                except Exception:
+                    pass
+                continue
         # Skip reveal on Cleartrip review — the flex sheet has no contact block yet, and
         # a full-DOM scroll search can stall Kernel for minutes.
         skip_reveal = stage == "review" and (
@@ -4184,17 +6266,172 @@ def run_checkout_agent(
             log.append("reveal_form")
             if reveal_form_step(page):
                 continue
+        # Before any Adult/contact autofill — wrong clock must not become "blank traveller".
+        wrong = _stop_wrong_itinerary()
+        if wrong is not None:
+            nxt = _finish_wrong(wrong)
+            if nxt is None:
+                continue
+            return nxt
         if time.monotonic() > deadline:
             log.append("checkout_deadline")
             handoff = handoff or (
                 "This step took too long, so I stopped and sent the page. Nothing paid."
             )
             return CheckoutOutcome(stage, text, url, log, facts=facts, checks=checks, handoff=handoff)
+        if (
+            seller == "ixigo"
+            and (
+                stage == "login"
+                or re.search(r"log in to ixigo", text or "", re.I)
+            )
+            and not re.search(r"verify your mobile|enter the otp|enter otp|otp sent", text or "", re.I)
+        ):
+            from app.kernel_otp import indian_national
+
+            saved_mobile = indian_national(str(profile.get("phone") or ""))
+            if not saved_mobile:
+                if not pause_on_auth:
+                    log.append("login_need_mobile")
+                    return CheckoutOutcome(
+                        "login",
+                        text,
+                        url,
+                        log,
+                        facts=facts,
+                        checks=checks,
+                        handoff=(
+                            "Ixigo opened sign-in on this fare. Send the 10-digit mobile and I'll remember it, "
+                            "type it in, then ask you for the OTP. Nothing paid."
+                        ),
+                    )
+                # pause_on_auth: fall through to auth_required — never invent a mobile.
+            else:
+                # Continue is disabled until the number is typed — never mash the grey button first.
+                if tap_pending and re.fullmatch(r"continue|proceed|confirm|go on", tap_pending or "", re.I):
+                    log.append("login_clear_continue_tap")
+                    tap_pending = ""
+                if "login_phone_typed" not in log:
+                    note = _fill_ixigo_login_phone(page, str(profile.get("phone") or ""))
+                    log.append(note)
+                    if note.startswith("bad") or note.endswith("miss"):
+                        handoff = (
+                            "Ixigo opened login but the mobile field was not fillable. "
+                            f"Verified fare {facts.get('total') or '?'}. Link: {url}. Nothing paid."
+                        )
+                        return CheckoutOutcome(
+                            "login", text, url, log, facts=facts, checks=checks, handoff=handoff
+                        )
+                    log.append("login_phone_typed")
+                    log.append(install_ixigo_otpless_callback_bridge(page))
+                    if not _safe_continue(page):
+                        log.append("login_continue_miss")
+                        return CheckoutOutcome(
+                            "login",
+                            text,
+                            url,
+                            log,
+                            facts=facts,
+                            checks=checks,
+                            handoff=(
+                                f"I typed the mobile ending {saved_mobile[-4:]} but Continue did not submit. "
+                                "Nothing paid."
+                            ),
+                        )
+                    text, url, stage, facts = _poll_ready(
+                        page, {"otp", "passenger", "review", "addons", "pay", "error"}, budget_ms=3500
+                    )
+                    if stage == "otp":
+                        handoff = (
+                            f"OTP sent for login. Verified {facts.get('flight') or '?'} "
+                            f"{facts.get('depart_time') or hint} total {facts.get('total') or '?'}. "
+                            "Ask the traveller for the SMS code. Nothing paid."
+                        )
+                        log.append("otp_handoff")
+                        return CheckoutOutcome("otp", text, url, log, facts=facts, checks=checks, handoff=handoff)
+                    continue
         # Front sheet first: a covering dialog owns the click; never fill the page under it.
         from app.step_read import decide_sheet
 
         surface_now = read_surface(page)
         front_now = apply_front_text(text, surface_now)
+        # User said pick a saved name — tick before contact-missing / fill rails steal the turn.
+        if tap_pending in {"__select_traveller__", "__pick_traveller__"}:
+            from app.step_read import _fare_list_sheet
+
+            if stage in {"results", "loading"} or _fare_list_sheet(text):
+                log.append("pick_traveller_on_results")
+                tap_pending = ""
+                continue
+            prepared = _ixigo_prepare_review(page, profile, log)
+            note = next(
+                (line for line in reversed(prepared) if str(line).startswith("traveller_")),
+                "traveller_miss",
+            )
+            log.append(f"user_pick_traveller:{note or 'miss'}")
+            tap_pending = ""
+            if note.startswith("traveller_clicked") or note.startswith("traveller_already") or note.startswith(
+                "traveller_card"
+            ):
+                try:
+                    page.wait_for_timeout(500)
+                except Exception:
+                    pass
+                from app.step_read import forward_tap
+
+                text, url, stage, facts = _snapshot()
+                move = decide_sheet(text, profile)
+                if move.get("action") == "ask" and move.get("missing"):
+                    fields = " and ".join(str(item) for item in move["missing"])
+                    handoff = (
+                        f"I ticked the saved traveller. The page still needs your {fields} "
+                        "before Continue. Send it and I'll type it in. Nothing paid."
+                    )
+                    return CheckoutOutcome(
+                        "passenger", text, url, log, facts=facts, checks=checks, handoff=handoff
+                    )
+                if move.get("action") == "fill":
+                    keys = tuple(
+                        str(item)
+                        for item in (move.get("fills") or [])
+                        if str(item)
+                        in {
+                            "email",
+                            "phone",
+                            "name",
+                            "dob",
+                            "pincode",
+                            "billing_address",
+                            "city",
+                            "billing_state",
+                        }
+                    )
+                    more = fill_profile_slots(
+                        page,
+                        profile,
+                        keys=keys
+                        or (
+                            "email",
+                            "phone",
+                            "pincode",
+                            "billing_address",
+                            "city",
+                            "billing_state",
+                        ),
+                    )
+                    log.extend(more)
+                    text, url, stage, facts = _snapshot()
+                label_next = str(move.get("tap") or "") or forward_tap(text or "") or "Continue"
+                hit = advance_forward_control(page, label_next, kind="passenger")
+                log.append(f"after_pick_continue:{hit or 'miss'}")
+                continue
+            if note.startswith("traveller_unticked") or note == "behind_sheet" or not note:
+                handoff = (
+                    "Saved travellers are on screen. I could not tick one yet — "
+                    "reply click one of the names again, or say delete one of the profiles. "
+                    "I will not create a new traveller. Nothing paid."
+                )
+                return CheckoutOutcome("passenger", text, url, log, facts=facts, checks=checks, handoff=handoff)
         sheet_move = decide_sheet(
             text,
             profile,
@@ -4209,7 +6446,20 @@ def run_checkout_agent(
                 "Send it and I'll type it in. Nothing paid."
             )
             return CheckoutOutcome("passenger", text, url, log, facts=facts, checks=checks, handoff=handoff)
-        if sheet_move.get("action") == "ask" and sheet_move.get("tap") and not tap_pending:
+        if (
+            not surface_now.get("overlay")
+            and stage not in {"fare_sheet", "pay", "otp", "login", "error", "unavailable"}
+        ):
+            from app.step_read import _fare_list_sheet
+
+            if stage in {"results", "loading"} or _fare_list_sheet(front_now or text):
+                stage = "results"
+        if (
+            sheet_move.get("action") == "ask"
+            and sheet_move.get("tap")
+            and not tap_pending
+            and stage not in {"results", "loading"}
+        ):
             # Upsell / unknown cover — stop and name the button; don't fill behind it.
             handoff = (
                 f"A sheet is open with {sheet_move['tap']}. "
@@ -4221,12 +6471,30 @@ def run_checkout_agent(
             keys = tuple(
                 str(item)
                 for item in (sheet_move.get("fills") or [])
-                if str(item) in {"email", "phone", "name", "dob", "pincode", "billing_state"}
+                if str(item)
+                in {
+                    "email",
+                    "phone",
+                    "name",
+                    "dob",
+                    "pincode",
+                    "billing_address",
+                    "city",
+                    "billing_state",
+                }
             )
             typed = fill_profile_slots(
                 page,
                 profile,
-                keys=keys or ("email", "phone", "pincode", "billing_state"),
+                keys=keys
+                or (
+                    "email",
+                    "phone",
+                    "pincode",
+                    "billing_address",
+                    "city",
+                    "billing_state",
+                ),
             )
             log.extend(typed)
             text, url, stage, facts = _snapshot()
@@ -4239,6 +6507,21 @@ def run_checkout_agent(
                 return CheckoutOutcome(
                     "passenger", text, url, log, facts=facts, checks=checks, handoff=handoff
                 )
+            # Ixigo Review Details: after typing contact, still need Assured + traveller tick
+            # before Continue — otherwise we stop with "typed contact" and nothing moves.
+            if (
+                seller == "ixigo"
+                or "ixigo.com" in (url or "").lower()
+                or re.search(
+                    r"review details|don.?t want free cancellation|choose from the saved list",
+                    text or "",
+                    re.I,
+                )
+            ) and sum(1 for line in log if line.startswith("ixigo_prepare:")) < 2:
+                log.append("ixigo_prepare:after_fill")
+                _ixigo_prepare_review(page, profile, log)
+                tap_pending = "Continue"
+                continue
             surface_now = read_surface(page)
             sheet_move = decide_sheet(
                 text,
@@ -4262,35 +6545,108 @@ def run_checkout_agent(
         if tap_pending and not tap_pending.startswith("__"):
             from app.step_read import form_sheet
 
-            if form_sheet(text) and re.fullmatch(r"continue", tap_pending, re.I):
+            # Do not defer Continue forever on a contact form — fill once, then click.
+            if (
+                form_sheet(text)
+                and re.fullmatch(r"continue", tap_pending, re.I)
+                and "defer_continue_for_fill" not in log
+            ):
                 log.append("defer_continue_for_fill")
             elif re.search(r"pay now|pay to complete|make payment", tap_pending, re.I) and not allow_pay:
                 log.append("user_tap_refused")
                 tap_pending = ""
-            elif re.search(r"skip add", tap_pending, re.I):
-                # click_verified on Skip can stall Kernel CDP; use the add-ons outcome loop.
+            elif re.search(
+                r"skip add|skip to payment|continue without add|no,? thanks|don.?t want (?:seats|meals|add)",
+                tap_pending,
+                re.I,
+            ):
+                # Ixigo "Skip to Payment" and Cleartrip "Skip add-ons" — use the outcome loop.
                 log.append(f"user_tap:{tap_pending}")
                 tap_pending = ""
-                _leave_addons(page, log, rounds=2)
+                left = _leave_addons(page, log, rounds=3)
+                text, url, stage, facts = _snapshot()
+                if left and (stage == "pay" or payment_sheet_open(text, stage)):
+                    return CheckoutOutcome(
+                        "pay",
+                        text,
+                        url,
+                        log,
+                        facts=facts,
+                        checks=checks,
+                        handoff=(
+                            f"Payment handoff. Total {facts.get('total') or '?'}. "
+                            f"Link: {url}. No payment clicked."
+                        ),
+                    )
+                if left and stage != "addons":
+                    log.append(f"skip_left:{stage}")
+                    continue
                 continue
             elif re.search(r"\b(confirm|continue|proceed)\b", tap_pending, re.I):
-                # Contact sheet: type a saved/just-sent email before Continue, or Ixigo stays put.
-                typed = type_saved_contact(page, profile)
-                if typed:
-                    log.extend(typed)
-                    email_state = _field_state(typed, "email")
-                    if email_state and email_state not in {"ok", "typed"}:
-                        log.append("contact_email_miss")
-                        tap_pending = ""
+                from app.step_read import is_name_confirm as _is_name_confirm
+
+                confirm_only = bool(
+                    re.search(r"\bconfirm\b", tap_pending, re.I)
+                    and (
+                        stage == "name_confirm"
+                        or _is_name_confirm(text or "")
+                    )
+                )
+                # Govt-ID Confirm: do not refill billing or tick Assured under the modal.
+                if not confirm_only and (
+                    seller == "ixigo"
+                    or "ixigo.com" in (url or "").lower()
+                    or re.search(
+                        r"review details|traveller details|don.?t want free cancellation|assured",
+                        text or "",
+                        re.I,
+                    )
+                ):
+                    _ixigo_prepare_review(page, profile, log)
+                    try:
+                        page.wait_for_timeout(350)
+                    except Exception:
+                        pass
+                    if (
+                        _adult_traveller_gaps(page)
+                        or _email_input_empty(page)
+                        or _ixigo_pin_invalid(page)
+                        or _ixigo_buy_this_visible(page)
+                    ):
                         text, url, stage, facts = _snapshot()
-                        handoff = contact_report(" | ".join(typed), text) or (
-                            "The email did not stick in the contact box. Nothing paid."
-                        )
                         return CheckoutOutcome(
-                            "passenger", text, url, log, facts=facts, checks=checks, handoff=handoff
+                            "passenger",
+                            text,
+                            url,
+                            log,
+                            facts=facts,
+                            checks=checks,
+                            handoff=_review_continue_blocker(page),
                         )
-                # Ground to visible control; if sheet stuck, retry Confirm↔Continue once.
-                hit = advance_forward_control(page, tap_pending, kind=stage)
+                if not confirm_only:
+                    # Contact sheet: type saved email before Continue, or Ixigo stays put.
+                    typed = type_saved_contact(page, profile)
+                    if typed:
+                        log.extend(typed)
+                        email_state = _field_state(typed, "email")
+                        if email_state and email_state not in {"ok", "typed"}:
+                            log.append("contact_email_miss")
+                            tap_pending = ""
+                            text, url, stage, facts = _snapshot()
+                            if _retry_known_traveller(page, profile, log):
+                                continue
+                            handoff = contact_report(" | ".join(typed), text) or (
+                                "The email did not stick in the contact box. Nothing paid."
+                            )
+                            return CheckoutOutcome(
+                                "passenger", text, url, log, facts=facts, checks=checks, handoff=handoff
+                            )
+                # Ground to visible control; Confirm stays Confirm (never sibling Continue).
+                hit = advance_forward_control(
+                    page,
+                    tap_pending,
+                    kind="name_confirm" if confirm_only else stage,
+                )
                 # Keep user_tap_continue for Continue; note Confirm/Proceed retries as forward.
                 if re.search(r"\bcontinue\b", tap_pending, re.I) or (
                     hit and re.search(r"\bcontinue\b", hit, re.I)
@@ -4298,11 +6654,254 @@ def run_checkout_agent(
                     log.append(f"user_tap_continue:{int(bool(hit))}")
                 else:
                     log.append(f"user_tap_forward:{hit or 'miss'}")
+                # Continue no-op on Review Details: Assured radios still block — pick decline and retry once.
+                if (
+                    not hit
+                    and not confirm_only
+                    and re.search(r"\bcontinue\b", tap_pending, re.I)
+                    and sum(1 for line in log if line == "continue_assured_retry") < 1
+                ):
+                    text_miss, _url_miss = _read(page)
+                    from app.step_read import _assured_radio_gate as _gate_retry
+
+                    if _gate_retry(text_miss or ""):
+                        log.append("continue_assured_retry")
+                        # Authorised default is decline — re-prepare (opt-out + traveller + contact).
+                        _ixigo_prepare_review(page, profile, log)
+                        blocked = _ixigo_autonomous_gate(page, profile, log)
+                        if blocked:
+                            text, url, stage, facts = _snapshot()
+                            return CheckoutOutcome(
+                                "passenger",
+                                text,
+                                url,
+                                log,
+                                facts=facts,
+                                checks=checks,
+                                handoff=blocked,
+                            )
+                        try:
+                            page.wait_for_timeout(300)
+                        except Exception:
+                            pass
+                        hit2 = advance_forward_control(page, "Continue", kind="review")
+                        log.append(f"user_tap_continue_retry:{int(bool(hit2))}")
+                        hit = hit or hit2
+                        if not hit2:
+                            text, url, stage, facts = _snapshot()
+                            if _on_addons_page(text, stage):
+                                log.append("review_stop_was_addons")
+                                tap_pending = ""
+                                continue
+                            return CheckoutOutcome(
+                                "passenger",
+                                text,
+                                url,
+                                log,
+                                facts=facts,
+                                checks=checks,
+                                handoff=_review_continue_blocker(page),
+                            )
+                # Review → Continue → Confirm → Add-ons. Confirm is not payment.
+                if hit and not confirm_only:
+                    try:
+                        page.wait_for_timeout(500)
+                    except Exception:
+                        pass
+                    text_after, url_after = _read(page)
+                    # Continue click can "succeed" while email validation keeps Review open.
+                    if _email_input_empty(page) or (
+                        re.search(r"please enter an email address", text_after or "", re.I)
+                        and re.search(r"review & traveller|review details", text_after or "", re.I)
+                    ):
+                        email = str((profile or {}).get("email") or "").strip()
+                        if email:
+                            log.append(
+                                "email:ok" if _commit_contact_email(page, email) else "email:miss"
+                            )
+                        if _email_input_empty(page):
+                            text, url, stage, facts = _snapshot()
+                            return CheckoutOutcome(
+                                "passenger",
+                                text,
+                                url,
+                                log,
+                                facts=facts,
+                                checks=checks,
+                                handoff=_review_continue_blocker(page),
+                            )
+                    addons_hit = _press_confirm_then_addons(page, log)
+                    if addons_hit is not None:
+                        return addons_hit
                 tap_pending = ""
                 try:
                     page.wait_for_timeout(400)
                 except Exception:
                     pass
+                continue
+            elif re.search(
+                r"assured free|assured flex|don.?t want|no,?\s*thanks|without assured",
+                tap_pending,
+                re.I,
+            ):
+                # Named Assured choice: tick the radio, then Continue only if it stuck.
+                # Do not fire another Continue when the sheet fingerprint did not change.
+                log.append(f"user_tap:{tap_pending}")
+                decline_tap = bool(
+                    re.search(r"don.?t want|no,?\s*thanks|without assured", tap_pending, re.I)
+                )
+                if decline_tap:
+                    # Apply saved traveller/contact FIRST. Assured opt-out used to run alone and
+                    # return on miss while Adult 1 was still blank — same stuck screenshot loop.
+                    _ixigo_prepare_review(page, profile, log)
+                    opt = _ixigo_opt_out_cancellation(page)
+                    log.append(opt)
+                    if opt in {"optout_miss", "optout_no_thanks_miss"} or not _cancellation_declined(
+                        page, opt
+                    ):
+                        text, url, stage, facts = _snapshot()
+                        # If Adult form is still empty, say that — not a Free Cancellation miss.
+                        if _adult_traveller_gaps(page) or _email_input_empty(page):
+                            return CheckoutOutcome(
+                                "passenger",
+                                text,
+                                url,
+                                log,
+                                facts=facts,
+                                checks=checks,
+                                handoff=_review_continue_blocker(page),
+                            )
+                        if _ixigo_pin_invalid(page):
+                            handoff = _pin_retry_handoff(sheet_open=_ixigo_buy_this_visible(page))
+                        elif _ixigo_buy_this_visible(page) or "no_thanks" in opt:
+                            handoff = (
+                                "I could not press No, Thanks on Free Cancellation, so I did not press Continue. "
+                                "Nothing paid."
+                            )
+                        else:
+                            handoff = (
+                                "I could not select I don't want Free Cancellation. Pay fee if you cancel, "
+                                "so I did not press Continue. Nothing paid."
+                            )
+                        return CheckoutOutcome(
+                            "passenger",
+                            text,
+                            url,
+                            log,
+                            facts=facts,
+                            checks=checks,
+                            handoff=handoff,
+                        )
+                    # Sheet/radio cleared — stop for a bad pin before Continue so the user can correct it.
+                    if _ixigo_pin_invalid(page):
+                        text, url, stage, facts = _snapshot()
+                        return CheckoutOutcome(
+                            "passenger",
+                            text,
+                            url,
+                            log,
+                            facts=facts,
+                            checks=checks,
+                            handoff=_pin_retry_handoff(sheet_open=_ixigo_buy_this_visible(page)),
+                        )
+                    # Re-apply after Assured in case Ixigo remounted Adult 1.
+                    _ixigo_prepare_review(page, profile, log)
+                    if _adult_traveller_gaps(page) or _email_input_empty(page) or _ixigo_pin_invalid(page):
+                        text, url, stage, facts = _snapshot()
+                        return CheckoutOutcome(
+                            "passenger",
+                            text,
+                            url,
+                            log,
+                            facts=facts,
+                            checks=checks,
+                            handoff=_review_continue_blocker(page),
+                        )
+                    if _ixigo_buy_this_visible(page):
+                        log.append(_ixigo_click_no_thanks(page) or "no_thanks_miss")
+                    elif not _decline_radio_checked(page) and not opt.startswith("optout_no_thanks"):
+                        log.append(_ixigo_opt_out_cancellation(page))
+                        if not _cancellation_declined(page, log[-1] if log else ""):
+                            text, url, stage, facts = _snapshot()
+                            return CheckoutOutcome(
+                                "passenger",
+                                text,
+                                url,
+                                log,
+                                facts=facts,
+                                checks=checks,
+                                handoff=(
+                                    "Free Cancellation came back after filling details. "
+                                    "Nothing paid."
+                                ),
+                            )
+                elif not _click_label(page, tap_pending):
+                    log.append("user_tap_upsell_miss")
+                    text, url, stage, facts = _snapshot()
+                    return CheckoutOutcome(
+                        "passenger",
+                        text,
+                        url,
+                        log,
+                        facts=facts,
+                        checks=checks,
+                        handoff=(
+                            f"I could not tick {tap_pending}, so I did not press Continue. Nothing paid."
+                        ),
+                    )
+                else:
+                    log.append(_select_saved_traveller(page, str(profile.get("name") or "")))
+                    typed = type_saved_contact(page, profile)
+                    if typed:
+                        log.extend(typed)
+                try:
+                    page.wait_for_timeout(400)
+                except Exception:
+                    pass
+                if _ixigo_buy_this_visible(page):
+                    log.append(_ixigo_click_no_thanks(page) or "no_thanks_miss")
+                if seller == "ixigo":
+                    blocked = _ixigo_autonomous_gate(page, profile, log)
+                    if blocked:
+                        text, url, stage, facts = _snapshot()
+                        return CheckoutOutcome(
+                            "pay" if stage == "pay" else "passenger",
+                            text,
+                            url,
+                            log,
+                            facts=facts,
+                            checks=checks,
+                            handoff=blocked,
+                        )
+                moved = bool(advance_forward_control(page, "Continue", kind="review"))
+                log.append(f"user_tap_upsell_continue:{int(bool(moved))}")
+                tap_pending = ""
+                if not moved and _ixigo_buy_this_visible(page):
+                    log.append(_ixigo_click_no_thanks(page) or "no_thanks_retry_miss")
+                    moved = bool(advance_forward_control(page, "Continue", kind="review"))
+                    log.append(f"user_tap_upsell_continue_after_sheet:{int(bool(moved))}")
+                if not moved:
+                    text, url, stage, facts = _snapshot()
+                    if _on_addons_page(text, stage):
+                        log.append("review_stop_was_addons")
+                        tap_pending = ""
+                        continue
+                    return CheckoutOutcome(
+                        "passenger",
+                        text,
+                        url,
+                        log,
+                        facts=facts,
+                        checks=checks,
+                        handoff=_review_continue_blocker(page),
+                    )
+                try:
+                    page.wait_for_timeout(800)
+                except Exception:
+                    pass
+                addons_hit = _press_confirm_then_addons(page, log)
+                if addons_hit is not None:
+                    return addons_hit
                 continue
             elif _click_label(page, tap_pending):
                 log.append(f"user_tap:{tap_pending}")
@@ -4319,18 +6918,26 @@ def run_checkout_agent(
 
         # Add-ons skip is an outcome loop, not a 16-step vision tour. Reply within ~20s.
         # Never treat Review-your-itinerary flex "Add" upsells as Choose add-ons / Skip.
-        skip_now = (
-            stage == "addons"
-            or (
-                "itinerary" in (url or "").lower()
-                and stage not in {"results", "fare_sheet", "loading", "home", "error", "review"}
-                and not re.search(r"review your itinerary", text or "", re.I)
-                and bool(
-                    re.search(
-                        r"choose add-ons|skip add-?ons|add seats|missed adding meal|add meals|add extra luggage",
-                        text or "",
-                        re.I,
-                    )
+        skip_now = _on_addons_page(text, stage) or stage == "addons" or (
+            stage not in {"results", "fare_sheet", "loading", "home", "error", "review", "pay", "login", "otp"}
+            and bool(
+                re.search(
+                    r"skip to payment|seat map|meal selection|choose add-ons|"
+                    r"skip add-?ons|add seats|missed adding meal",
+                    text or "",
+                    re.I,
+                )
+            )
+        ) or (
+            "itinerary" in (url or "").lower()
+            and stage not in {"results", "fare_sheet", "loading", "home", "error", "review"}
+            and not re.search(r"review your itinerary", text or "", re.I)
+            and bool(
+                re.search(
+                    r"choose add-ons|skip add-?ons|skip to payment|add seats|"
+                    r"missed adding meal|add meals|add extra luggage",
+                    text or "",
+                    re.I,
                 )
             )
         )
@@ -4340,6 +6947,11 @@ def run_checkout_agent(
                 settle_visible_sheet(page, budget_ms=4000)
             except Exception:
                 pass
+            # Secure My Trip can reappear on Add-ons after Confirm — decline, don't ask.
+            if _ixigo_buy_this_visible(page):
+                log.append(
+                    f"addons_fast_no_thanks:{_dismiss_post_confirm_secure_trip(page, log) or 'clear'}"
+                )
             left = _leave_addons(page, log, rounds=3)
             text, url, stage, facts = _snapshot()
             if not left or stage == "addons":
@@ -4350,7 +6962,7 @@ def run_checkout_agent(
                     pass
                 left = _leave_addons(page, log, rounds=2)
                 text, url, stage, facts = _snapshot()
-                left = bool(left) and stage != "addons" and not re.search(
+                left = bool(left) and stage != "addons" and not _on_addons_page(text, stage) and not re.search(
                     r"choose add-ons|add seats|missed adding meal", text or "", re.I
                 )
                 log.append(f"addons_fast_dom:{stage}")
@@ -4365,10 +6977,15 @@ def run_checkout_agent(
                         "Nothing paid."
                     )
                     return CheckoutOutcome("addons", text, url, log, facts=facts, checks=checks, handoff=handoff)
-                action = {"action": "click", "target": "Skip add-ons", "value": ""}
+                action = {"action": "click", "target": "Skip to Payment", "value": ""}
                 kind = action["action"]
                 log.append(f"{step}:{stage}:{kind}:{action.get('target')}")
-                if _click_label(page, "Skip add-ons") or _click_label(page, "Skip add ons"):
+                if (
+                    _skip_addons(page)
+                    or _click_label(page, "Skip to Payment")
+                    or _click_label(page, "Skip add-ons")
+                    or _click_label(page, "Skip add ons")
+                ):
                     log.append("addons_retry_skip")
                 continue
         # Vision on every step: screenshot overrides a wrong DOM toast / sold-out miss.
@@ -4426,8 +7043,15 @@ def run_checkout_agent(
             log.append(f"{step}:vision_err:{type(exc).__name__}")
             log.append("vision_down")
         from app.step_read import form_sheet as _form_sheet
+        from app.step_read import is_saved_traveller_sheet as _saved_travellers
 
-        if _form_sheet(text) and stage not in {"pay", "otp", "login", "error", "unavailable"}:
+        # Contact-only sheets demote to "other" for the fill sprint. Saved Mr/Ms
+        # Review Details is not form_sheet, so it keeps review/passenger rails.
+        if (
+            _form_sheet(text)
+            and not _saved_travellers(text)
+            and stage not in {"pay", "otp", "login", "error", "unavailable"}
+        ):
             if stage != "other":
                 log.append(f"{step}:form_sheet:{stage}->other")
             stage = "other"
@@ -4435,57 +7059,9 @@ def run_checkout_agent(
             label = tap_pending
             tap_pending = ""
             if label in {"__select_traveller__", "__pick_traveller__"}:
-                note = _select_saved_traveller(page, str(profile.get("name") or ""))
-                log.append(f"user_pick_traveller:{note or 'miss'}")
-                if note.startswith("traveller_clicked") or note.startswith("traveller_already") or note.startswith(
-                    "traveller_card"
-                ):
-                    try:
-                        page.wait_for_timeout(500)
-                    except Exception:
-                        pass
-                    # Conscience: after the tick, fill empty contact boxes then press Continue.
-                    typed = type_saved_contact(page, profile)
-                    if typed:
-                        log.extend(typed)
-                    from app.step_read import forward_tap
-
-                    after = _snapshot()
-                    text, url, stage, facts = after
-                    move = decide_sheet(text, profile)
-                    if move.get("action") == "ask" and move.get("missing"):
-                        fields = " and ".join(str(item) for item in move["missing"])
-                        handoff = (
-                            f"I ticked the saved traveller. The page still needs your {fields} "
-                            "before Continue. Send it and I'll type it in. Nothing paid."
-                        )
-                        return CheckoutOutcome(
-                            "passenger", text, url, log, facts=facts, checks=checks, handoff=handoff
-                        )
-                    if move.get("action") == "fill":
-                        keys = tuple(
-                            str(item)
-                            for item in (move.get("fills") or [])
-                            if str(item) in {"email", "phone", "name", "dob", "pincode", "billing_state"}
-                        )
-                        more = fill_profile_slots(
-                            page,
-                            profile,
-                            keys=keys or ("email", "phone", "pincode", "billing_state"),
-                        )
-                        log.extend(more)
-                        text, url, stage, facts = _snapshot()
-                    label_next = str(move.get("tap") or "") or forward_tap(text or "") or "Continue"
-                    hit = advance_forward_control(page, label_next, kind="passenger")
-                    log.append(f"after_pick_continue:{hit or 'miss'}")
-                    continue
-                if note.startswith("traveller_unticked") or note == "behind_sheet" or not note:
-                    handoff = (
-                        "Saved travellers are on screen. I could not tick one yet — "
-                        "reply click one of the names again, or say delete one of the profiles. "
-                        "I will not create a new traveller. Nothing paid."
-                    )
-                    return CheckoutOutcome("passenger", text, url, log, facts=facts, checks=checks, handoff=handoff)
+                # Handled at the top of the loop before contact-missing returns.
+                log.append("pick_traveller_late_miss")
+                continue
             elif label in {"__delete_traveller__", "__remove_traveller__"}:
                 note = _delete_saved_traveller(page, str(profile.get("name") or ""))
                 log.append(f"user_delete_traveller:{note or 'miss'}")
@@ -4501,6 +7077,32 @@ def run_checkout_agent(
                 log.append("user_tap_refused")
             elif _click_label(page, label):
                 log.append(f"user_tap:{label}")
+                if re.search(
+                    r"assured free|assured flex|don.?t want|no,?\s*thanks|without assured",
+                    label,
+                    re.I,
+                ):
+                    try:
+                        page.wait_for_timeout(400)
+                    except Exception:
+                        pass
+                    if seller == "ixigo":
+                        blocked = _ixigo_autonomous_gate(page, profile, log)
+                        if blocked:
+                            text, url, stage, facts = _snapshot()
+                            return CheckoutOutcome(
+                                "pay" if stage == "pay" else "passenger",
+                                text,
+                                url,
+                                log,
+                                facts=facts,
+                                checks=checks,
+                                handoff=blocked,
+                            )
+                    moved = bool(advance_forward_control(page, "Continue", kind="review"))
+                    if not moved:
+                        moved = bool(_js_continue(page) or _safe_continue(page))
+                    log.append(f"user_tap_upsell_continue:{int(bool(moved))}")
                 try:
                     page.wait_for_timeout(800)
                 except Exception:
@@ -4509,12 +7111,21 @@ def run_checkout_agent(
             else:
                 log.append("user_tap_miss")
         if pause_on_auth and stage in {"login", "otp"}:
-            log.append(f"{step}:{stage}:auth_pause")
-            handoff = (
-                "Authentication required in the browser. Do not automate OTP. "
-                f"Verified fare so far {facts.get('total') or '?'}. Nothing paid."
+            from app.kernel_otp import indian_national
+
+            # A saved mobile on the Ixigo number sheet is typed here. OTP digits still wait for WhatsApp.
+            can_type_saved_mobile = (
+                stage == "login"
+                and bool(indian_national(str(profile.get("phone") or "")))
+                and not re.search(r"verify your mobile|enter the otp|enter otp|otp sent", text or "", re.I)
             )
-            return CheckoutOutcome("auth_required", text, url, log, facts=facts, checks=checks, handoff=handoff)
+            if not can_type_saved_mobile:
+                log.append(f"{step}:{stage}:auth_pause")
+                handoff = (
+                    "Authentication required in the browser. Do not automate OTP. "
+                    f"Verified fare so far {facts.get('total') or '?'}. Nothing paid."
+                )
+                return CheckoutOutcome("auth_required", text, url, log, facts=facts, checks=checks, handoff=handoff)
         if stage in {"review", "passenger", "addons", "pay"} and (facts.get("flight") or facts.get("total")):
             ok, problems = verify_trip_facts(
                 facts,
@@ -4527,15 +7138,20 @@ def run_checkout_agent(
             checks.append(check)
             if not ok:
                 log.append(f"{step}:verify_fail:{';'.join(problems)}")
-                return CheckoutOutcome(
-                    "wrong_flight",
-                    text,
-                    url,
-                    log,
-                    facts=facts,
-                    checks=checks,
-                    handoff="Stopped: on-screen itinerary did not match the requested flight.",
+                nxt = _finish_wrong(
+                    CheckoutOutcome(
+                        "wrong_flight",
+                        text,
+                        url,
+                        log,
+                        facts=facts,
+                        checks=checks,
+                        handoff="Stopped: on-screen itinerary did not match the requested flight.",
+                    )
                 )
+                if nxt is None:
+                    continue
+                return nxt
         if stage == "error" and recovers >= max_recovers:
             log.append(f"{step}:error:stop")
             break
@@ -4670,6 +7286,8 @@ def run_checkout_agent(
                     if any(line.startswith("contact_unready") for line in applied) and contact_tries == 0:
                         continue
                     if any(line.startswith("contact_unready") for line in applied):
+                        if _retry_known_traveller(page, profile, log):
+                            continue
                         return CheckoutOutcome(
                             "passenger",
                             text,
@@ -4682,6 +7300,54 @@ def run_checkout_agent(
                         )
                     continue
         if action is None:
+            # Ixigo logged-in Review: never ask while a saved profile can still be applied.
+            if (
+                seller == "ixigo"
+                and str((profile or {}).get("auth_mode") or "").lower() != "guest"
+                and (
+                    str((profile or {}).get("name") or "").strip()
+                    or str((profile or {}).get("email") or "").strip()
+                )
+                and stage in {"review", "passenger", "other", "ask"}
+                and sum(1 for line in log if line == "ixigo_autofill_before_ask") < 1
+            ):
+                log.append("ixigo_autofill_before_ask")
+                _ixigo_prepare_review(page, profile, log)
+                blocked = _ixigo_autonomous_gate(page, profile, log)
+                if blocked:
+                    text, url, stage, facts = _snapshot()
+                    return CheckoutOutcome(
+                        "passenger",
+                        text,
+                        url,
+                        log,
+                        facts=facts,
+                        checks=checks,
+                        handoff=blocked,
+                    )
+                moved = bool(advance_forward_control(page, "Continue", kind="review"))
+                if not moved:
+                    moved = bool(_js_continue(page) or _safe_continue(page))
+                log.append(f"autofill_continue:{int(bool(moved))}")
+                if moved:
+                    addons_hit = _press_confirm_then_addons(page, log)
+                    if addons_hit is not None:
+                        return addons_hit
+                    text, url, stage, facts = _snapshot()
+                    continue
+                text, url, stage, facts = _snapshot()
+                if _on_addons_page(text, stage):
+                    log.append("review_stop_was_addons")
+                    continue
+                return CheckoutOutcome(
+                    "passenger",
+                    text,
+                    url,
+                    log,
+                    facts=facts,
+                    checks=checks,
+                    handoff=_review_continue_blocker(page),
+                )
             if not chosen_tap:
                 return _pause_unknown(
                     page,
@@ -4756,31 +7422,40 @@ def run_checkout_agent(
                     except Exception:
                         pass
             else:
+                # Assured / Secure My Trip must not become an ask while a saved profile exists —
+                # prepare declines the sheet, ticks the traveller, and fills contact first.
                 surface = read_surface(page)
                 if surface.get("overlay") or _ixigo_buy_this_visible(page):
                     note = _clear_front_sheet(page, chosen_tap, seller=seller, hint=hint)
                     log.append(note or "front_clear_miss")
                     if note.startswith("front_tap:"):
                         continue
-                    return _pause_unknown(
-                        page,
-                        seller=seller,
-                        hint=hint,
-                        text=text,
-                        url=url,
-                        log=log,
-                        facts=facts,
-                        checks=checks,
-                        step=step,
-                        chosen_tap=chosen_tap,
-                    )
-                # Tick one saved person and leave extras off before Continue. Do not add another.
-                log.append(_ixigo_opt_out_cancellation(page))
-                log.append(_select_saved_traveller(page, str(profile.get("name") or "")))
+                if re.search(
+                    r"assured free|assured flex|don.?t want free cancellation|no,?\s*thanks|without assured",
+                    chosen_tap or "",
+                    re.I,
+                ):
+                    log.append(f"upsell_choice_held:{chosen_tap[:48]}")
+                    _ixigo_prepare_review(page, profile, log)
+                else:
+                    _ixigo_prepare_review(page, profile, log)
                 try:
                     page.wait_for_timeout(400)
                 except Exception:
                     pass
+                blocked = _ixigo_autonomous_gate(page, profile, log)
+                if blocked:
+                    text, url, stage, facts = _snapshot()
+                    shown = "pay" if stage == "pay" or payment_sheet_open(text, stage) else "passenger"
+                    return CheckoutOutcome(
+                        shown,
+                        text,
+                        url,
+                        log,
+                        facts=facts,
+                        checks=checks,
+                        handoff=blocked,
+                    )
             # One accurate click per attempt. Press the label on this sheet, else _safe_continue(page).
             from app.step_read import forward_tap
 
@@ -4802,6 +7477,10 @@ def run_checkout_agent(
                 {"login", "otp", "passenger", "addons", "pay", "error", "other", "review"},
                 budget_ms=8000,
             )
+            if moved:
+                addons_hit = _press_confirm_then_addons(page, log)
+                if addons_hit is not None:
+                    return addons_hit
             if not cleartrip_review:
                 # Continue often opens a name Confirm sheet — conscience clears it.
                 after = _clear_front_sheet(page, seller=seller, hint=hint)
@@ -4932,6 +7611,8 @@ def run_checkout_agent(
                     if after:
                         log.append(after)
                     continue
+                if _retry_known_traveller(page, profile, log):
+                    continue
                 log.append("passenger_unfilled")
                 handoff = contact_report(" | ".join(notes), text) or (
                     "Passenger form is open, but the name did not go into the fields. Nothing paid."
@@ -5012,6 +7693,13 @@ def run_checkout_agent(
                 return CheckoutOutcome("unavailable", after, after_url, log, checks=checks)
             if after_stage in {"addons", "review", "passenger", "pay"}:
                 log.append(f"after_book_direct:{after_stage}")
+                text, url, stage, facts = after, after_url, after_stage, _af
+                wrong = _stop_wrong_itinerary()
+                if wrong is not None:
+                    nxt = _finish_wrong(wrong)
+                    if nxt is None:
+                        continue
+                    return nxt
                 continue
             if after_stage == "fare_sheet":
                 if hint and not (
@@ -5036,8 +7724,8 @@ def run_checkout_agent(
                 log.append("book_still_results")
                 continue
             if not card and after_stage == "results":
-                # One mouse Book before giving up — Cleartrip often ignores JS click.
-                if hint and "cleartrip.com" in (after_url or url or "") and _mouse_book_depart(page, hint):
+                # One mouse Book before giving up — a JS click often misses Ixigo's Book.
+                if hint and _mouse_book_depart(page, hint):
                     log.append("results:mouse_book")
                     _poll_ready(
                         page,
@@ -5123,7 +7811,18 @@ def run_checkout_agent(
             continue
     text, url, stage, facts = _snapshot()
     if stage == "pay" and not handoff:
-        handoff = f"Payment handoff. Total {facts.get('total') or '?'}. Link: {url}. No payment clicked."
+        if seller == "ixigo":
+            try:
+                from app.ixigo_decisions import observe_ixigo_checkout, plan_ixigo_checkout
+
+                pay_plan = plan_ixigo_checkout(observe_ixigo_checkout(page, profile), profile)
+                handoff = str(pay_plan.get("handoff") or "")
+            except Exception:
+                handoff = ""
+        if not handoff:
+            handoff = f"Payment handoff. Total {facts.get('total') or '?'}. Link: {url}. No payment clicked."
+        elif "no payment" not in handoff.lower() and "will not click pay" not in handoff.lower():
+            handoff = handoff.rstrip(".") + f". Link: {url}. No payment clicked."
     if stage == "otp" and not handoff:
         handoff = "OTP required from traveller. Nothing paid."
     if stage == "login" and not handoff:

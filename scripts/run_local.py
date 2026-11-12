@@ -22,8 +22,8 @@ load_dotenv(ROOT / ".env", override=True)
 
 # Prod-matching stack; only egress and DB path are local-safe.
 os.environ["GUIDE_LOCAL"] = "1"
-os.environ.setdefault("GUIDE_PUBLIC_URL", "http://127.0.0.1:8000")
-os.environ.setdefault("GUIDE_DB_PATH", str(ROOT / "data" / "guide-local.db"))
+os.environ["GUIDE_PUBLIC_URL"] = "http://127.0.0.1:8000"
+os.environ["GUIDE_DB_PATH"] = str(ROOT / "data" / "guide-local.db")
 os.environ.setdefault("GUIDE_LAB_PHONE", "919999000001")
 
 # Settings are cached — clear after env overrides.

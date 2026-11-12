@@ -159,20 +159,37 @@ def left_addons(page: str, stage: str = "") -> bool:
     on the same sheet as Skip add-ons does not mean extras are done.
     """
     hay = page or ""
-    # Live Skip / meals / luggage means we are still mid-extras.
+    # Real payment sheet wins even if a hidden Skip control still sits in the DOM text.
+    if (stage or "") == "pay" or re.search(
+        r"enter card number|pay to complete your booking|name on card|scan qr code",
+        hay,
+        re.I,
+    ):
+        if not re.search(r"seat map|meal selection|choose add-ons|missed adding", hay, re.I):
+            return True
+    # Live Skip / meals / luggage / Ixigo Skip-to-Payment means we are still mid-extras.
     if re.search(
-        r"skip add-?ons|choose add-ons|add seats|missed adding meal|add meals|add extra luggage",
+        r"skip add-?ons|skip to payment|choose add-ons|add seats|missed adding meal|"
+        r"add meals|add extra luggage|meal selection|seat selection|seat map",
         hay,
         re.I,
     ):
         return False
     if re.search(r"review your itinerary", hay, re.I) and not re.search(
-        r"skip add-?ons|add meals|choose add-ons", hay, re.I
+        r"skip add-?ons|skip to payment|add meals|choose add-ons|meal selection|seat map",
+        hay,
+        re.I,
     ):
         return True
-    if re.search(r"choose add-ons|add seats|seat map|missed adding meal", hay, re.I):
+    if re.search(
+        r"choose add-ons|add seats|seat map|missed adding meal|meal selection|seat selection",
+        hay,
+        re.I,
+    ):
         return False
-    if re.search(r"skip add-?ons", hay, re.I) and re.search(r"add meal|extra baggage|choose add-ons", hay, re.I):
+    if re.search(r"skip add-?ons|skip to payment", hay, re.I) and re.search(
+        r"add meal|extra baggage|choose add-ons|seat|meal", hay, re.I
+    ):
         return False
     if (stage or "") in {"review", "passenger", "pay", "login", "otp", "error", "unavailable"}:
         return True

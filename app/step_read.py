@@ -36,7 +36,7 @@ _SPEND = re.compile(
 )
 _DECLINE = re.compile(
     r"(I don'?t want Free Cancellation|No,? Thanks|Not this time|Continue without(?: add-?ons)?|"
-    r"Skip add-?ons|Skip this|I don'?t want|Not now|Maybe later)",
+    r"Skip to Payment|Skip add-?ons|Skip this|I don'?t want|Not now|Maybe later)",
     re.I,
 )
 _AGREE = re.compile(
@@ -58,7 +58,7 @@ def step_read_enabled() -> bool:
 
 _ADDONS_SHEET = re.compile(
     r"choose add-ons|choose your seat|add seats|missed adding meal|skip add-?ons|"
-    r"add meals|add extra luggage|seat map",
+    r"skip to payment|add meals|add extra luggage|seat map|meal selection|seat selection",
     re.I,
 )
 _AGREE_ONLY = re.compile(
@@ -88,22 +88,30 @@ def visible_forward(page: str, requested: str = "") -> str:
     asked = re.sub(r"\s+", " ", requested or "").strip()
     if re.search(r"\bcontinue\b", asked, re.I):
         return "Continue"
-    if asked and re.fullmatch(r"skip|decline|no thanks|no, thanks", asked, re.I):
+    if asked and re.search(r"skip to payment|go to payment|skip add|decline|no,? thanks", asked, re.I):
         for label in (
+            "Skip to Payment",
+            "Skip to payment",
             "Skip add-ons",
             "Skip add ons",
             "Continue without add-ons",
             "No, Thanks",
             "No Thanks",
         ):
-            if label.lower() in hay.lower():
+            if re.search(re.escape(label).replace(r"\ ", r"\s*"), hay, re.I):
                 return label
     if asked:
         hit = safe_tap(asked, hay)
         if hit:
             return hit
     if addons_sheet(hay):
-        for label in ("Skip add-ons", "Skip add ons", "Continue without add-ons", "Continue"):
+        for label in (
+            "Skip to Payment",
+            "Skip add-ons",
+            "Skip add ons",
+            "Continue without add-ons",
+            "Continue",
+        ):
             hit = safe_tap(label, hay)
             if hit:
                 return hit
@@ -118,6 +126,32 @@ def decline_tap(page: str) -> str:
     if not match:
         return ""
     return safe_tap(match.group(1), page)
+
+
+def upsell_choice_labels(page: str) -> list[str]:
+    """Assured / free-cancellation radios the traveller can pick (not Pay / Secure My Trip)."""
+    hay = page or ""
+    found: list[str] = []
+    for pattern in (
+        r"Assured Free Cancellation",
+        r"Assured Flex",
+        r"Free Cancellation \+ Rescheduling",
+        # Paid card title "Free Cancellation @₹…" — not the "Assured Free Cancellation" name.
+        r"(?<![Aa]ssured )Free Cancellation(?=\s*@)",
+        r"I don'?t want Free Cancellation",
+        r"Without Assured",
+        r"No,?\s*Thanks",
+    ):
+        match = re.search(pattern, hay, re.I)
+        if not match:
+            continue
+        label = safe_tap(match.group(0), hay) or re.sub(r"\s+", " ", match.group(0)).strip()
+        # Drop the section header "Add Free Cancellation…" — not a radio.
+        if re.search(r"^add free cancellation", label, re.I):
+            continue
+        if label and label.lower() not in {item.lower() for item in found}:
+            found.append(label)
+    return found
 
 
 def is_paid_upsell(page: str) -> bool:
@@ -143,6 +177,59 @@ def _traveller_form_open(page: str) -> bool:
     return False
 
 
+def _assured_radio_gate(page: str) -> bool:
+    """True when Free Cancellation / Assured radios need a pick before Continue.
+
+    Ixigo puts these radios on the same Review Details page as saved travellers.
+    Buried 'Refund on Cancellation' marketing alone must not trip this — need the
+    decline option plus at least one paid Assured / Free Cancellation choice.
+    """
+    hay = page or ""
+    if re.search(r"please select an option before proceeding", hay, re.I):
+        return True
+    labels = upsell_choice_labels(hay)
+    if len(labels) >= 2:
+        decline = any(re.search(r"don.?t want|no,?\s*thanks|without assured", item, re.I) for item in labels)
+        paid = any(
+            re.search(r"assured|free cancellation", item, re.I)
+            and not re.search(r"don.?t want|without assured|no,?\s*thanks", item, re.I)
+            for item in labels
+        )
+        if decline and paid:
+            return True
+    # Classic three-radio Assured block (even when a Mr name is also on the page).
+    if (
+        re.search(r"assured free cancellation", hay, re.I)
+        and re.search(r"assured flex", hay, re.I)
+        and re.search(r"i don'?t want free cancellation", hay, re.I)
+    ):
+        return True
+    # Newer Ixigo Review Details: Free Cancellation / + Rescheduling cards + decline.
+    if re.search(r"i don'?t want free cancellation", hay, re.I) and (
+        re.search(r"free cancellation \+ rescheduling", hay, re.I)
+        or (
+            re.search(r"add free cancellation to your trip", hay, re.I)
+            and len(re.findall(r"\bfree cancellation\b", hay, re.I)) >= 2
+        )
+    ):
+        return True
+    return False
+
+
+def adult_form_needs_fill(page: str) -> bool:
+    """True when Adult 1 / title fields look empty — not merely a saved-list row on Assured."""
+    hay = page or ""
+    if re.search(r"please select your title|clear details", hay, re.I):
+        return True
+    if (
+        re.search(r"adult\s*1|first\s*&\s*middle name", hay, re.I)
+        and re.search(r"choose from the saved list|traveller details", hay, re.I)
+        and not re.search(r"adult\s*1[^\n]{0,80}\b(mr|ms|mrs|mx)\.?\s+\w+", hay, re.I)
+    ):
+        return True
+    return False
+
+
 def classify_sheet(page: str) -> str:
     """One ordered sheet kind. First match wins — no overlapping detectors fighting."""
     hay = page or ""
@@ -156,20 +243,34 @@ def classify_sheet(page: str) -> str:
         r"search again|no longer available|sold out", hay, re.I
     ):
         return "unavailable"
-    if is_paid_upsell(hay) or (
+    # A multi-row Book list is the fare list. Card copy can mention Assured
+    # or free cancellation without that being the cancellation popup.
+    if _fare_list_sheet(hay):
+        return "results"
+    # Name-check modal covers traveller/billing — Confirm/Edit before fill/Continue.
+    if is_name_confirm(hay):
+        return "name_confirm"
+    # Open traveller / Adult 1 / Contact form owns the sheet. Buried Assured marketing
+    # or a leftover "I don't want Free Cancellation" string must not win.
+    # Empty Adult 1 (Please select your title) wins over Assured radios on the same
+    # Review page — prepare ticks the saved traveller, then declines Assured.
+    traveller_open = is_saved_traveller_sheet(hay) or _traveller_form_open(hay)
+    adult_needs_fill = adult_form_needs_fill(hay)
+    if traveller_open and (adult_needs_fill or not _assured_radio_gate(hay)):
+        return "traveller"
+    if is_paid_upsell(hay) or _assured_radio_gate(hay) or (
         re.search(r"free cancellation|\bassured\b", hay, re.I)
         and re.search(
             r"i don'?t want free cancellation|please select an option before proceeding|buy this|secure my trip",
             hay,
             re.I,
         )
+        and not traveller_open
     ):
         return "upsell"
-    # Traveller/billing before name_confirm — buried govt-ID copy must not win.
-    if is_saved_traveller_sheet(hay) or _traveller_form_open(hay):
+    # Traveller/billing before a buried govt-ID disclaimer (no open Confirm modal).
+    if traveller_open:
         return "traveller"
-    if is_name_confirm(hay):
-        return "name_confirm"
     if is_contact_form(hay) or (
         re.search(r"contact details|please enter (?:a )?valid email", hay, re.I)
         and not _fare_list_sheet(hay)
@@ -189,13 +290,12 @@ def classify_sheet(page: str) -> str:
 def is_saved_traveller_sheet(page: str) -> bool:
     """Saved traveller checkboxes on Review Details. Continue advances — not a govt-ID Confirm modal."""
     hay = page or ""
-    # Free-cancellation / Assured radio owns the sheet even when a saved name sits behind it.
-    if is_paid_upsell(hay) or re.search(
-        r"free cancellation|i don'?t want free cancellation|buy this|secure my trip|"
-        r"assured flex|please select an option before proceeding",
-        hay,
-        re.I,
-    ):
+    # Empty Adult 1 still counts as the traveller sheet even when Assured radios sit below.
+    adult_empty = adult_form_needs_fill(hay)
+    # Only the Assured radio gate covers the form — not buried "Refund on Cancellation" copy.
+    if _assured_radio_gate(hay) and not adult_empty:
+        return False
+    if is_paid_upsell(hay) and not _traveller_form_open(hay) and not adult_empty:
         return False
     people = len(re.findall(r"\b(?:mr|ms|mrs|mx)\.?\b", hay, re.I))
     listed = people >= 1 or bool(re.search(r"choose from the saved list|adult\s*1", hay, re.I))
@@ -218,18 +318,30 @@ def is_saved_traveller_sheet(page: str) -> bool:
 def is_name_confirm(page: str) -> bool:
     """Name-check overlay (govt-id / Confirm). Wins over contact copy behind the modal."""
     hay = page or ""
-    # Billing / Adult 1 / saved list is Continue work — never a Confirm modal.
-    if is_saved_traveller_sheet(hay) or _traveller_form_open(hay):
-        return False
-    if not re.search(r"\b(?:confirm|continue)\b", hay, re.I):
-        return False
-    return bool(
+    has_govt = bool(
         re.search(
             r"govt\.?\s*id|aadhaar|matches your (govt|name)|driver.?s license|please ensure that your name",
             hay,
             re.I,
         )
     )
+    if not has_govt or not re.search(r"\b(?:confirm|continue)\b", hay, re.I):
+        return False
+    # Open modal paints Title / First & Middle / Edit / Confirm over billing — still Confirm.
+    if (
+        re.search(r"\bedit\b", hay, re.I)
+        and re.search(r"\bconfirm\b", hay, re.I)
+        and re.search(
+            r"first\s*&\s*middle\s*name|adult\s*title|\btitle\b.{0,16}\b(?:mr|ms|mrs|mx)\b",
+            hay,
+            re.I,
+        )
+    ):
+        return True
+    # Adult 1 / saved list / open billing form is Continue work — not the govt-ID popup.
+    if is_saved_traveller_sheet(hay) or _traveller_form_open(hay):
+        return False
+    return True
 
 
 def is_contact_form(page: str) -> bool:
@@ -247,7 +359,7 @@ def is_contact_form(page: str) -> bool:
 
 
 def _fare_list_sheet(page: str) -> bool:
-    """Several flights with Book. Not a contact form, add-ons, or one review sheet."""
+    """Results with Book. One visible card counts. Not contact, add-ons, or review."""
     hay = page or ""
     if (
         is_contact_form(hay)
@@ -255,11 +367,19 @@ def _fare_list_sheet(page: str) -> bool:
         or on_review_itinerary(hay)
         or addons_sheet(hay)
         or re.search(r"\breview details\b", hay, re.I)
+        or re.search(r"please select an option before proceeding", hay, re.I)
     ):
         return False
     times = set(re.findall(r"\b\d{1,2}:\d{2}\b", hay))
     books = len(re.findall(r"\bBook\b", hay))
-    return len(times) >= 2 and books >= 2
+    if len(times) >= 2 and books >= 2:
+        return True
+    # Ixigo often paints one card. 09:10 and 19:10 are depart and arrive, not two flights.
+    if books < 1 or not times:
+        return False
+    if re.search(r"fare summary|review & traveller", hay, re.I):
+        return False
+    return bool(re.search(r"\bsort by\b|flights available", hay, re.I))
 
 
 INDIAN_STATES = (
@@ -304,9 +424,22 @@ def _sheet_fields(page: str, facts: dict) -> tuple[list[str], list[str]]:
             missing.append("mobile")
         elif phone[-10:] not in re.sub(r"\D", "", hay):
             fills.append("phone")
+    if re.search(r"please select your title", hay, re.I):
+        # Saved list on screen is not enough — Adult form title is still empty.
+        name = str(facts.get("name") or "").strip()
+        if name:
+            fills.append("name")
+        else:
+            missing.append("title")
     if re.search(r"first\s*(?:&|and)\s*middle|first name|last name \(surname\)|traveller name", hay, re.I):
         name = str(facts.get("name") or "").strip()
-        if not name:
+        if re.search(r"please select your title|clear details", hay, re.I):
+            if name:
+                if "name" not in fills:
+                    fills.append("name")
+            elif "full name" not in missing:
+                missing.append("full name")
+        elif not name:
             missing.append("full name")
         elif name.lower() not in hay.lower():
             fills.append("name")
@@ -319,11 +452,32 @@ def _sheet_fields(page: str, facts: dict) -> tuple[list[str], list[str]]:
     if re.search(r"billing address|\bpincode\b|pin code", hay, re.I):
         pin = re.sub(r"\D", "", str(facts.get("pincode") or ""))
         if re.search(r"\bpincode\b|pin code", hay, re.I):
+            # A rejected pin still appears as 6 digits next to "Please enter a valid pincode".
+            # Those digits are not a filled field. Retype only when we have a different pin.
+            rejected = bool(
+                re.search(r"please enter a valid pin\s*code|please enter a valid pincode", hay, re.I)
+            )
             on_page = bool(pin) and len(pin) == 6 and pin in re.sub(r"\D", "", hay)
             if len(pin) != 6:
                 missing.append("pincode")
-            elif not on_page:
+            elif rejected and on_page:
+                missing.append("a valid pincode")
+            elif rejected or not on_page:
                 fills.append("pincode")
+        address = str(facts.get("billing_address") or facts.get("address") or "").strip()
+        if re.search(r"\baddress\b", hay, re.I) and not re.search(r"email address", hay, re.I):
+            on_page = bool(address) and address.lower()[:12] in hay.lower()
+            if not address:
+                missing.append("address")
+            elif not on_page:
+                fills.append("billing_address")
+        city = str(facts.get("city") or "").strip()
+        if re.search(r"\bcity\b", hay, re.I):
+            on_page = bool(city) and city.lower() in hay.lower()
+            if not city:
+                missing.append("city")
+            elif not on_page:
+                fills.append("city")
         billing_state = str(facts.get("billing_state") or "").strip()
         if re.search(r"\bstate\b", hay, re.I):
             on_page = bool(billing_state) and billing_state.lower() in hay.lower()
@@ -391,11 +545,17 @@ def decide_sheet(
     if sheet == "results" and not cover:
         return _done("pick")
     if sheet == "upsell":
+        choices = upsell_choice_labels(hay)
         tap = decline_tap(hay) or ground_tap("", page=hay, kind="upsell")
         # Bare Continue on a paid extra is not a safe decline — ask with No, Thanks wording.
         if tap and re.fullmatch(r"continue|proceed|confirm", tap, re.I):
             tap = ""
-        return _done("ask", tap=tap)
+        if not tap and choices:
+            tap = next(
+                (item for item in choices if re.search(r"don.?t want|no,?\s*thanks|without assured", item, re.I)),
+                choices[-1],
+            )
+        return _done("ask", tap=tap, fills=choices)
     if sheet == "addons":
         tap = visible_forward(hay) or ground_tap("Skip add-ons", page=hay, kind="addons")
         if tap:
@@ -406,13 +566,16 @@ def decide_sheet(
         and re.search(r"govt|aadhaar|edit\b", hay, re.I)
         and sheet not in {"traveller", "contact"}
     ):
+        # Ask Confirm vs Edit — never auto-press on the govt-ID modal.
         tap = (
             ground_tap("", list(parse_control_labels(controls or hay)), hay, kind="name_confirm")
             or forward_tap(hay)
             or safe_tap("Confirm", hay)
             or "Confirm"
         )
-        return _done("click", tap=tap)
+        edit = safe_tap("Edit", hay) or ("Edit" if re.search(r"\bedit\b", hay, re.I) else "")
+        fills = [label for label in (tap, edit) if label]
+        return _done("ask", tap=tap, fills=fills)
     if cover and sheet not in {"contact", "traveller"} and not form_sheet(hay):
         tap = (
             ground_tap("", list(parse_control_labels(controls or hay)), hay)
@@ -476,8 +639,11 @@ def format_sheet_move(
         what = f"{seller} saved travellers for the {which}"
         why = "tick a name, fill any red fields, then Continue — that is not a Confirm popup"
         if action == "ask" and missing:
-            fields = " and ".join(missing)
-            nxt = f"send your {fields}, or say pick traveller {who} — then I'll press {tap or 'Continue'}".strip()
+            if any(re.search(r"valid pincode", item, re.I) for item in missing):
+                nxt = "send a valid 6-digit pin code and I'll replace the one the page rejected"
+            else:
+                fields = " and ".join(missing)
+                nxt = f"send your {fields}, or say pick traveller {who} — then I'll press {tap or 'Continue'}".strip()
         elif action == "fill":
             nxt = f"I'll fill {', '.join(fills) or 'saved details'}, then press {tap or 'Continue'}"
         else:
@@ -491,8 +657,11 @@ def format_sheet_move(
         what = f"{seller} contact details for the {which}"
         why = "this is the email and mobile step, not a name Confirm and not payment"
         if action == "ask" and missing:
-            fields = " and ".join(missing)
-            nxt = f"send your {fields} — that box is empty, so I won't press {tap or 'the button on this page'}"
+            if any(re.search(r"valid pincode", item, re.I) for item in missing):
+                nxt = "send a valid 6-digit pin code and I'll replace the one the page rejected"
+            else:
+                fields = " and ".join(missing)
+                nxt = f"send your {fields} — that box is empty, so I won't press {tap or 'the button on this page'}"
         elif action == "fill":
             nxt = f"I'll type the saved {', '.join(fills) or 'details'}, then press {tap or 'Continue'}"
         else:
@@ -501,18 +670,29 @@ def format_sheet_move(
 
     if sheet == "name_confirm":
         label = tap or "Confirm"
+        choices = [str(item) for item in fills if str(item).strip()] or [label]
+        if any(re.search(r"\bedit\b", item, re.I) for item in choices):
+            nxt = f"reply confirm (or yes) to press {label}, or edit / exit to press Edit"
+        else:
+            nxt = f"reply yes or confirm and I'll press {label}, then move toward add-ons"
         return (
             f"{seller} name check for the {which}",
             f"Review Details wants {label} — that is not payment",
-            f"reply yes or confirm and I'll press {label}, then move toward add-ons",
+            nxt,
         )
 
     if sheet == "upsell":
-        label = tap or "No, Thanks"
+        choices = [str(item) for item in fills if str(item).strip()]
+        label = tap or (choices[-1] if choices else "No, Thanks")
+        if len(choices) >= 2:
+            listed = " / ".join(choices)
+            nxt = f"pick one — {listed} — and I'll tick that (default skip is {label})"
+        else:
+            nxt = f"reply yes or skip and I'll press {label}"
         return (
             f"{seller}'s paid Free Cancellation / Assured pop-up on the {which}",
             "an extra they want to sell — not payment yet",
-            f"reply yes or skip and I'll press {label}",
+            nxt,
         )
 
     if sheet == "addons":
@@ -537,6 +717,12 @@ def format_sheet_move(
         )
 
     if action == "ask" and missing:
+        if any(re.search(r"valid pincode", item, re.I) for item in missing):
+            return (
+                f"{seller} billing address for the {which}",
+                "the pin code on screen was rejected",
+                "send a valid 6-digit pin code and I'll replace it",
+            )
         fields = " and ".join(missing)
         return (
             f"the open {seller} page for the {which}",
@@ -776,6 +962,13 @@ def accept_choice(text: str, pending: dict[str, str]) -> str:
             or forward_tap(page)
             or RECOMMENDED
         )
+    if re.search(r"\bedit\b|\bexit\b", raw, re.I) and (
+        kind == "name_confirm" or re.search(r"\bedit\b", page, re.I)
+    ):
+        return (
+            ground_tap("Edit", pool, page, kind=kind or "name_confirm")
+            or safe_tap("Edit", page)
+        )
     if re.search(r"no\s*,?\s*thanks", raw, re.I):
         return (
             ground_tap("No, Thanks", pool, page, kind=kind or "upsell")
@@ -784,11 +977,42 @@ def accept_choice(text: str, pending: dict[str, str]) -> str:
             or decline_tap(page)
         )
     if re.search(r"don.?t want", raw, re.I):
-        return decline_tap(page) or RECOMMENDED
+        return (
+            next(
+                (
+                    item
+                    for item in upsell_choice_labels(page)
+                    if re.search(r"don.?t want", item, re.I)
+                ),
+                "",
+            )
+            or decline_tap(page)
+            or RECOMMENDED
+        )
+    # Assured three-way radios — Free Cancellation / Flex / don't want.
+    if kind in {"upsell", "addon_buy"} or upsell_choice_labels(page):
+        choices = upsell_choice_labels(page)
+        if re.search(r"\bflex\b|reschedul", raw, re.I):
+            hit = next((item for item in choices if re.search(r"flex", item, re.I)), "")
+            if hit:
+                return hit
+        if re.search(r"assured free|free cancellation", raw, re.I) and not re.search(
+            r"don.?t want", raw, re.I
+        ):
+            hit = next(
+                (item for item in choices if re.search(r"assured free cancellation", item, re.I)),
+                "",
+            )
+            if hit:
+                return hit
     if 2 <= len(raw) <= 80:
         hit = ground_tap(raw, pool, page, kind=kind) or safe_tap(raw, page)
         if hit:
             return hit
+        # Soft match Assured option titles from WhatsApp short replies.
+        for item in upsell_choice_labels(page):
+            if raw.lower() in item.lower() or item.lower() in raw.lower():
+                return item
     return ""
 
 
@@ -875,7 +1099,8 @@ def read_step(
     tap = safe_tap(str(data.get("tap") or ""), hay)
     if not tap and is_name_confirm(hay):
         tap = forward_tap(hay)
-        auto = True
+        auto = False
+        kind = "review"
     if kind == "upsell" and not tap:
         tap = decline_tap(hay)
         auto = False
@@ -1052,6 +1277,19 @@ def decide_front(
             "recommend": heard.get("recommend") or "reply yes to skip it",
         }
 
+    # Govt-ID Confirm/Edit always asks unless the traveller already named a tap.
+    if is_name_confirm(hay) and not raw_choice:
+        tap = (heard or {}).get("tap") or forward_tap(hay) or "Confirm"
+        return {
+            "action": "ask",
+            "tap": tap,
+            "kind": "name_confirm",
+            "what": (heard or {}).get("what") or "a name check on Review Details",
+            "why": (heard or {}).get("why") or "Confirm or Edit — that is not payment",
+            "recommend": (heard or {}).get("recommend")
+            or "reply confirm (or yes) to press Confirm, or edit / exit to press Edit",
+        }
+
     # Auto only when the model marks auto, or a known form/review forward — never blind on "other".
     if (
         heard
@@ -1074,18 +1312,36 @@ def decide_front(
             "recommend": heard.get("recommend") or f"reply yes to press {heard['tap']}",
         }
 
-    # Model off or empty: rails only. Name Confirm may auto-click; everything else asks.
+    # Model off or empty: rails only. Name Confirm asks Confirm/Edit; never auto-press.
     if is_name_confirm(hay):
         tap = ground_tap(chosen_tap or "Confirm", page=hay, kind="name_confirm") or forward_tap(hay)
-        return {"action": "click", "tap": tap, "kind": "review"}
-    if is_paid_upsell(hay):
+        if raw_choice:
+            label = (
+                ground_tap(raw_choice, page=hay, kind="name_confirm")
+                or safe_tap(raw_choice, hay)
+                or (tap if re.search(r"^(?:yes|yep|yeah|ok|okay|sure|confirm)$", raw_choice, re.I) else "")
+            )
+            if label:
+                return {"action": "click", "tap": label, "kind": "name_confirm"}
         return {
             "action": "ask",
-            "tap": decline_tap(hay),
+            "tap": tap or "Confirm",
+            "kind": "name_confirm",
+            "what": "a name check on Review Details",
+            "why": "Confirm or Edit — that is not payment",
+            "recommend": "reply confirm (or yes) to press Confirm, or edit / exit to press Edit",
+        }
+    if is_paid_upsell(hay):
+        choices = upsell_choice_labels(hay)
+        tap = decline_tap(hay) or (choices[-1] if choices else "")
+        listed = " / ".join(choices) if len(choices) >= 2 else "No, Thanks"
+        return {
+            "action": "ask",
+            "tap": tap,
             "kind": "upsell",
             "what": "a paid Free Cancellation / Assured sheet",
             "why": "an optional purchase on top of the fare",
-            "recommend": "reply yes or send No, Thanks — I will not buy Assured",
+            "recommend": f"pick one — {listed}" if len(choices) >= 2 else "reply yes or send No, Thanks — I will not buy Assured",
         }
     tap = decline_tap(hay) or forward_tap(hay)
     return {
@@ -1116,6 +1372,10 @@ def form_sheet(page: str) -> bool:
     hay = page or ""
     if addons_sheet(hay) or on_review_itinerary(hay):
         return False
+    # Ixigo Review Details with Mr/Ms checkboxes is tick→Continue work, not the
+    # contact-only "other" path. Contact Details copy on that sheet must not win.
+    if is_saved_traveller_sheet(hay) or _traveller_form_open(hay):
+        return False
     # Cleartrip "Add traveller details" still shows the saved email in the header.
     if re.search(
         r"add traveller|first & middle|first name|last name \(surname\)|adult 1",
@@ -1141,6 +1401,10 @@ def profile_slots(profile: dict) -> dict[str, str]:
         "name": str((profile or {}).get("name") or "").strip(),
         "dob": str((profile or {}).get("dob") or "").strip(),
         "pincode": pin if len(pin) == 6 else "",
+        "billing_address": str(
+            (profile or {}).get("billing_address") or (profile or {}).get("address") or ""
+        ).strip(),
+        "city": str((profile or {}).get("city") or "").strip(),
         "billing_state": str((profile or {}).get("billing_state") or "").strip(),
     }
 

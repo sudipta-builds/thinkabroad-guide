@@ -926,7 +926,11 @@ class BrowserSession:
         assert self.page is not None
         path = _shot_path()
         try:
-            self.page.screenshot(path=str(path), type="jpeg", quality=55, full_page=False, timeout=4000)
+            from app.vision_agent import capture_user_shot
+
+            got = capture_user_shot(self.page, dest=path, tag="browse")
+            if got:
+                return Path(got)
         except Exception as exc:
             logger.warning("Screenshot failed: %s", type(exc).__name__)
             return None

@@ -143,6 +143,20 @@ def handle_turn(
         "depart_until": state.get("depart_until"),
     }
     state = _recover_trip(state, prior, text)
+    if getattr(get_settings(), "guide_local", False) and re.fullmatch(
+        r"(?:reset as )?(?:a )?new user", (text or "").strip(), re.I
+    ):
+        from app.kernel_otp import release_saved_kernel
+
+        release_saved_kernel(str(state.get("kernel_session_id") or ""))
+        fresh = reset_lab_traveller(state)
+        _save(phone, fresh)
+        reply = (
+            "Cleared this lab profile. Passenger, login, and billing are gone. "
+            "The trip stays if you already picked one. Reply Ixigo to log in with a mobile and OTP. Nothing paid."
+        )
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply, emoji="🆕")
     previous_stage = str(state.get("stage") or "")
     saved_secret = _capture_private(phone, text, state)
     kind, spoken = resolve_intent(text, state, prior)
@@ -192,8 +206,7 @@ def handle_turn(
                 state.pop("chosen_tap", None)
                 if named != previous:
                     state.pop("kernel_auth_mode", None)
-            state["preferred_seller"] = named
-            state["seller"] = named
+            _commit_bookable_seller(state, named)
             state["kernel_seller"] = named
             if kind == "select":
                 kind = "book"
@@ -268,13 +281,13 @@ def handle_turn(
         raw_auth = (text or "").strip()
         seller_id = str(state.get("kernel_seller") or state.get("seller") or "cleartrip")
         from app.kernel_otp import release_saved_kernel
+        from app.turn_loop import declines_login
 
         def _commit_auth_seller(mode: str) -> None:
             """Keep the site from the guest/login ask; drop any other site's pay tab."""
             state["kernel_auth_mode"] = mode
             state["kernel_awaiting_auth_mode"] = False
-            state["seller"] = seller_id
-            state["preferred_seller"] = seller_id
+            _commit_bookable_seller(state, seller_id)
             state["kernel_seller"] = seller_id
             release_saved_kernel(str(state.get("kernel_session_id") or ""))
             state.pop("kernel_session_id", None)
@@ -286,8 +299,14 @@ def handle_turn(
             state.pop("stuck_page", None)
             state["stage"] = "booking"
 
-        if re.search(r"\bguest\b|without (?:an? )?(?:login|otp|signing)|as a guest", raw_auth, re.I):
+        if seller_id == "ixigo":
+            _commit_auth_seller("login")
+            kind = "book"
+        elif declines_login(raw_auth) or re.search(
+            r"\bguest\b|without (?:an? )?(?:login|otp|signing)|as a guest", raw_auth, re.I
+        ):
             _commit_auth_seller("guest")
+            state["chosen_tap"] = "Continue" if re.search(r"\bcontinue\b", raw_auth, re.I) else ""
             state["busy_at"] = f"{time.time():.3f}"
             _save(phone, state)
             if message_sid:
@@ -298,14 +317,13 @@ def handle_turn(
                 name="guide-browse",
                 daemon=True,
             ).start()
-            need = "4" if seller_id == "cleartrip" else "6"
             reply = (
                 f"Opening the {str(state.get('selected_hint') or 'flight')} on {_seller_label(seller_id)} as a guest. "
-                f"If a login code appears I'll ask for the {need} digits then. I'll stop before payment."
+                "I'll book that time and continue through traveller details without sign-in. I'll stop before payment."
             )
             db.add_message(phone, "assistant", reply)
             return Reply.of(reply, emoji="✈️")
-        if re.search(r"\b(?:log\s*in|sign\s*in|otp|with (?:an? )?otp|account)\b", raw_auth, re.I):
+        elif re.search(r"\b(?:log\s*in|sign\s*in|otp|with (?:an? )?otp|account)\b", raw_auth, re.I):
             _commit_auth_seller("login")
             _save(phone, state)
             # Fall through: may still need a mobile, then browse.
@@ -322,10 +340,24 @@ def handle_turn(
         national = indian_national(text)
         seller_id = str(state.get("kernel_seller") or state.get("seller") or "ixigo")
         if national and kernel_configured() and seller_id in {"ixigo", "cleartrip"}:
+            same_session = seller_id == "ixigo" and ixigo_session_for_number(state, national)
             state["login_phone"] = "+91" + national
+            if not str(state.get("phone") or "").strip():
+                state["phone"] = "+91" + national
+            state["kernel_auth_mode"] = "login"
             state["kernel_awaiting_phone"] = False
             state["seller"] = seller_id
             state["preferred_seller"] = seller_id
+            if same_session:
+                state.pop("require_otp", None)
+            else:
+                from app.kernel_otp import release_saved_kernel
+
+                release_saved_kernel(str(state.get("kernel_session_id") or ""))
+                state["require_otp"] = True
+                state.pop("kernel_logged_in", None)
+                state.pop("kernel_session_id", None)
+                state.pop("live", None)
             state["busy_at"] = f"{time.time():.3f}"
             _save(phone, state)
             if message_sid:
@@ -337,17 +369,47 @@ def handle_turn(
                 daemon=True,
             ).start()
             need = "4" if seller_id == "cleartrip" else "6"
-            reply = (
-                f"Got it. Opening {_seller_label(seller_id)} now. "
-                f"This usually takes 1–2 minutes. I'll send a screenshot of the code screen, then reply with only the {need} digits."
-            )
+            if seller_id == "ixigo" and same_session:
+                reply = (
+                    "Ixigo is already logged in with that mobile, so I won't ask for another OTP. "
+                    "I'll continue this booking. Nothing paid."
+                )
+            elif seller_id == "ixigo":
+                reply = (
+                    f"Saved that mobile. I'll type it into Ixigo. "
+                    f"When the code arrives, reply with only the {need} digits. "
+                    "After login I'll fill passenger and billing details, and if anything is missing or wrong "
+                    "I'll name it with a screenshot. Nothing paid."
+                )
+            else:
+                reply = (
+                    f"Saved that mobile. I'll type it into {_seller_label(seller_id)}. "
+                    f"When the code arrives, reply with only the {need} digits. Nothing paid."
+                )
             db.add_message(phone, "assistant", reply)
             return Reply.of(reply, emoji="🔐")
-        reply = "Send just the 10-digit mobile that should get the login code. Nothing is paid."
+        if re.search(r"\+\s*\d{1,3}|\b00\d{2}", text or ""):
+            reply = (
+                "Ixigo sends the login code only to an Indian mobile. "
+                "That country code won't get an OTP. Send 10 digits starting with 6, 7, 8, or 9. Nothing paid."
+            )
+        else:
+            reply = (
+                "Send a 10-digit Indian mobile starting with 6, 7, 8, or 9. "
+                "That is the number that gets the Ixigo OTP. Nothing is paid."
+            )
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="📱")
 
-    if should_resume_kernel_otp(state, text):
+    # Stale OTP wait must not steal a billing pin the open page rejected.
+    if (
+        _needs_billing_pin(state)
+        and re.fullmatch(r"\d{4,8}", (text or "").strip())
+        and state.get("kernel_awaiting_otp")
+    ):
+        state["kernel_awaiting_otp"] = False
+        _save(phone, state)
+    if should_resume_kernel_otp(state, text) and not _needs_billing_pin(state):
         from app.kernel_otp import resume_kernel_otp
 
         if message_sid:
@@ -363,17 +425,94 @@ def handle_turn(
             reply = "Typing that code into the login now."
             db.add_message(phone, "assistant", reply)
             return Reply.of(reply, emoji="🔐")
+        if action == "reconnect":
+            from app.kernel_otp import submit_otp
+
+            sid = str(state.get("kernel_session_id") or "")
+            code = (text or "").strip()
+
+            def _reconnect_otp() -> None:
+                result = submit_otp(session_id=sid, seller=seller_id, code=code)
+                _publish_kernel_otp_result(phone, seller_id, sid, result, secrets=[])
+
+            threading.Thread(target=_reconnect_otp, name="guide-otp-reconnect", daemon=True).start()
+            reply = "Typing that code into the login now."
+            db.add_message(phone, "assistant", reply)
+            return Reply.of(reply, emoji="🔐")
         state["kernel_awaiting_otp"] = False
         state.pop("kernel_session_id", None)
         _save(phone, state)
         reply = "The login page closed. Say the trip again and I'll request a new code. Nothing paid."
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="🔐")
+    if state.get("pin_was_rejected"):
+        state.pop("pin_was_rejected", None)
+        _save(phone, state)
+        reply = "That pin code was already rejected. Send a different 6-digit pin. Nothing paid."
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply, emoji="📝")
+    if state.get("email_was_rejected"):
+        state.pop("email_was_rejected", None)
+        _save(phone, state)
+        reply = "That email was rejected. Send a different email address. Nothing paid."
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply, emoji="📝")
+    if state.get("ixigo_awaiting_profile") or state.get("awaiting_corrections"):
+        providing = bool(
+            _EMAIL.search(text or "")
+            or _DOB.search(text or "")
+            or _GENDER.search(text or "")
+            or re.search(r"\b(?:address|addr|city|state|pin(?:\s*code)?|my name is)\b", text or "", re.I)
+            or re.fullmatch(r"\d{6}", (text or "").strip())
+            or re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}", (text or "").strip())
+        )
+        if providing:
+            seller_now = str(state.get("kernel_seller") or state.get("seller") or "")
+            reply = (
+                ixigo_profile_reply(state)
+                if seller_now == "ixigo" or state.get("ixigo_awaiting_profile")
+                else passenger_details_reply(state)
+            )
+            if reply:
+                _save(phone, state)
+                db.add_message(phone, "assistant", reply)
+                return Reply.of(reply, emoji="📝")
+            state.pop("ixigo_awaiting_profile", None)
+            state.pop("awaiting_corrections", None)
+            if seller_now == "ixigo" or ixigo_signed_in(state):
+                state["seller"] = "ixigo"
+                state["preferred_seller"] = "ixigo"
+                state["kernel_seller"] = "ixigo"
+                state["kernel_auth_mode"] = "login"
+                state["direct_checkout"] = True
+            if kernel_configured():
+                state["busy_at"] = f"{time.time():.3f}"
+                _save(phone, state)
+                if message_sid:
+                    remember_inbound(phone, message_sid)
+                threading.Thread(
+                    target=_run_browse,
+                    args=(phone, text, state.get("busy_at"), "book"),
+                    name="guide-browse",
+                    daemon=True,
+                ).start()
+                reply = (
+                    "Got those details. I'll type them in and open payment. "
+                    "If a field is still missing or wrong, I'll name it with a screenshot. Nothing charged."
+                )
+                db.add_message(phone, "assistant", reply)
+                return Reply.of(reply, emoji="✈️")
+            _save(phone, state)
     if not get_settings().gemini_api_key and not get_settings().llm_ready:
         reply = saved_secret or "Gemini isn't configured on the server, so I can't look or book yet."
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="🔐" if saved_secret else "⚠️")
-    if saved_secret and _secret_only(text) and not _paying_now(state, kind, previous_stage):
+    if (
+        saved_secret
+        and _secret_only(text)
+        and not _paying_now(state, kind, previous_stage)
+        and not _needs_billing_pin(state)
+    ):
         db.add_message(phone, "assistant", saved_secret)
         return Reply.of(saved_secret, emoji="🔐")
     if kind == "pay_self":
@@ -409,13 +548,62 @@ def handle_turn(
         clear_checkout_memory(state)
         state.pop("selected_hint", None)
         _save(phone, state)
+    step = ixigo_checkout_step(text, state)
+    if step:
+        from app.kernel_otp import kernel_configured as _kernel_ready
+
+        _arm_ixigo_payment(state, text)
+        state["kernel_auth_mode"] = "login"
+        if step == "phone":
+            state["kernel_awaiting_phone"] = True
+            state.pop("ixigo_awaiting_profile", None)
+            state.pop("busy_at", None)
+            _save(phone, state)
+            reply = (
+                "Ixigo needs a login before it can book. "
+                "Send the 10-digit mobile that should get the OTP. Nothing paid."
+            )
+            db.add_message(phone, "assistant", reply)
+            return Reply.of(reply, emoji="📱")
+        if not _kernel_ready():
+            reply = "Ixigo checkout needs the browser, and it isn't available right now. Nothing paid."
+            state.pop("busy_at", None)
+            _save(phone, state)
+            db.add_message(phone, "assistant", reply)
+            return Reply.of(reply, emoji="⚠️")
+        if step == "profile":
+            state["ixigo_awaiting_profile"] = True
+        state["busy_at"] = f"{time.time():.3f}"
+        _save(phone, state)
+        threading.Thread(
+            target=_run_browse,
+            args=(phone, text, state.get("busy_at"), "book"),
+            name="guide-browse",
+            daemon=True,
+        ).start()
+        mobile = ixigo_saved_mobile(state)
+        if step == "login" and mobile:
+            reply = (
+                f"I'll type the mobile ending {mobile[-4:]} into Ixigo and ask for the 6-digit OTP. "
+                "After login I'll fill what I have, and if anything is missing or wrong I'll name it with a screenshot. "
+                "Nothing is charged."
+            )
+        elif step == "profile":
+            reply = (
+                "You're logged in on Ixigo. I'll open the form and send a screenshot naming "
+                "any missing or wrong detail. Nothing is charged."
+            )
+        else:
+            reply = direct_checkout_ack(state)
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply, emoji="✈️")
     if _asks_for_filled_form(text) and state.get("origin") and state.get("destination"):
         state["seller"] = "ixigo"
         state["preferred_seller"] = "ixigo"
         state["kernel_seller"] = "ixigo"
         state["notes"] = [note for note in (state.get("notes") or []) if "not usable" not in str(note).lower()]
-        reply = _form_status_reply(state)
-        if passenger_gaps(state) or not kernel_configured():
+        reply = ixigo_profile_reply(state) or _form_status_reply(state)
+        if ixigo_checkout_gaps(state) or not kernel_configured():
             state.pop("busy_at", None)
             _save(phone, state)
             db.add_message(phone, "assistant", reply)
@@ -428,6 +616,46 @@ def handle_turn(
             name="guide-browse",
             daemon=True,
         ).start()
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply, emoji="✈️")
+    if _quote_time_after_search(text, state) and not state.get("book_quotes_busy"):
+        from app.kernel_otp import kernel_configured, release_saved_kernel
+
+        hint = _flight_hint(text)
+        release_saved_kernel(str(state.get("kernel_session_id") or ""))
+        state.pop("direct_checkout", None)
+        state.pop("kernel_session_id", None)
+        state.pop("kernel_seller", None)
+        state.pop("live", None)
+        state.pop("stuck_kind", None)
+        state.pop("stuck_page", None)
+        state.pop("chosen_tap", None)
+        state["seller"] = "google"
+        state["awaiting_book_site"] = True
+        state["selected_hint"] = hint
+        state["stage"] = "results"
+        state["busy_at"] = f"{time.time():.3f}"
+        if kernel_configured():
+            state["book_quotes_busy"] = True
+            _save(phone, state)
+            threading.Thread(
+                target=_publish_book_quotes,
+                args=(phone, [], state.get("busy_at")),
+                kwargs={"hint": hint},
+                name="book-quotes",
+                daemon=True,
+            ).start()
+            reply = (
+                f"Noted {hint}. Checking Cleartrip, Ixigo, and EaseMyTrip for that flight — "
+                "I'll send those prices and which site is cheapest. Nothing paid."
+            )
+        else:
+            state.pop("busy_at", None)
+            _save(phone, state)
+            reply = (
+                f"Noted {hint}. I can't open Cleartrip, Ixigo, and EaseMyTrip from here. "
+                "Reply Ixigo, Cleartrip, or EaseMyTrip and I'll book that flight there. Nothing paid."
+            )
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="✈️")
     if _hold_live(state, text, busy=busy, changed=changed):
@@ -549,14 +777,38 @@ def handle_turn(
                 "form",
             }
             has_saved = bool(
-                state.get("email") or state.get("phone") or state.get("name") or state.get("dob") or state.get("gender")
+                state.get("email")
+                or state.get("phone")
+                or state.get("name")
+                or state.get("dob")
+                or state.get("gender")
+                or state.get("pincode")
+                or state.get("billing_address")
+                or state.get("city")
+                or state.get("billing_state")
             )
             if live_open and has_saved:
-                state["chosen_tap"] = tap or "Continue"
+                if re.fullmatch(r"\d{6}", (text or "").strip()) and _needs_billing_pin(state):
+                    state["chosen_tap"] = "Continue"
+                else:
+                    state["chosen_tap"] = tap or "Continue"
                 state.pop("stuck_kind", None)
+                if _defer_live_browse(state):
+                    state["pending_tap"] = state["chosen_tap"]
+                    state["pending_text"] = (text or "")[:200]
+                    _save(phone, state)
+                    logger.info("browse queued tap=%s while checkout is in flight", state["pending_tap"])
+                    spoken = (
+                        f"Still on the open {_seller_label(str(state.get('seller') or 'ixigo'))} page. "
+                        f"I'll press {state['pending_tap']} when this step finishes and send what the page shows. "
+                        "Nothing paid."
+                    )
+                    db.add_message(phone, "assistant", spoken)
+                    return Reply.of(spoken, emoji="✈️")
                 spoken = _details_action_ack(state, text)
                 state["busy_at"] = f"{time.time():.3f}"
                 _save(phone, state)
+                logger.info("browse start kind=details tap=%s", state.get("chosen_tap"))
                 threading.Thread(
                     target=_run_browse,
                     args=(phone, text, state.get("busy_at"), "details"),
@@ -592,47 +844,53 @@ def handle_turn(
             _save(phone, state)
         elif tap in {"__delete_traveller__", "__remove_traveller__"}:
             pass
+    if wants_direct_ixigo_checkout(text, state):
+        _arm_direct_ixigo_checkout(state, text)
+        _save(phone, state)
     cached = _cached_fares_reply(state, text, kind)
     if cached and do not in {"search", "book"}:
         db.add_message(phone, "assistant", cached)
         return Reply.of(cached, emoji="✈️")
-    # After Google: note the clock; start site quotes only once a time is chosen — never default Cleartrip.
-    if kind in _BOOKING and _needs_book_site_choice(state, text):
-        hint = _flight_hint(text) or str(state.get("selected_hint") or "")
-        if hint:
+    # After Google: note the clock only when this message names a time — never an old hint.
+    if kind in _BOOKING and not state.get("direct_checkout") and _needs_book_site_choice(state, text):
+        said_time = _flight_hint(text)
+        if not said_time:
+            state.pop("selected_hint", None)
+            kind = "search"
+        else:
+            hint = said_time
             state["selected_hint"] = hint
-        state["stage"] = "results"
-        state.pop("busy_at", None)
-        # First clock after Google: kick Cleartrip/Ixigo/EMT quotes for that time (not the bot's guess).
-        start_quotes = bool(
-            hint
-            and state.get("awaiting_book_site")
-            and not state.get("book_quotes")
-            and not state.get("book_quotes_busy")
-        )
-        if start_quotes:
-            from app.kernel_otp import kernel_configured
+            state["stage"] = "results"
+            state.pop("busy_at", None)
+            start_quotes = bool(
+                hint
+                and state.get("awaiting_book_site")
+                and not state.get("book_quotes")
+                and not state.get("book_quotes_busy")
+            )
+            if start_quotes:
+                from app.kernel_otp import kernel_configured
 
-            if kernel_configured():
-                state["book_quotes_busy"] = True
-                _save(phone, state)
-                threading.Thread(
-                    target=_publish_book_quotes,
-                    args=(phone, [], None),
-                    kwargs={"hint": hint},
-                    name="book-quotes",
-                    daemon=True,
-                ).start()
-                reply = (
-                    f"Noted {hint}. Checking Cleartrip, Ixigo, and EaseMyTrip for that flight — "
-                    "I'll ask which site to book once those prices are in. Nothing paid."
-                )
-                db.add_message(phone, "assistant", reply)
-                return Reply.of(reply, emoji="✈️")
-        _save(phone, state)
-        reply = _book_site_choice_reply(state, text)
-        db.add_message(phone, "assistant", reply)
-        return Reply.of(reply, emoji="✈️")
+                if kernel_configured():
+                    state["book_quotes_busy"] = True
+                    _save(phone, state)
+                    threading.Thread(
+                        target=_publish_book_quotes,
+                        args=(phone, [], None),
+                        kwargs={"hint": hint},
+                        name="book-quotes",
+                        daemon=True,
+                    ).start()
+                    reply = (
+                        f"Noted {hint}. Checking Cleartrip, Ixigo, and EaseMyTrip for that flight — "
+                        "I'll ask which site to book once those prices are in. Nothing paid."
+                    )
+                    db.add_message(phone, "assistant", reply)
+                    return Reply.of(reply, emoji="✈️")
+            _save(phone, state)
+            reply = _book_site_choice_reply(state, text)
+            db.add_message(phone, "assistant", reply)
+            return Reply.of(reply, emoji="✈️")
     if kind in _BOOKING and _should_browse(state, text, busy=busy, changed=changed):
         from app.kernel_otp import kernel_configured
 
@@ -642,17 +900,28 @@ def handle_turn(
             reply = "Chromium isn't installed on the server yet, so I can't open the booking page."
             db.add_message(phone, "assistant", reply)
             return Reply.of(reply, emoji="⚠️")
-        state["seller"] = book_seller
-        state["preferred_seller"] = book_seller
+        _commit_bookable_seller(state, book_seller)
         if kernel_book and not state.get("kernel_seller"):
             state["kernel_seller"] = book_seller
         if kernel_book:
             from app.kernel_otp import indian_national, login_phone_for
 
             chosen = str(state.get("selected_hint") or "").strip()
+            if book_seller == "ixigo":
+                sent = indian_national(text) or indian_national(
+                    str(state.get("login_phone") or state.get("phone") or "")
+                )
+                if sent and not ixigo_session_for_number(state, sent):
+                    state["require_otp"] = True
+                    state["kernel_auth_mode"] = "login"
+                    state.pop("kernel_logged_in", None)
+                    state["login_phone"] = "+91" + sent
             signed_in = str(state.get("kernel_logged_in") or "") == book_seller
             auth_mode = str(state.get("kernel_auth_mode") or "").strip().lower()
-            # Guest can book without OTP. Login needs a mobile. Ask once when neither is chosen.
+            if book_seller == "ixigo" and not signed_in:
+                state["kernel_auth_mode"] = "login"
+                auth_mode = "login"
+            # Cleartrip can book as a guest. Ixigo always logs in. Ask once when neither is chosen.
             if chosen and not signed_in and auth_mode not in {"guest", "login"}:
                 state["kernel_awaiting_auth_mode"] = True
                 state["kernel_seller"] = book_seller
@@ -667,9 +936,18 @@ def handle_turn(
                 db.add_message(phone, "assistant", reply)
                 return Reply.of(reply, emoji="📱")
             if chosen and not signed_in and auth_mode == "login":
-                login = login_phone_for(phone, str(state.get("login_phone") or state.get("phone") or ""))
-                if not login and indian_national(text):
-                    login = "+91" + indian_national(text)
+                if book_seller == "ixigo":
+                    login = ixigo_saved_mobile(state)
+                    if (
+                        not login
+                        and indian_national(text)
+                        and not re.fullmatch(r"ixigo\??", (text or "").strip(), re.I)
+                    ):
+                        login = "+91" + indian_national(text)
+                else:
+                    login = login_phone_for(phone, str(state.get("login_phone") or state.get("phone") or ""))
+                    if not login and indian_national(text):
+                        login = "+91" + indian_national(text)
                 if not login:
                     state["kernel_awaiting_phone"] = True
                     state["kernel_seller"] = book_seller
@@ -695,8 +973,21 @@ def handle_turn(
                 release_saved_kernel(str(state.get("kernel_session_id") or ""))
                 state.pop("kernel_session_id", None)
                 state.pop("live", None)
+        if _defer_live_browse(state):
+            queued = tap or str(state.get("chosen_tap") or "Continue")
+            state["pending_tap"] = queued
+            state["pending_text"] = (text or "")[:200]
+            _save(phone, state)
+            logger.info("browse queued tap=%s while checkout is in flight", queued)
+            reply = (
+                f"Still on the open {_seller_label(str(state.get('seller') or 'ixigo'))} page. "
+                f"I'll press {queued} when this step finishes and send what the page shows. Nothing paid."
+            )
+            db.add_message(phone, "assistant", reply)
+            return Reply.of(reply, emoji="✈️")
         state["busy_at"] = f"{time.time():.3f}"
         _save(phone, state)
+        logger.info("browse start kind=%s tap=%s", kind, state.get("chosen_tap"))
         threading.Thread(
             target=_run_browse,
             args=(phone, text, state.get("busy_at"), kind),
@@ -755,6 +1046,8 @@ def handle_turn(
             reply = canned or _usable_reply(state, spoken, _booking_ack(state, kind, text))
         else:
             reply = _usable_reply(state, spoken, _booking_ack(state, kind, text))
+        if state.get("direct_checkout"):
+            reply = direct_checkout_ack(state)
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="✈️")
     if (
@@ -795,7 +1088,16 @@ def handle_turn(
             )
             db.add_message(phone, "assistant", reply)
             return Reply.of(reply, emoji="✈️")
-    if _should_browse(state, text, busy=busy, changed=changed) and _direct_results(state, text) and chromium_ready():
+    from app.intent import parse_updates
+
+    new_route = bool(parse_updates(text).get("origin") and parse_updates(text).get("destination"))
+    if (
+        kind != "search"
+        and not new_route
+        and _should_browse(state, text, busy=busy, changed=changed)
+        and _direct_results(state, text)
+        and chromium_ready()
+    ):
         state["busy_at"] = f"{time.time():.3f}"
         _save(phone, state)
         threading.Thread(
@@ -809,6 +1111,19 @@ def handle_turn(
         return Reply.of(reply, emoji="✈️")
     if kind == "search":
         if state.get("origin") and state.get("destination") and state.get("depart") and chromium_ready():
+            from app.kernel_otp import release_saved_kernel
+
+            release_saved_kernel(str(state.get("kernel_session_id") or ""))
+            state.pop("kernel_session_id", None)
+            state.pop("stuck_kind", None)
+            state.pop("stuck_page", None)
+            state.pop("selected_hint", None)
+            state.pop("last_vision", None)
+            state.pop("kernel_awaiting_otp", None)
+            state.pop("kernel_awaiting_phone", None)
+            state.pop("kernel_awaiting_auth_mode", None)
+            state["seller"] = "google"
+            state["stage"] = "results"
             state["busy_at"] = f"{time.time():.3f}"
             _save(phone, state)
             threading.Thread(
@@ -817,7 +1132,7 @@ def handle_turn(
                 name="guide-browse",
                 daemon=True,
             ).start()
-            reply = _usable_reply(state, spoken, _search_ack(state, text))
+            reply = _search_ack(state, text)
             db.add_message(phone, "assistant", reply)
             return Reply.of(reply, emoji="✈️")
         reply = _usable_reply(state, spoken, "Where are you flying from and to?")
@@ -873,10 +1188,15 @@ def start_price_watch() -> None:
 
 def _recover_trip(state: dict[str, Any], prior: list[dict[str, Any]], text: str) -> dict[str, Any]:
     data = dict(state)
+    reset_at = str(state.get("profile_reset_at") or "")
     for item in prior:
-        if item.get("role") == "user":
-            data = absorb_trip(data, str(item.get("body") or ""))
-            data = absorb_details(data, str(item.get("body") or ""))
+        if item.get("role") != "user":
+            continue
+        # New user wipes the profile. Older chat must not put that mobile back.
+        if reset_at and str(item.get("created_at") or "") <= reset_at:
+            continue
+        data = absorb_trip(data, str(item.get("body") or ""))
+        data = absorb_details(data, str(item.get("body") or ""))
     return absorb_details(absorb_trip(data, text), text)
 
 
@@ -921,7 +1241,9 @@ def wants_pick_saved_traveller(text: str) -> bool:
             r"|\b(?:traveller|traveler)\s+as\b"
             r"|\bpick one\b|\bthat one\b|\bone of the names\b|\bsaved (?:traveller|traveler|profile)\b"
             r"|\bexisting (?:traveller|traveler)\b|\bany of (?:the|those) names\b|\buse (?:the |a )?saved\b"
-            r"|\banyone (?:of them|listed)\b",
+            r"|\banyone (?:of them|listed)\b"
+            # "pick Mr Sudipta Saikia" / "tick Ms Priya" — title + name, no "traveller" word.
+            r"|\b(?:pick|select\w*|tick|choose|use)\s+(?:mr|ms|mrs|mx)\.?\s+[a-z]",
             raw,
             re.I,
         )
@@ -942,6 +1264,7 @@ def traveller_name_from_ask(text: str) -> str:
         return ""
     name = next((g for g in match.groups() if g), "")
     name = re.sub(r"\b(?:traveller|traveler|profile|please|thanks)\b", " ", name, flags=re.I)
+    name = re.sub(r"^(?:mr|ms|mrs|mx)\.?\s+", "", name, flags=re.I)
     name = re.sub(r"\s+", " ", name).strip(" .")
     if len(name) < 3 or re.fullmatch(r"one|it|that|this|him|her", name, re.I):
         return ""
@@ -1000,9 +1323,20 @@ def extract_user_ask(text: str, state: dict[str, Any]) -> dict[str, str]:
     if pending:
         page = str(pending.get("page") or "")
     page = page or str(state.get("stuck_page") or "")
-    if re.search(r"\bcontinue\b", raw, re.I) and str(state.get("stuck_kind") or "") != "addon_buy":
+    # "Continue without add-ons" is skip, not the review Continue button.
+    if (
+        re.search(r"\bcontinue\b|\bgo on\b", raw, re.I)
+        and not re.search(r"continue without", raw, re.I)
+        and str(state.get("stuck_kind") or "") != "addon_buy"
+    ):
         out["intent"] = "book"
         out["goal"] = "forward"
+        # Login drawer: Continue is disabled until the mobile is typed — do not mash that button.
+        if str(state.get("stuck_kind") or "") == "login" or re.search(
+            r"log in to ixigo|enter mobile number", page, re.I
+        ):
+            out["tap"] = ""
+            return out
         out["tap"] = "Continue"
         return out
     if re.fullmatch(
@@ -1031,9 +1365,24 @@ def extract_user_ask(text: str, state: dict[str, Any]) -> dict[str, str]:
     if re.fullmatch(r"confirm", raw, re.I):
         out["tap"] = safe_tap("Confirm", page) or "Confirm"
         out["intent"] = "book"
-    if re.search(r"\bno,?\s*thanks\b|\bskip(?:\s+it)?\b|\bdon'?t want\b", raw, re.I):
+    if re.search(
+        r"\bno,?\s*thanks\b|\bskip(?:\s+it)?\b|\bdon'?t want\b|"
+        r"skip to payment|continue without add|don'?t want (?:seats?|meals?|add-?ons?)",
+        raw,
+        re.I,
+    ):
         out["intent"] = "book"
         out["goal"] = "skip"
+        if re.search(r"skip to payment|go (?:to |on to )?payment", raw, re.I):
+            # Prefer the Ixigo control label when it is on the stuck page.
+            if re.search(r"skip to payment", page, re.I):
+                out["tap"] = safe_tap("Skip to Payment", page) or "Skip to Payment"
+            else:
+                out["tap"] = out["tap"] or "Skip to Payment"
+        elif re.search(r"skip add|continue without add", raw, re.I):
+            out["tap"] = out["tap"] or (
+                safe_tap("Skip add-ons", page) or "Skip add-ons"
+            )
     return out
 
 
@@ -1067,6 +1416,9 @@ def infer_intent(state: dict[str, Any], text: str) -> str:
         return "pay_self"
     if looks_like_card(raw) or _card_digits(raw) or _UPI.search(raw) or re.search(r"\b(upi|cvv|cvc)\b", raw, re.I):
         return "pay"
+    if re.fullmatch(r"\d{6}", raw) and _needs_billing_pin(state):
+        # Same Review Details page — type the new pin and Continue. Do not restart search.
+        return "details"
     if re.fullmatch(r"\d{4,8}", raw) and state.get("stage") in {"payment", "booking"}:
         return "pay"
     if re.search(r"\b(log ?in|sign ?in|password)\b", raw, re.I):
@@ -1166,11 +1518,26 @@ def _merge_intent(local: str, model: str, text: str, state: dict[str, Any]) -> s
         return local
     if local == "login" and re.search(r"log ?in|sign ?in|password", text or "", re.I):
         return local
+    if local == "details" and re.fullmatch(r"\d{6}", (text or "").strip()) and _needs_billing_pin(state):
+        return "details"
     passenger = bool(_EMAIL.search(text or "") or _DOB.search(text or "") or _GENDER.search(text or ""))
     booking = str(state.get("stage") or "") in {"booking", "passenger", "login", "payment", "results", "review"}
     if passenger and booking and "details" in {local, model}:
         return "details"
     return model
+
+
+def ixigo_name_is_direct_book(text: str, state: dict[str, Any]) -> bool:
+    """Bare 'Ixigo' opens payment only when this traveller is already logged in and complete."""
+    return ixigo_checkout_step(text, state) == "pay"
+
+
+def _arm_ixigo_payment(state: dict[str, Any], text: str) -> None:
+    """Start Ixigo checkout and keep the departure already chosen, such as 10:45."""
+    kept = str(state.get("selected_hint") or "")
+    _arm_direct_ixigo_checkout(state, text)
+    if kept and not state.get("selected_hint"):
+        state["selected_hint"] = kept
 
 
 def _asks_for_filled_form(text: str) -> bool:
@@ -1245,7 +1612,9 @@ def _trivial_mid_booking_yes(text: str, asked: dict[str, str]) -> bool:
     if asked.get("tap") in {"__select_traveller__", "__delete_traveller__"}:
         return True
     if re.fullmatch(
-        r"yes|yep|yeah|ok|okay|sure|decline|skip|skip add-ons|skip addons|no thanks|no, thanks|confirm|continue",
+        r"yes|yep|yeah|ok|okay|sure|decline|skip|skip add-ons|skip addons|"
+        r"skip to payment|skip add-?ons?|continue without add-?ons?|"
+        r"i don'?t want seats?(?: or meals?)?|no thanks|no, thanks|confirm|continue",
         raw,
         re.I,
     ):
@@ -1276,12 +1645,53 @@ def resolve_intent(text: str, state: dict[str, Any], prior: list[dict[str, Any]]
             return "I'll remove one saved traveller profile. Nothing paid."
         if asked.get("tap"):
             return f"I'll press {asked['tap']} on the open page. Nothing paid."
+        if asked.get("goal") == "forward" and (
+            str(state.get("stuck_kind") or "") == "login"
+            or re.search(r"log in to ixigo|enter mobile number", str(state.get("stuck_page") or ""), re.I)
+        ):
+            from app.kernel_otp import indian_national
+
+            saved = indian_national(str(state.get("login_phone") or state.get("phone") or ""))
+            if saved:
+                return (
+                    f"I'll type the saved mobile ending {saved[-4:]} into the login, "
+                    "then ask you for the OTP. Nothing paid."
+                )
         if asked.get("goal") == "skip":
             if not state.get("chosen_tap") and _mid_booking(state):
-                from app.step_read import decline_tap
+                from app.step_read import decline_tap, upsell_choice_labels
 
-                state["chosen_tap"] = decline_tap(str(state.get("stuck_page") or "")) or "Skip add-ons"
-            return "I'll skip the paid extra and keep your traveller selected. Nothing paid."
+                page = str(state.get("stuck_page") or "")
+                choices = upsell_choice_labels(page)
+                decline = next(
+                    (
+                        item
+                        for item in choices
+                        if re.search(r"don.?t want|no,?\s*thanks|without assured", item, re.I)
+                    ),
+                    "",
+                )
+                # Prefer Without Assured when Assured UI is (or was) on the page — Skip add-ons
+                # does not select the comparison card, so Continue stays on Review.
+                if re.search(r"skip to payment|seat map|meal selection|choose add-ons", page, re.I):
+                    state["chosen_tap"] = (
+                        asked.get("tap")
+                        or ("Skip to Payment" if re.search(r"skip to payment", page, re.I) else "")
+                        or decline_tap(page)
+                        or "Skip add-ons"
+                    )
+                elif re.search(
+                    r"with assured|without assured|assured free|secure my trip|free cancellation",
+                    page,
+                    re.I,
+                ):
+                    state["chosen_tap"] = decline or "Without Assured"
+                else:
+                    state["chosen_tap"] = decline or decline_tap(page) or "Skip add-ons"
+            tap_now = str(state.get("chosen_tap") or asked.get("tap") or "")
+            if re.search(r"skip to payment", tap_now, re.I):
+                return "I'll skip to payment and stop before paying. Nothing paid."
+            return "I'll skip the paid extra, press Continue, and keep going. Nothing paid."
         if asked.get("goal") == "forward":
             return "I'll move the booking forward and stop before payment."
         return ""
@@ -1366,9 +1776,37 @@ def resolve_intent(text: str, state: dict[str, Any], prior: list[dict[str, Any]]
         page = page or str(state.get("stuck_page") or "")
         _apply_understood_tap(state, wanted, page=page)
     if asked.get("goal") == "skip" and _mid_booking(state) and not state.get("chosen_tap"):
-        from app.step_read import decline_tap
+        from app.step_read import decline_tap, upsell_choice_labels
 
-        state["chosen_tap"] = decline_tap(str(state.get("stuck_page") or "")) or "Skip add-ons"
+        page = str(state.get("stuck_page") or "")
+        choices = upsell_choice_labels(page)
+        decline = next(
+            (
+                item
+                for item in choices
+                if re.search(r"don.?t want|no,?\s*thanks|without assured", item, re.I)
+            ),
+            "",
+        )
+        if re.search(r"skip to payment", page, re.I) or re.search(
+            r"skip to payment|seat map|meal selection|choose add-ons|add seats",
+            page,
+            re.I,
+        ):
+            state["chosen_tap"] = (
+                asked.get("tap")
+                or ("Skip to Payment" if re.search(r"skip to payment", page, re.I) else "")
+                or decline_tap(page)
+                or "Skip add-ons"
+            )
+        elif re.search(
+            r"with assured|without assured|assured free|secure my trip|free cancellation",
+            page,
+            re.I,
+        ):
+            state["chosen_tap"] = decline or "Without Assured"
+        else:
+            state["chosen_tap"] = decline or decline_tap(page) or "Skip add-ons"
     if not spoken and asked.get("tap"):
         if asked["tap"] == "__select_traveller__":
             who = str(state.get("name") or "").strip()
@@ -1442,6 +1880,26 @@ def _secret_only(text: str) -> bool:
     return False
 
 
+def _needs_billing_pin(state: dict[str, Any]) -> bool:
+    """Open checkout is asking for a pin code — not a login/payment OTP."""
+    page = str(state.get("stuck_page") or "")
+    vision = state.get("last_vision") if isinstance(state.get("last_vision"), dict) else {}
+    bits = [
+        page,
+        " ".join(str(x) for x in (vision.get("errors") or [])),
+        " ".join(str(x) for x in (vision.get("fields") or [])),
+        str(state.get("last_stuck") or ""),
+    ]
+    hay = " ".join(bits)
+    return bool(
+        re.search(
+            r"valid pin\s*code|valid pincode|billing address|\bpincode\b|pin code",
+            hay,
+            re.I,
+        )
+    )
+
+
 def _capture_private(phone: str, text: str, state: dict[str, Any]) -> str:
     """Save UPI and card in the vault. Hold CVV and OTP only for this turn."""
     raw = text or ""
@@ -1464,7 +1922,14 @@ def _capture_private(phone: str, text: str, state: dict[str, Any]) -> str:
     if cvv:
         private["cvv"] = cvv.group(1)
         notes.append("I'll use that CVV once on the payment page. It is not saved.")
-    if re.fullmatch(r"\d{4,8}", raw.strip()) and state.get("stage") in {"payment", "booking", "login", "passenger", "results"}:
+    digits_only = bool(re.fullmatch(r"\d{4,8}", raw.strip()))
+    # Billing pin (6 digits on a pin/Billing ask) must not be held as a login OTP.
+    if digits_only and _needs_billing_pin(state):
+        pass
+    elif digits_only and (
+        state.get("kernel_awaiting_otp")
+        or state.get("stage") in {"payment", "login"}
+    ):
         private["otp"] = raw.strip()
         notes.append("I'll type that OTP once. It is not saved.")
     if private:
@@ -1574,6 +2039,59 @@ def _booking_seller_id(state: dict[str, Any], text: str = "") -> str:
     return fulfillment_seller(preferred, named)
 
 
+def _checkout_owns_turn(state: dict[str, Any], text: str = "") -> bool:
+    """Open bookable sheet / forward Continue|Confirm owns the turn over Google site quotes."""
+    from app.search import seller_can_book
+
+    live_seller = str(state.get("seller") or state.get("kernel_seller") or "")
+    on_sheet = bool(
+        state.get("kernel_seller")
+        or state.get("kernel_session_id")
+        or state.get("live")
+        or state.get("stuck_kind")
+        or state.get("stuck_page")
+        or resume_booking_url(state, text)
+        or str(state.get("stage") or "")
+        in {"booking", "review", "passenger", "login", "addons", "payment"}
+    )
+    if live_seller and seller_can_book(live_seller) and on_sheet:
+        return True
+    tap = str(state.get("chosen_tap") or "").strip()
+    if on_sheet and tap and re.search(r"continue|confirm|skip", tap, re.I):
+        return True
+    return False
+
+
+def _commit_bookable_seller(state: dict[str, Any], seller_id: str) -> None:
+    """Lock a bookable site and drop the Google 'which site?' quote gate."""
+    if not seller_id:
+        return
+    state["seller"] = seller_id
+    state["preferred_seller"] = seller_id
+    state.pop("awaiting_book_site", None)
+    state.pop("book_quotes_busy", None)
+
+
+def _quote_time_after_search(text: str, state: dict[str, Any]) -> bool:
+    """A clock after Google Flights should price Cleartrip, Ixigo, and EaseMyTrip."""
+    from app.search import NOT_BOOKABLE, named_seller, seller_can_book
+
+    if not _flight_hint(text):
+        return False
+    named = named_seller(text)
+    if named and seller_can_book(named):
+        return False
+    if re.search(r"\bbook\b", text or "", re.I) and named == "ixigo":
+        return False
+    seller = str(state.get("seller") or "")
+    return bool(
+        state.get("origin")
+        and state.get("destination")
+        and state.get("depart")
+        and (state.get("awaiting_book_site") or seller in NOT_BOOKABLE or seller in {"google", "kayak", ""})
+    )
+
+
 def _needs_book_site_choice(state: dict[str, Any], text: str = "") -> bool:
     """After Google, a bare time must not open Cleartrip until the traveller picks a site."""
     from app.search import NOT_BOOKABLE, seller_can_book
@@ -1581,18 +2099,9 @@ def _needs_book_site_choice(state: dict[str, Any], text: str = "") -> bool:
     named = named_seller_from(text)
     if named and seller_can_book(named):
         return False
-    # Already mid-checkout on a bookable Kernel/Chromium sheet.
-    if state.get("kernel_seller") or str(state.get("stage") or "") in {
-        "booking",
-        "review",
-        "passenger",
-        "login",
-        "addons",
-        "payment",
-    }:
-        live_seller = str(state.get("seller") or "")
-        if live_seller and seller_can_book(live_seller) and not state.get("awaiting_book_site"):
-            return False
+    # Live Ixigo/Cleartrip sheet (or Continue/Confirm on it) beats stale awaiting_book_site.
+    if _checkout_owns_turn(state, text):
+        return False
     if state.get("awaiting_book_site"):
         return True
     if state.get("book_site_ready") and state.get("preferred_seller"):
@@ -1607,8 +2116,9 @@ def _needs_book_site_choice(state: dict[str, Any], text: str = "") -> bool:
 
 def _book_site_choice_reply(state: dict[str, Any], text: str = "") -> str:
     """Note the clock; ask which bookable site. Never start Cleartrip here."""
-    hint = str(state.get("selected_hint") or _flight_hint(text) or "").strip()
-    noted = f"Noted {hint}. " if hint else ""
+    said = str(_flight_hint(text) or "").strip()
+    hint = said or str(state.get("selected_hint") or "").strip()
+    noted = f"Noted {said}. " if said else ""
     if state.get("awaiting_book_site"):
         if state.get("book_quotes_busy"):
             return (
@@ -1669,6 +2179,13 @@ def _details_action_ack(state: dict[str, Any], text: str = "") -> str:
     from app.kernel_otp import indian_national
 
     if indian_national(raw) or re.search(r"\b(?:mobile|phone)\b", raw, re.I):
+        if str(state.get("seller") or state.get("kernel_seller") or "").lower() == "ixigo" and not ixigo_session_for_number(
+            state, indian_national(raw)
+        ):
+            return (
+                "I'll open Log in/Sign up on Ixigo, type that mobile, and ask you for the 6-digit OTP. "
+                "Nothing paid."
+            )
         return (
             f"Typing your mobile into {seller} contact. "
             "I won't Continue until that field sticks. Nothing paid."
@@ -1729,6 +2246,12 @@ def resume_booking_url(state: dict[str, Any], text: str = "") -> str:
     url = str(live.get("url") or "")
     seller = str(state.get("kernel_seller") or state.get("seller") or state.get("preferred_seller") or "")
     if not is_resume_booking_url(url, seller):
+        return ""
+    # Fare-list ask ("reply go on and I'll Book the 1:15") must not reopen a leftover Review.
+    if str(state.get("stuck_kind") or "") == "results":
+        return ""
+    tap = str(state.get("chosen_tap") or state.get("pending_tap") or "").strip()
+    if re.fullmatch(r"book", tap, re.I):
         return ""
     stage = str(state.get("stage") or live.get("stage") or "")
     if stage not in {"booking", "review", "passenger", "payment", "login", "addons"}:
@@ -1920,12 +2443,28 @@ def _search_ack(state: dict[str, Any], text: str = "") -> str:
     return f"Checking Google Flights for {trip}. One page, then the fares and a screenshot."
 
 
+def _defer_live_browse(state: dict[str, Any]) -> bool:
+    """A checkout already holds the browser. Queue the new tap; do not start another."""
+    return _busy(state) and _LOCK.locked()
+
+
 def _hold_live(state: dict[str, Any], text: str, *, busy: bool, changed: bool) -> bool:
     """A running search stays up. A new route, or a request for the Ixigo form, replaces it."""
     if _asks_for_filled_form(text) or named_seller_from(text) == "ixigo":
         return False
-    # Time pick while site prices are still loading — answer with the site-choice line, don't soft-hold.
-    if state.get("awaiting_book_site") and infer_intent(state, text) in {"select", "book"}:
+    if state.get("book_quotes_busy") and _flight_hint(text):
+        return True
+    if _quote_time_after_search(text, state):
+        return False
+    # Continue/Confirm on an open bookable sheet — act, don't soft-hold.
+    if _checkout_owns_turn(state, text) and infer_intent(state, text) == "book":
+        return False
+    # Bare clock while site quotes load — answer with the site-choice line, don't soft-hold.
+    if (
+        state.get("awaiting_book_site")
+        and infer_intent(state, text) in {"select", "book"}
+        and (_flight_hint(text) or infer_intent(state, text) == "select")
+    ):
         return False
     if not busy or changed:
         return False
@@ -1934,7 +2473,13 @@ def _hold_live(state: dict[str, Any], text: str, *, busy: bool, changed: bool) -
 
 def _live_hold_reply(state: dict[str, Any], text: str) -> str:
     trip = _trip_line(state) or "that trip"
-    hint = str(state.get("selected_hint") or "")
+    hint = _flight_hint(text) or str(state.get("selected_hint") or "")
+    if state.get("book_quotes_busy"):
+        noted = f" for the {hint}" if hint else ""
+        return (
+            f"Still checking Cleartrip, Ixigo, and EaseMyTrip{noted}. "
+            "I'll send those prices when they load. Nothing paid."
+        )
     noted = f" I noted {hint}." if hint and infer_intent(state, text) in {"select", "book"} else ""
     return f"Still checking {trip}. First fares and a screenshot in a few seconds. I won't start over.{noted}"
 
@@ -2236,7 +2781,20 @@ def absorb_details(state: dict[str, Any], text: str) -> dict[str, Any]:
     raw = text or ""
     email = _EMAIL.search(raw)
     if email:
-        data["email"] = email.group(0)
+        addr = email.group(0)
+        # Common TLD fat-fingers next to .com (gmail.vom / yahoo.con).
+        addr = re.sub(
+            r"@(gmail|googlemail|yahoo|outlook|hotmail|icloud)\.(vom|con|cpm|comm)\b",
+            r"@\1.com",
+            addr,
+            flags=re.I,
+        )
+        if addr.lower() == str(data.get("rejected_email") or "").strip().lower():
+            data["email_was_rejected"] = True
+        else:
+            data["email"] = addr
+            data.pop("rejected_email", None)
+            data.pop("email_was_rejected", None)
     dob = _DOB.search(raw)
     if dob:
         day, month, year = (int(dob.group(i)) for i in (1, 2, 3))
@@ -2248,13 +2806,21 @@ def absorb_details(state: dict[str, Any], text: str) -> dict[str, Any]:
     if name:
         data["name"] = name.group(1).strip(" .")
     else:
-        leftover = _GENDER.sub(" ", _DOB.sub(" ", _EMAIL.sub(" ", raw)))
-        leftover = re.sub(r"[,;|/]+", " ", leftover)
-        leftover = re.sub(r"\s+", " ", leftover).strip(" .")
-        if re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}", leftover):
-            data["name"] = leftover
-        elif re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}", raw.strip()):
-            data["name"] = raw.strip()
+        head = re.split(r"[,;|]", _EMAIL.sub(" ", raw), maxsplit=1)[0]
+        head = _DOB.sub(" ", head)
+        head = _GENDER.sub(" ", head)
+        words = re.findall(r"[A-Za-z]{2,}", head)
+        if 2 <= len(words) <= 4:
+            data["name"] = " ".join(word.title() for word in words)
+        else:
+            leftover = _GENDER.sub(" ", _DOB.sub(" ", _EMAIL.sub(" ", raw)))
+            leftover = re.sub(r"[,;|/]+", " ", leftover)
+            leftover = re.sub(r"\s+", " ", leftover).strip(" .")
+            titled = re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}", leftover) or re.fullmatch(
+                r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}", raw.strip()
+            )
+            if titled:
+                data["name"] = titled.group(0)
     if _looks_like_birth_depart(str(data.get("depart") or ""), str(data.get("dob") or "")):
         data["depart"] = "2026-12-04"
         data.pop("depart_until", None)
@@ -2269,15 +2835,58 @@ def absorb_details(state: dict[str, Any], text: str) -> dict[str, Any]:
         # Bare 6 digits on a billing ask, or explicit pincode — not a phone fragment.
         digits = pin.group(1)
         phone_digits = re.sub(r"\D", "", str(data.get("phone") or ""))
-        if digits not in phone_digits and not re.fullmatch(r"\d{10,}", re.sub(r"\D", "", raw) or ""):
-            data["pincode"] = digits
+        compact = re.sub(r"\D", "", raw)
+        if dob:
+            compact = compact.replace(f"{dob.group(1)}{dob.group(2)}{dob.group(3)}", "", 1)
+        if digits not in phone_digits and not re.fullmatch(r"\d{10,}", compact or ""):
+            if digits == str(data.get("rejected_pincode") or ""):
+                data["pin_was_rejected"] = True
+            else:
+                data["pincode"] = digits
+                data.pop("rejected_pincode", None)
+                data.pop("pin_was_rejected", None)
         elif re.search(r"\bpin(?:\s*code)?\b", raw, re.I):
-            data["pincode"] = digits
+            if digits == str(data.get("rejected_pincode") or ""):
+                data["pin_was_rejected"] = True
+            else:
+                data["pincode"] = digits
+                data.pop("rejected_pincode", None)
+                data.pop("pin_was_rejected", None)
     from app.step_read import INDIAN_STATES
 
     state_hit = re.search(rf"\b({INDIAN_STATES})\b", raw, re.I)
     if state_hit:
         data["billing_state"] = state_hit.group(1).strip().title()
+    addr = re.search(
+        r"(?:billing\s*)?(?:address|addr)[:\s#-]+(.{6,120}?)(?=\s*(?:pin(?:\s*code)?|city|state)\b|$)",
+        raw,
+        re.I,
+    )
+    if addr:
+        data["billing_address"] = re.sub(r"\s+", " ", addr.group(1)).strip(" ,.")
+    city = re.search(r"\bcity[:\s#-]+([A-Za-z][A-Za-z .'-]{1,40})", raw, re.I)
+    if city:
+        data["city"] = city.group(1).strip(" .")
+    elif state_hit:
+        # "Guwahati Assam" / "Guwahati, Assam" ahead of the state name.
+        before = raw[: state_hit.start()]
+        city_hit = re.search(r"([A-Za-z]{3,})\s*,?\s*$", before.strip())
+        if city_hit and city_hit.group(1).lower() not in {"male", "female", "other", "india"}:
+            data["city"] = city_hit.group(1).title()
+    if not data.get("city"):
+        without_pin = re.sub(r"\b\d{6}\b", " ", raw)
+        tail = re.search(r"([A-Za-z]{3,})\s*$", without_pin.strip())
+        skip = {"male", "female", "other", "india", "address", "email"}
+        saved_name = str(data.get("name") or "").lower()
+        if (
+            tail
+            and tail.group(1).lower() not in skip
+            and tail.group(1).lower() not in saved_name
+            and not re.search(rf"\b{re.escape(tail.group(1))}\b", INDIAN_STATES, re.I)
+        ):
+            data["city"] = tail.group(1).title()
+    if not str(data.get("billing_address") or "").strip() and data.get("city") and data.get("billing_state"):
+        data["billing_address"] = f"{data['city']}, {data['billing_state']}"
     if re.search(r"\b(anyway|use it|use this|only number)\b", raw, re.I):
         data["phone_ok"] = True
     if re.search(r"\bcheapest\b", raw, re.I):
@@ -2504,6 +3113,421 @@ def _hour(depart: object) -> int:
     return int(match.group(1)) if match else 12
 
 
+_OPTION_KEYS = (
+    "airline",
+    "flight",
+    "depart",
+    "arrive",
+    "duration",
+    "stops",
+    "price",
+    "price_n",
+    "minutes",
+)
+_MONTHS_SHORT = ("", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _slim_option(item: dict[str, Any]) -> dict[str, Any]:
+    return {key: item[key] for key in _OPTION_KEYS if key in item}
+
+
+def _is_nonstop_option(item: dict[str, Any]) -> bool:
+    return bool(re.search(r"non-?stop|0\s*stops?|\bdirect\b", str(item.get("stops") or ""), re.I))
+
+
+def _nonstop_alternative(options: list[dict[str, Any]], pick: dict[str, Any]) -> dict[str, Any] | None:
+    """Cheapest nonstop that is not the flight already chosen."""
+    if not pick or _is_nonstop_option(pick):
+        return None
+    pool = [
+        item
+        for item in options
+        if _is_nonstop_option(item)
+        and (
+            str(item.get("depart") or "") != str(pick.get("depart") or "")
+            or str(item.get("airline") or "") != str(pick.get("airline") or "")
+        )
+    ]
+    if not pool:
+        return None
+    return min(pool, key=lambda item: (item.get("price_n") or 999999, item.get("minutes") or 9999))
+
+
+def _spoken_date_short(iso: str) -> str:
+    from datetime import date
+
+    try:
+        when = date.fromisoformat(str(iso)[:10])
+    except ValueError:
+        return str(iso or "")
+    if not 1 <= when.month <= 12:
+        return str(iso or "")
+    return f"{when.day} {_MONTHS_SHORT[when.month]}"
+
+
+def _spoken_clock(raw: str) -> str:
+    text = re.sub(r"\s+", " ", str(raw or "")).strip()
+    match = re.match(r"^(\d{1,2}):(\d{2})(?:\s*(am|pm))?$", text, re.I)
+    if not match:
+        return text
+    hour, minute, meridiem = int(match.group(1)), match.group(2), (match.group(3) or "").lower()
+    if meridiem:
+        hour12 = hour % 12 or 12
+        return f"{hour12}:{minute} {meridiem.upper()}"
+    if hour == 0:
+        return f"12:{minute} AM"
+    if hour < 12:
+        return f"{hour}:{minute} AM"
+    if hour == 12:
+        return f"12:{minute} PM"
+    return f"{hour - 12}:{minute} PM"
+
+
+def _airline_short(name: str) -> str:
+    raw = re.sub(r"\s+", " ", str(name or "")).strip()
+    if re.search(r"air india", raw, re.I):
+        return "Air India"
+    short = re.sub(r"\s+air$", "", raw, flags=re.I).strip()
+    return short or raw or "that"
+
+
+def _rupees(amount: int) -> str:
+    return f"Rs {amount:,}"
+
+
+def _first_inr(page: str, pattern: str) -> int:
+    match = re.search(pattern, page or "", re.I)
+    if not match:
+        return 0
+    digits = re.sub(r"[^\d]", "", match.group(1))
+    return int(digits or "0")
+
+
+def _layover_city(page: str) -> str:
+    match = re.search(
+        r"(?:layover|via|stop)\s+(?:in|at)\s+([A-Za-z][A-Za-z .'-]{2,40})",
+        page or "",
+        re.I,
+    )
+    if not match:
+        return ""
+    city = re.split(r"\s{2,}|\.|,|₹|\bRs\b|\bfor\b", match.group(1).strip(), maxsplit=1)[0].strip()
+    return city[:40]
+
+
+def _hold_minutes(page: str) -> int:
+    match = re.search(
+        r"(?:expires|expire|valid|hold|left)\D{0,16}(\d{1,2})\s*min"
+        r"|(\d{1,2})\s*min(?:ute)?s?\s*(?:left|remaining|to complete|to pay)",
+        page or "",
+        re.I,
+    )
+    if match:
+        return int(match.group(1) or match.group(2) or "0")
+    # Ixigo payment shows a MM:SS countdown (04:20) that is not a flight clock.
+    for found in re.finditer(r"\b(\d{1,2}):(\d{2})\b", page or ""):
+        start, end = found.span()
+        window = (page or "")[max(0, start - 16) : end + 16]
+        if re.search(r"\b(?:GAU|DEL|Guwahati|Delhi|AM|PM)\b", window, re.I):
+            continue
+        mins, secs = int(found.group(1)), int(found.group(2))
+        if secs >= 60 or not 0 <= mins <= 20:
+            continue
+        return mins or 1
+    return 0
+
+
+def _payment_itinerary(page: str) -> dict[str, str]:
+    """Airline, clocks, and stops printed on the Ixigo fare summary / pay sheet."""
+    text = page or ""
+    airline = ""
+    if re.search(r"\bakasa\b", text, re.I):
+        airline = "Akasa Air"
+    elif re.search(r"\bindigo\b|\b6E\b", text, re.I):
+        airline = "IndiGo"
+    elif re.search(r"\bspice\s*jet\b", text, re.I):
+        airline = "SpiceJet"
+    elif re.search(r"air india express", text, re.I):
+        airline = "Air India Express"
+    elif re.search(r"\bair india\b", text, re.I):
+        airline = "Air India"
+    depart = ""
+    arrive = ""
+    leave = re.search(r"(\d{1,2}:\d{2})\s*(?:GAU\b|Guwahati)", text, re.I)
+    land = re.search(r"(\d{1,2}:\d{2})\s*(?:DEL\b|New Delhi|Delhi)", text, re.I)
+    if leave:
+        depart = leave.group(1)
+    if land:
+        arrive = land.group(1)
+    stops = "Non-stop" if re.search(r"non-?stop", text, re.I) else ""
+    return {"airline": airline, "depart": depart, "arrive": arrive, "stops": stops}
+
+
+def wants_direct_ixigo_checkout(text: str, state: dict[str, Any]) -> bool:
+    """Book a dated route on Ixigo only when the traveller named Ixigo and details are saved."""
+    raw = text or ""
+    if not re.search(r"\bbook\b", raw, re.I):
+        return False
+    if re.search(r"\b(?:guest|login|otp|pay myself)\b", raw, re.I):
+        return False
+    from app.search import named_seller
+
+    if named_seller(raw) != "ixigo":
+        return False
+    from app.intent import parse_updates
+
+    route = parse_updates(raw)
+    if not (route.get("origin") and route.get("destination") and route.get("depart")):
+        return False
+    until = str(route.get("depart_until") or "")
+    if until and until != str(route.get("depart") or ""):
+        return False
+    return not passenger_gaps(state)
+
+
+def direct_checkout_ack(state: dict[str, Any]) -> str:
+    origin = _place(state.get("origin")) or "that city"
+    destination = _place(state.get("destination")) or "that city"
+    when = _spoken_date_short(str(state.get("depart") or ""))
+    when_bit = f" on {when}" if when else ""
+    hint = str(state.get("selected_hint") or "").strip()
+    if hint:
+        return (
+            f"On it. I'll take the {hint}, {origin} to {destination}{when_bit}, on Ixigo "
+            "through to the payment page. Nothing is charged."
+        )
+    return (
+        f"On it. I'll set up {origin} to {destination}{when_bit} in Ixigo "
+        "and show you the checkout page before anything is charged."
+    )
+
+
+def _arm_direct_ixigo_checkout(state: dict[str, Any], text: str) -> None:
+    """Lock Ixigo and drop a leftover itinerary so this book starts at the fare list."""
+    from app.kernel_otp import release_saved_kernel
+
+    release_saved_kernel(str(state.get("kernel_session_id") or ""))
+    state.pop("kernel_session_id", None)
+    state.pop("live", None)
+    state.pop("stuck_page", None)
+    state.pop("stuck_kind", None)
+    state.pop("pending_step", None)
+    state.pop("chosen_tap", None)
+    state.pop("awaiting_book_site", None)
+    state.pop("book_site_ready", None)
+    state.pop("book_quotes_busy", None)
+    from app.search import place_label
+
+    for key in ("origin", "destination"):
+        label = place_label(str(state.get(key) or ""))
+        if label:
+            state[key] = label
+    state["direct_checkout"] = True
+    state["seller"] = "ixigo"
+    state["preferred_seller"] = "ixigo"
+    state["kernel_seller"] = "ixigo"
+    state["preference"] = "cheapest"
+    state["kernel_awaiting_auth_mode"] = False
+    state.pop("kernel_awaiting_phone", None)
+    # Ixigo will not ticket a guest. Login (OTP) is the only checkout.
+    if str(state.get("kernel_logged_in") or "") != "ixigo":
+        state.pop("kernel_logged_in", None)
+    state["kernel_auth_mode"] = "login"
+    hint = _flight_hint(text)
+    if hint:
+        state["selected_hint"] = hint
+    else:
+        state.pop("selected_hint", None)
+
+
+def checkout_ready_lines(state: dict[str, Any], page: str = "") -> list[str]:
+    """WhatsApp bubbles once Ixigo is on the fare summary and nothing is charged."""
+    pick = dict(state.get("direct_pick") or {}) if isinstance(state.get("direct_pick"), dict) else {}
+    options = _stored_options(state) or fare_options(page)
+    if not pick and options:
+        pick = dict(_pick_best(options, "cheapest"))
+    seen = _payment_itinerary(page)
+    for key in ("airline", "depart", "arrive", "stops"):
+        if seen.get(key):
+            pick[key] = seen[key]
+    alt = dict(state.get("direct_alt") or {}) if isinstance(state.get("direct_alt"), dict) else {}
+    if not alt and pick:
+        alt = _nonstop_alternative(options, pick) or {}
+    if not alt and pick and options:
+        others = [
+            item
+            for item in options
+            if str(item.get("depart") or "") != str(pick.get("depart") or "")
+            or str(item.get("airline") or "") != str(pick.get("airline") or "")
+        ]
+        if others:
+            alt = min(others, key=lambda item: (item.get("price_n") or 999999, item.get("minutes") or 9999))
+    origin = _place(state.get("origin")) or "the origin"
+    destination = _place(state.get("destination")) or "the destination"
+    when = _spoken_date_short(str(state.get("depart") or ""))
+    when_bit = f" on {when}" if when else ""
+    airline = str(pick.get("airline") or "the flight")
+    short = _airline_short(airline)
+    depart = _spoken_clock(str(pick.get("depart") or ""))
+    arrive = _spoken_clock(str(pick.get("arrive") or ""))
+    leaves = f"leaves {origin} {depart}".strip()
+    lands = f", lands {destination} {arrive}".rstrip() if arrive or destination else ""
+    city = _layover_city(page)
+    if _is_nonstop_option(pick):
+        via = ", nonstop"
+    else:
+        minutes = int(pick.get("minutes") or 0)
+        long = "long " if minutes >= 360 or re.search(r"long layover", page or "", re.I) else ""
+        if city:
+            via = f", one {long}layover in {city}"
+        elif pick.get("stops"):
+            via = f", {pick.get('stops')}"
+        else:
+            via = ""
+    total = _first_inr(
+        page,
+        r"(?:amount to be paid|total(?:\s+amount|\s+fare)?|you pay)\s*₹?\s*([0-9,]{4,})",
+    )
+    if not total:
+        amounts = [n for n in prices_in(page) if n >= 3000]
+        total = max(amounts) if amounts else int(pick.get("price_n") or 0)
+    fee = _first_inr(page, r"(?:convenience|ixigo|service)\s+fee\s*₹?\s*([0-9,]{2,})")
+    if not fee:
+        fee = _first_inr(page, r"\bfee\s*₹\s*([0-9,]{2,})")
+    fee_included = bool(re.search(r"conv(?:enience)?\.?\s*fee included|gst\s*&\s*conv", page or "", re.I))
+    coupon = _first_inr(page, r"coupon(?:\s+applied|\s+discount)?\s*[-−]?\s*₹?\s*([0-9,]{2,})")
+    if not coupon:
+        coupon = _first_inr(page, r"(?:you )?saved\s*₹?\s*([0-9,]{2,})")
+        saved_word = bool(coupon)
+    else:
+        saved_word = False
+    bag = re.search(r"(\d{1,2})\s*kg\s*check", page or "", re.I)
+    extras: list[str] = []
+    if fee:
+        extras.append(f"includes a {_rupees(fee)} fee")
+    elif fee_included:
+        extras.append("GST and convenience fee included")
+    if coupon:
+        extras.append(f"after a {_rupees(coupon)} {'saving' if saved_word else 'coupon'}")
+    extra = f" ({', '.join(extras)})" if extras else ""
+    bag_bit = f" {bag.group(1)} kg checked bag." if bag else ""
+    total_bit = f" Total {_rupees(total)}{extra}." if total else ""
+    ready = re.sub(
+        r"\s+",
+        " ",
+        f"Ready to pay on Ixigo, nothing charged. Cheapest{when_bit}: {airline}, {leaves}{lands}{via}.{total_bit}{bag_bit}",
+    ).strip()
+    lines = [ready]
+    list_price = int(pick.get("price_n") or 0)
+    alt_price = int(alt.get("price_n") or 0) if alt else 0
+    base = total or list_price
+    delta = alt_price - base if alt_price and base else 0
+    offer_nonstop = bool(alt) and delta > 0 and not _is_nonstop_option(pick)
+    offer_cheaper_stop = bool(alt) and delta < 0 and _is_nonstop_option(pick) and not _is_nonstop_option(alt)
+    if offer_nonstop:
+        lines.append(
+            f"If you'd rather skip the layover, {alt.get('airline')} nonstop "
+            f"{_spoken_clock(str(alt.get('depart') or ''))} to {_spoken_clock(str(alt.get('arrive') or ''))} "
+            f"is about {_rupees(delta)} more."
+        )
+    elif offer_cheaper_stop:
+        lines.append(
+            f"If you'd rather pay less, {alt.get('airline')} with a layover "
+            f"{_spoken_clock(str(alt.get('depart') or ''))} to {_spoken_clock(str(alt.get('arrive') or ''))} "
+            f"is about {_rupees(abs(delta))} less."
+        )
+    elif alt and delta and (
+        str(alt.get("depart") or "") != str(pick.get("depart") or "")
+        or str(alt.get("airline") or "") != str(pick.get("airline") or "")
+    ):
+        how = "nonstop" if _is_nonstop_option(alt) else (str(alt.get("stops") or "another time"))
+        more = "more" if delta > 0 else "less"
+        lines.append(
+            f"Another option: {alt.get('airline')} {_spoken_clock(str(alt.get('depart') or ''))} "
+            f"to {_spoken_clock(str(alt.get('arrive') or ''))}, {how}, "
+            f"is about {_rupees(abs(delta))} {more}."
+        )
+    quotes = state.get("book_quotes") if isinstance(state.get("book_quotes"), list) else []
+    quote_bits = [
+        f"{q.get('label') or q.get('seller')} ₹{int(q.get('price_n') or 0):,}"
+        for q in quotes
+        if int(q.get("price_n") or 0) > 0
+    ]
+    if quote_bits:
+        lines.append("Other sites: " + " · ".join(quote_bits) + ".")
+    hold_n = _hold_minutes(page)
+    hold = (
+        f"The fare hold expires in about {hold_n} minutes, so quick is good."
+        if hold_n
+        else "The fare can move, so quick is good."
+    )
+    amount = _rupees(total) if total else "that total"
+    choice = (
+        f"Approve {amount} for the {short} flight, or want the nonstop?"
+        if offer_nonstop
+        else f"Approve {amount} for the {short} flight?"
+    )
+    lines.append(
+        f"{choice} And payment: I can't do UPI myself. I can send a secure link to save your card "
+        f"and pay with it, or you pay on the page yourself. {hold}"
+    )
+    return lines
+
+
+def _checkout_summary_open(page: str, shown: str) -> bool:
+    """Fare summary or pay sheet, and the traveller form is not still asking for blanks."""
+    if shown in {"login", "otp", "error", "home", "cookie", "results", "loading", "unavailable"}:
+        return False
+    if re.search(
+        r"please (?:enter|select)|add new adult|first\s*&\s*middle name",
+        page or "",
+        re.I,
+    ):
+        return False
+    from app.page_agent import _on_addons_page, payment_sheet_open
+
+    # Seat map still has a fare summary sidebar. That is not the payment page.
+    if _on_addons_page(page, shown):
+        return False
+    pay_words = bool(
+        re.search(r"amount to be paid\s*₹\s*[0-9,]|pay via any upi|credit/debit card", page or "", re.I)
+    )
+    # Contact, GST, and billing are the review form. A total beside them is not payment.
+    if re.search(
+        r"contact details|billing address|gst details|email address|mobile number|add traveller",
+        page or "",
+        re.I,
+    ) and not pay_words:
+        return False
+    if payment_sheet_open(page, shown):
+        return True
+    if pay_words:
+        return True
+    if shown not in {"review", "pay", "passenger", "addons", "fare_sheet", "other", ""}:
+        return False
+    has_total = bool(
+        re.search(r"total(?:\s+amount)?\s*₹\s*[0-9,]{4,}|you pay\s*₹\s*[0-9,]{4,}", page or "", re.I)
+    )
+    has_summary = bool(re.search(r"fare summary|review (?:&|and) traveller|review details", page or "", re.I))
+    return has_total and has_summary
+
+
+def _send_checkout_ready(
+    phone: str,
+    state: dict[str, Any],
+    page: str,
+    secrets: list[str],
+    shots: list[str] | None,
+) -> None:
+    lines = checkout_ready_lines(state, page)
+    if not lines:
+        return
+    # Screenshot first, then the fare recommendation under it.
+    _deliver(phone, "Ready to pay on Ixigo, nothing charged.", None, secrets, shot_paths=shots)
+    for line in lines:
+        _deliver(phone, line, None, secrets)
+
+
 def _indian_mobile(phone: str) -> bool:
     digits = re.sub(r"\D", "", phone or "")
     if digits.startswith("91") and len(digits) == 12:
@@ -2684,9 +3708,29 @@ def _publish_fares(
             saved["awaiting_book_site"] = True
             saved.pop("book_site_ready", None)
             saved.pop("book_quotes", None)
+            saved.pop("direct_checkout", None)
+            saved.pop("kernel_seller", None)
+            saved.pop("kernel_session_id", None)
+            saved.pop("live", None)
+            saved.pop("stuck_kind", None)
+            saved.pop("stuck_page", None)
         if options:
             saved["options"] = [
-                {k: item[k] for k in ("airline", "flight", "depart", "arrive", "price") if k in item}
+                {
+                    k: item[k]
+                    for k in (
+                        "airline",
+                        "flight",
+                        "depart",
+                        "arrive",
+                        "duration",
+                        "stops",
+                        "price",
+                        "price_n",
+                        "minutes",
+                    )
+                    if k in item
+                }
                 for item in options
             ]
         saved["stage"] = "results"
@@ -2733,41 +3777,66 @@ def _publish_book_quotes(
     from app.book_quotes import collect_book_quotes, format_book_quotes
     from app.kernel_otp import kernel_configured
 
-    if not kernel_configured():
-        return
-    state = _load(phone)
-    origin = str(state.get("origin") or "")
-    destination = str(state.get("destination") or "")
-    depart = str(state.get("depart") or "")
-    if not (origin and destination and depart):
-        return
-    when = hint or str(state.get("selected_hint") or "")
-    quotes = collect_book_quotes(
-        phone=phone,
-        origin=origin,
-        destination=destination,
-        depart=depart,
-        hint=when,
-    )
-    if _stale(phone, started_at):
-        return
-    saved = _load(phone)
-    # Prefer a clock the traveller already named while quotes were loading.
-    when = str(saved.get("selected_hint") or when or "")
-    saved["book_quotes"] = [
-        {k: q[k] for k in ("seller", "label", "price", "price_n", "depart", "bookable") if k in q}
-        for q in quotes
-    ]
-    bookable = [q for q in quotes if q.get("bookable") and int(q.get("price_n") or 0) > 0]
-    if bookable:
-        best_site = min(bookable, key=lambda q: int(q["price_n"]))
-        saved["preferred_seller"] = str(best_site["seller"])
-    saved["awaiting_book_site"] = False
-    saved["book_site_ready"] = True
-    saved.pop("book_quotes_busy", None)
-    _save(phone, saved)
-    spoken = format_book_quotes(quotes, hint=when, trip=_trip_line(saved) or "")
-    _deliver(phone, spoken, None, secrets)
+    try:
+        if not kernel_configured():
+            _deliver(
+                phone,
+                "I noted the time, but Kernel isn't configured here so I can't pull Cleartrip/Ixigo/"
+                "EaseMyTrip prices. Reply Ixigo or Cleartrip to open that site. Nothing paid.",
+                None,
+                secrets,
+            )
+            return
+        state = _load(phone)
+        origin = str(state.get("origin") or "")
+        destination = str(state.get("destination") or "")
+        depart = str(state.get("depart") or "")
+        if not (origin and destination and depart):
+            _deliver(phone, "I still need origin, destination, and date before I can quote sites. Nothing paid.", None, secrets)
+            return
+        when = hint or str(state.get("selected_hint") or "")
+        quotes = collect_book_quotes(
+            phone=phone,
+            origin=origin,
+            destination=destination,
+            depart=depart,
+            hint=when,
+        )
+        if _stale(phone, started_at):
+            return
+        saved = _load(phone)
+        # Prefer a clock the traveller already named while quotes were loading.
+        when = str(saved.get("selected_hint") or when or "")
+        saved["book_quotes"] = [
+            {k: q[k] for k in ("seller", "label", "price", "price_n", "depart", "bookable") if k in q}
+            for q in quotes
+        ]
+        bookable = [q for q in quotes if q.get("bookable") and int(q.get("price_n") or 0) > 0]
+        if bookable:
+            best_site = min(bookable, key=lambda q: int(q["price_n"]))
+            saved["preferred_seller"] = str(best_site["seller"])
+        saved["awaiting_book_site"] = False
+        saved["book_site_ready"] = True
+        _save(phone, saved)
+        spoken = format_book_quotes(quotes, hint=when, trip=_trip_line(saved) or "")
+        _deliver(phone, spoken, None, secrets)
+    except Exception:
+        logger.exception("Book-site quotes failed")
+        if not _stale(phone, started_at):
+            _deliver(
+                phone,
+                f"Site prices for {hint or 'that time'} didn't come back. "
+                "Reply Ixigo or Cleartrip to open that site anyway. Nothing paid.",
+                None,
+                secrets,
+            )
+    finally:
+        # Never leave the chat stuck on "Still checking…" forever.
+        saved = _load(phone)
+        if saved.pop("book_quotes_busy", None) is not None or saved.get("busy_at"):
+            if str(saved.get("busy_at") or "") == str(started_at or ""):
+                saved.pop("busy_at", None)
+            _save(phone, saved)
 
 
 def _book_on_seller(
@@ -2899,7 +3968,11 @@ def _book_on_seller(
     if outcome.stage == "wrong_flight":
         _deliver(
             phone,
-            f"I did not click {hint}. The fare sheet on screen is a different flight, so I stopped before Continue. Nothing paid.",
+            (outcome.handoff or "").strip()
+            or (
+                f"I did not click {hint}. The fare sheet on screen is a different flight, "
+                "so I stopped before Continue. Nothing paid."
+            ),
             session,
             secrets,
         )
@@ -3024,13 +4097,249 @@ def passenger_details_reply(state: dict[str, Any]) -> str:
     return f"{got}I still need your {', '.join(gaps)} before I fill the form. Nothing paid."
 
 
+def billing_gaps(state: dict[str, Any]) -> list[str]:
+    """Billing block Ixigo shows on Review. All four are required to reach payment."""
+    gaps: list[str] = []
+    if not str(state.get("billing_address") or state.get("address") or "").strip():
+        gaps.append("billing address")
+    if not str(state.get("city") or "").strip():
+        gaps.append("city")
+    if not str(state.get("billing_state") or "").strip():
+        gaps.append("state")
+    pin = re.sub(r"\D", "", str(state.get("pincode") or ""))
+    if len(pin) != 6:
+        gaps.append("pin code")
+    return gaps
+
+
+def ixigo_checkout_gaps(state: dict[str, Any]) -> list[str]:
+    """Passenger plus billing. Login mobile already counts as the contact number."""
+    gaps = passenger_gaps(state)
+    for item in billing_gaps(state):
+        if item not in gaps:
+            gaps.append(item)
+    return gaps
+
+
+def ixigo_saved_mobile(state: dict[str, Any]) -> str:
+    """A mobile the traveller sent. The WhatsApp or lab id is not an Ixigo login."""
+    from app.kernel_otp import indian_national
+
+    for key in ("login_phone", "phone"):
+        national = indian_national(str(state.get(key) or ""))
+        if national:
+            return "+91" + national
+    return ""
+
+
+def ixigo_signed_in(state: dict[str, Any]) -> bool:
+    return str(state.get("kernel_logged_in") or "") == "ixigo"
+
+
+def ixigo_session_for_number(state: dict[str, Any], national: str) -> bool:
+    """True only when this Ixigo browser was logged in with this exact mobile.
+
+    A leftover 'Hey Ixigoer' session is not that number until an OTP proved it.
+    """
+    from app.kernel_otp import indian_national
+
+    if str(state.get("kernel_logged_in") or "") != "ixigo":
+        return False
+    saved = indian_national(str(state.get("kernel_login_phone") or ""))
+    return bool(national) and saved == national
+
+
+def ixigo_profile_reply(state: dict[str, Any]) -> str:
+    """Ask only for passenger and billing fields that are still empty."""
+    gaps = ixigo_checkout_gaps(state)
+    if not gaps:
+        return ""
+    have = [
+        label
+        for label, key in (
+            ("name", "name"),
+            ("email", "email"),
+            ("date of birth", "dob"),
+            ("gender", "gender"),
+            ("billing address", "billing_address"),
+            ("city", "city"),
+            ("state", "billing_state"),
+        )
+        if str(state.get(key) or "").strip()
+    ]
+    if _indian_mobile(str(state.get("phone") or state.get("login_phone") or "")):
+        have.append("mobile")
+    pin = re.sub(r"\D", "", str(state.get("pincode") or ""))
+    if len(pin) == 6:
+        have.append("pin code")
+    got = f"I have your {', '.join(have)}. " if have else ""
+    example = ""
+    if len(gaps) > 2 and not have:
+        example = (
+            " One message is enough, for example: "
+            "Sudipta Saikia, name@gmail.com, 29/07/1997, Male, "
+            "address 12 Zoo Road city Guwahati 781001 Assam."
+        )
+    return (
+        f"{got}I still need your {', '.join(gaps)} before I fill Ixigo and open payment."
+        f"{example} Nothing paid."
+    )
+
+
+def ixigo_checkout_step(text: str, state: dict[str, Any]) -> str:
+    """phone, login, profile, or pay when this message chooses Ixigo. Empty otherwise."""
+    raw = (text or "").strip()
+    bare = bool(re.fullmatch(r"ixigo\??", raw, re.I))
+    from app.search import named_seller
+
+    booked = named_seller(raw) == "ixigo" and bool(re.search(r"\bbook\b", raw, re.I))
+    if not bare and not booked:
+        return ""
+    if not (state.get("origin") and state.get("destination") and state.get("depart")):
+        return ""
+    if not ixigo_signed_in(state):
+        return "phone" if not ixigo_saved_mobile(state) else "login"
+    if ixigo_checkout_gaps(state):
+        return "profile"
+    return "pay"
+
+
+def field_correction_line(state: dict[str, Any], page: str) -> str:
+    """Name every missing or rejected field on the open sheet. Empty when the page is fine."""
+    from app.page_agent import named_form_issues
+
+    missing, wrong = named_form_issues(page or "")
+    if not missing and not wrong:
+        return ""
+    bits: list[str] = []
+    if wrong:
+        bits.append("These look wrong: " + ", ".join(wrong))
+    if missing:
+        bits.append("Still missing: " + ", ".join(missing))
+    return (
+        ". ".join(bits)
+        + ". Send the corrected details and I'll type them on this page. "
+        "The screenshot is this page. Nothing paid."
+    )
+
+
+def drop_rejected_details(state: dict[str, Any], page: str) -> None:
+    """Forget a value the page just rejected so the next reply can replace it."""
+    from app.page_agent import named_form_issues
+
+    _missing, wrong = named_form_issues(page or "")
+    if "pin code" in wrong:
+        bad = re.sub(r"\D", "", str(state.get("pincode") or ""))
+        if len(bad) == 6:
+            state["rejected_pincode"] = bad
+        state.pop("pincode", None)
+    if "email" in wrong:
+        bad_email = str(state.get("email") or "").strip()
+        if bad_email:
+            state["rejected_email"] = bad_email
+        state.pop("email", None)
+
+
+def _keep_profile_from_disk(phone: str, state: dict[str, Any]) -> None:
+    """A checkout thread must not wipe name, email, or billing saved while it was running."""
+    latest = _load(phone)
+    for key in (
+        "name",
+        "email",
+        "phone",
+        "login_phone",
+        "dob",
+        "gender",
+        "pincode",
+        "billing_address",
+        "city",
+        "billing_state",
+    ):
+        if key == "pincode" and state.get("rejected_pincode"):
+            continue
+        if key == "email" and state.get("rejected_email"):
+            continue
+        if str(latest.get(key) or "").strip() and not str(state.get(key) or "").strip():
+            state[key] = latest[key]
+
+
+def _wrong_itinerary_reply(notes: str, page: str, hint: str) -> str:
+    """Don't say the flight is missing when that departure is on the fare list in the screenshot."""
+    first = (notes or "").split(" | ")[0].strip()
+    from app.page_agent import _clock_needles, _depart_clocks_on_fare_list
+
+    clocks = _depart_clocks_on_fare_list(page or "")
+    needles = set(_clock_needles(hint or ""))
+    if hint and any(clock in needles for clock in clocks):
+        return (
+            f"The {hint} is on the Ixigo list in the screenshot. "
+            f"Reply {hint} and I'll Book that row. Nothing paid."
+        )
+    if first.lower().startswith("stopped"):
+        return first[:500]
+    if "ixigo list" in first.lower():
+        return first[:500]
+    found = re.search(r"Stopped: on-screen itinerary[^.]*\.", notes or "", re.I)
+    if found:
+        return found.group(0)[:500]
+    when = hint or "the requested time"
+    return f"Stopped: on-screen itinerary did not match {when}. Nothing paid."
+
+
+def _form_ask_shots(state: dict[str, Any], shots: list[str] | None) -> list[str] | None:
+    paths = [path for path in (shots or []) if path]
+    if paths:
+        return paths
+    from app.turn_loop import _shot_from
+
+    last = _shot_from(state)
+    return [last] if last else None
+
+
+_LAB_KEEP = (
+    "origin",
+    "destination",
+    "depart",
+    "depart_until",
+    "selected_hint",
+    "book_quotes",
+    "awaiting_book_site",
+    "options",
+    "preference",
+)
+
+
+def reset_lab_traveller(state: dict[str, Any]) -> dict[str, Any]:
+    """Drop passenger, login, and billing so the lab phone can book as a new user."""
+    from app.db import _utc_now
+
+    fresh: dict[str, Any] = {}
+    for key in _LAB_KEEP:
+        value = state.get(key)
+        if value not in (None, "", [], {}):
+            fresh[key] = value
+    fresh["profile_reset_at"] = _utc_now()
+    return fresh
+
+
 def _mid_booking_ack(state: dict[str, Any], seller_id: str, chosen: str, text: str) -> str:
     """Mirror what they asked; do not promise a button that may not be the real step."""
+    from app.kernel_otp import indian_national
     from app.step_read import RECOMMENDED
 
     seller = _seller_label(seller_id)
     tap = str(state.get("chosen_tap") or "")
     ask = extract_user_ask(text, state)
+    page = str(state.get("stuck_page") or "")
+    saved = indian_national(str(state.get("login_phone") or state.get("phone") or ""))
+    if saved and (
+        str(state.get("stuck_kind") or "") == "login"
+        or re.search(r"log in to ixigo|enter mobile number", page, re.I)
+    ) and not re.search(r"verify your mobile|enter the otp|otp sent", page, re.I):
+        return (
+            f"Typing the saved mobile ending {saved[-4:]} into {seller} login for the {chosen}, "
+            "then I'll ask you for the OTP. Nothing paid."
+        )
     if tap == RECOMMENDED or ask.get("goal") == "skip":
         return (
             f"Skipping extras and ticking your traveller on {seller} for {chosen}. "
@@ -3082,7 +4391,18 @@ def _remember_front_sheet(state: dict[str, Any], surface: dict) -> None:
 
 def _addon_upsell(page: str) -> str:
     """Paid cancellation/add-on sheet from page text. Empty when Continue is the real step."""
+    from app.step_read import _assured_radio_gate, _traveller_form_open
+
     hay = page or ""
+    # Empty Adult 1 / Title gap owns the step — Assured radios are declined during prepare.
+    if re.search(r"please select your title", hay, re.I) and _traveller_form_open(hay):
+        return ""
+    # Adult 1 / Contact Details with Continue is the traveller form — not Assured, even if
+    # "Refund on Cancellation" or leftover radio copy sits in the DOM behind it.
+    if (_traveller_form_open(hay) or re.search(r"contact details", hay, re.I)) and not _assured_radio_gate(
+        hay
+    ):
+        return ""
     if not re.search(r"free cancellation|\bassured\b", hay, re.I):
         return ""
     if re.search(
@@ -3122,21 +4442,37 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     if site_error_page(page, url):
         shown = "error"
     vision_seen = None
-    if session.page is not None:
-        try:
-            from app.vision_agent import capture_page_shot, classify_with_vision, vision_enabled
+    # Internal vision may settle/scroll; traveller shot stays clean and separate.
+    try:
+        from app.vision_agent import (
+            capture_page_shot,
+            capture_user_shot,
+            classify_with_vision,
+            vision_enabled,
+        )
+        from app.turn_loop import remember_shot
 
+        user_shot = ""
+        vision_shot = ""
+        if session.page is not None and getattr(session.page, "screenshot", None):
+            user_shot = capture_user_shot(session.page, tag="checkout")
+            if user_shot:
+                remember_shot(state, user_shot)
             if vision_enabled():
-                shot = capture_page_shot(session.page)
-                if shot:
-                    shown, vision_seen = classify_with_vision(
-                        shown, shot, seller=seller, hint=hint, page_text=page
-                    )
-                    from app.turn_loop import remember_shot
-
-                    remember_shot(state, shot)
-        except Exception:
-            vision_seen = None
+                vision_shot = capture_page_shot(session.page)
+        if vision_enabled() and (vision_shot or user_shot or state.get("last_shot")):
+            shown, vision_seen = classify_with_vision(
+                shown,
+                vision_shot or user_shot or str(state.get("last_shot") or ""),
+                seller=seller,
+                hint=hint,
+                page_text=page,
+            )
+            # Never remember the internal vision PNG as the traveller media.
+            if user_shot:
+                remember_shot(state, user_shot)
+    except Exception:
+        vision_seen = None
     which = hint or "that flight"
     if vision_seen:
         state["last_vision"] = {
@@ -3147,6 +4483,8 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             "what": vision_seen.get("what") or "",
             "tap": vision_seen.get("tap") or "",
             "recommend": vision_seen.get("recommend") or "",
+            "errors": list(vision_seen.get("errors") or []),
+            "fields": list(vision_seen.get("fields") or []),
             "shot": str(state.get("last_shot") or ""),
         }
     if site_error_page(page, url):
@@ -3175,12 +4513,14 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         and str(vision_seen.get("kind") or "") not in {"review", "form", "upsell", "passenger"}
     ):
         shown = "results"
-    from app.step_read import form_sheet, is_name_confirm
+    from app.step_read import _fare_list_sheet, form_sheet, is_name_confirm
 
     if is_name_confirm(page or "") and shown not in {"pay", "otp", "login", "error", "unavailable"}:
         shown = "review"
     if form_sheet(page) and shown not in {"pay", "otp", "login", "error", "unavailable", "review"}:
         shown = "other"
+    if _fare_list_sheet(page or "") and shown not in {"unavailable", "pay", "error", "otp", "login"}:
+        shown = "results"
     if site_error_page(page, url) or (vision_seen and str(vision_seen.get("kind") or "") == "error"):
         shown = "error"
     if shown == "unavailable" or flight_unavailable(page):
@@ -3204,6 +4544,7 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     # Wins over a mis-shown fare-list stage when the open DOM is clearly a form sheet.
     if shown not in {"error", "unavailable", "pay", "otp", "login", "home", "cookie"}:
         from app.step_read import (
+            adult_form_needs_fill,
             arm_pending_step,
             classify_sheet,
             decide_sheet,
@@ -3212,6 +4553,10 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         )
 
         sheet_now = classify_sheet(page or "")
+        # Screenshot wins over buried DOM Assured copy when the shot is the traveller form.
+        vision_kind = str((vision_seen or {}).get("kind") or "")
+        if vision_kind in {"form", "review", "passenger"} and sheet_now == "upsell":
+            sheet_now = "traveller" if vision_kind in {"form", "passenger"} else "review"
         form_sheets = {
             "traveller",
             "contact",
@@ -3226,14 +4571,46 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             and re.search(r"review your itinerary|\breview details\b", page or "", re.I)
         ):
             vision_controls = list((vision_seen or {}).get("controls") or [])
+            vision_errors = [
+                str(item).strip()
+                for item in ((vision_seen or {}).get("errors") or [])
+                if str(item).strip()
+            ]
+            sheet_page = page or ""
+            if vision_errors:
+                sheet_page = f"{sheet_page}\n" + "\n".join(vision_errors)
             move = decide_sheet(
-                page or "",
+                sheet_page,
                 state,
                 front=str(surface.get("text") or ""),
                 controls=str(surface.get("controls") or "")
                 or "\n".join(str(c) for c in vision_controls),
                 overlay=bool(surface.get("overlay")),
             )
+            if sheet_now in {"traveller", "review"} and str(move.get("sheet") or "") == "upsell":
+                move = {**move, "sheet": sheet_now, "action": move.get("action") or "click", "tap": move.get("tap") or "Continue"}
+            # Blank Adult 1 + saved profile: never ask Assured first — arm Continue for autofill.
+            # Require real empty-form signals (title / Adult 1 fields), not just a saved-list row
+            # beside Assured radios — that case stays upsell ("I don't want Free Cancellation").
+            if (
+                str(state.get("seller") or "").lower() == "ixigo"
+                and str(state.get("name") or "").strip()
+                and adult_form_needs_fill(page or "")
+                and str(move.get("sheet") or "") == "upsell"
+            ):
+                from app.page_agent import _clean_traveller_name
+
+                who = _clean_traveller_name(str(state.get("name") or "")) or str(state.get("name") or "")
+                state["chosen_tap"] = "Continue"
+                state["pending_tap"] = "Continue"
+                arm_pending_step(state, page, "passenger", tap="Continue")
+                return _stuck_line(
+                    state,
+                    "passenger",
+                    f"the {seller} Review Details for {which}",
+                    f"saved traveller {who} is on file but Adult 1 is still blank",
+                    "reply continue and I'll tick the saved traveller, fill contact, decline Free Cancellation, then Continue",
+                )
             # Cleartrip itinerary wording when classify lands on review.
             if sheet_now == "review" and re.search(r"review your itinerary", page or "", re.I):
                 tap = str(move.get("tap") or "Continue")
@@ -3406,17 +4783,50 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
             f"an SMS one-time password, not the flight form",
             f"reply with only the {need} digits",
         )
-    if needs_login or shown == "login":
+    guest_on_review = (
+        str(state.get("kernel_auth_mode") or "").strip().lower() == "guest"
+        and bool(
+            re.search(
+                r"fare summary|review & traveller|refund on cancellation|add free cancellation|total amount",
+                page,
+                re.I,
+            )
+            and re.search(r"\bcontinue\b", page, re.I)
+            and not re.search(r"enter otp|otp sent|enter mobile number|log in to ixigo|get otp", page, re.I)
+        )
+    )
+    if guest_on_review and shown == "login":
+        shown = "review"
+    if (needs_login or shown == "login") and not guest_on_review:
         # Kernel OTP login (mobile code) — not a password vault form.
         if state.get("kernel_session_id") or str(state.get("seller") or "") in {"cleartrip", "ixigo"}:
             need = "4" if str(state.get("seller") or "") == "cleartrip" else "6"
-            if str(state.get("kernel_auth_mode") or "") == "guest":
+            if str(state.get("kernel_auth_mode") or "") == "guest" or re.search(
+                r"log in to ixigo|enter mobile number", page or "", re.I
+            ):
+                from app.kernel_otp import indian_national
+
+                state["kernel_auth_mode"] = "login"
+                saved = indian_national(str(state.get("login_phone") or state.get("phone") or ""))
+                if saved:
+                    state["login_phone"] = "+91" + saved
+                    if not str(state.get("phone") or "").strip():
+                        state["phone"] = "+91" + saved
+                    state["kernel_awaiting_phone"] = False
+                    return _stuck_line(
+                        state,
+                        "login",
+                        f"{seller} sign-in for the {which}",
+                        "this fare needs an OTP login",
+                        f"reply continue and I'll type the saved mobile ending {saved[-4:]}, then ask you for the OTP",
+                    )
+                state["kernel_awaiting_phone"] = True
                 return _stuck_line(
                     state,
                     "login",
-                    f"{seller} sign-in appeared during guest booking",
-                    "the site opened login even though you chose guest",
-                    f"reply login and I'll request the {need}-digit OTP, or say skip if a Skip control is on screen",
+                    f"{seller} sign-in for the {which}",
+                    "this fare needs an OTP login",
+                    "send the 10-digit mobile and I'll remember it, type it in, then ask you for the OTP",
                 )
             return _stuck_line(
                 state,
@@ -3437,6 +4847,8 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         state.pop("stuck_kind", None)
         totals = [n for n in prices_in(page) if n >= 3000]
         total = f"₹{totals[0]:,}" if totals else "the total on the screenshot"
+        if state.get("direct_checkout"):
+            return "\n\n".join(checkout_ready_lines(state, page))
         return (
             f"Ready to pay for {trip}. Nothing charged yet. Final total is {total} on {seller}. "
             f"{which} is on the screenshot. "
@@ -3564,7 +4976,9 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         ):
             from app.step_read import classify_sheet as _cls_front
 
-            if _cls_front(hay) in {"name_confirm", "traveller", "contact"}:
+            # Classify the open page only — control digests can list a Mr checkbox
+            # behind an insurance/upsell sheet and falsely look like travellers.
+            if _cls_front(page or "") in {"name_confirm", "traveller", "contact"}:
                 pass
             else:
                 kind = decision.get("kind") or "other"
@@ -3619,7 +5033,34 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
     saved_list = bool(re.search(r"choose from the saved list", page, re.I)) and bool(
         re.search(r"\b(mr|ms|mrs|mx)\b", page, re.I)
     )
-    if re.search(r"traveller details|first\s*&\s*middle", page, re.I) and not saved_list:
+    # Saved list + saved profile name: do not ask for passenger fields — queue autofill.
+    has_saved_name = bool(str(state.get("name") or "").strip())
+    adult_empty = bool(
+        re.search(r"please select your title|clear details", page, re.I)
+    ) or (
+        re.search(r"first\s*&\s*middle name|first name", page, re.I)
+        and not re.search(r"adult\s*1[^\n]{0,40}\b(mr|ms|mrs)\b", page, re.I)
+    )
+    if (
+        seller == "ixigo"
+        and has_saved_name
+        and (saved_list or adult_empty)
+        and re.search(r"traveller details|review details|review & traveller", page, re.I)
+    ):
+        from app.page_agent import _clean_traveller_name
+
+        who = _clean_traveller_name(str(state.get("name") or "")) or str(state.get("name") or "")
+        state["chosen_tap"] = "Continue"
+        state["pending_tap"] = "Continue"
+        arm_pending_step(state, page, "passenger", tap="Continue")
+        return _stuck_line(
+            state,
+            "passenger",
+            f"the {seller} Review Details for {which}",
+            f"saved traveller {who} and contact are on file — I'll apply them without asking again",
+            "reply yes or continue and I'll tick the saved traveller, fill contact, decline Free Cancellation, then Continue",
+        )
+    if re.search(r"traveller details|first\s*&\s*middle", page, re.I) and not saved_list and not has_saved_name:
         waiting = passenger_details_reply(state)
         if waiting:
             gaps = passenger_gaps(state)
@@ -3640,17 +5081,47 @@ def _booking_page_reply(state: dict[str, Any], hint: str, page: str, session: Br
         )
     offer = _addon_upsell(page)
     if offer:
-        if offer == "radio":
+        from app.step_read import upsell_choice_labels
+
+        choices = upsell_choice_labels(page)
+        tap = decline_tap(page) or (
+            next(
+                (item for item in choices if re.search(r"don.?t want|no,?\s*thanks|without", item, re.I)),
+                "",
+            )
+        )
+        extras = str(state.get("extras_preference") or "decline").strip().lower()
+        # Returning users with an authorised decline: do not ask Assured again — arm the skip.
+        if extras in {"", "decline", "skip", "no"} and seller == "ixigo":
+            tap = tap or "Without Assured"
+            state["chosen_tap"] = tap
+            state["pending_tap"] = tap
+            arm_pending_step(state, page, "addon_buy", tap=tap)
+            return _stuck_line(
+                state,
+                "addon_buy",
+                f"{seller}'s Free Cancellation sheet on the {which}",
+                "your preference is no paid extras — I'll decline it and apply the saved traveller",
+                "reply yes and I'll press No, Thanks / Without Assured, fill saved details, then Continue",
+            )
+        if offer == "radio" and len(choices) >= 2:
+            cta = " / ".join(choices)
+            rec = (
+                f"pick one — {cta}. "
+                f"Reply with that label (or yes/skip for {tap or choices[-1]}) and I'll tick it, then Continue"
+            )
+            tap = tap or choices[-1]
+        elif offer == "radio":
             cta = "I don't want Free Cancellation vs Assured"
             rec = (
                 "skip — reply yes, or send No Thanks / I don't want Free Cancellation. "
                 "I'll tick that and your saved traveller, not Assured"
             )
-            tap = decline_tap(page)
+            tap = tap or decline_tap(page)
         else:
             cta = "No, Thanks vs Secure My Trip" if offer == "secure" else "No, Thanks vs the paid extra"
             rec = "skip — reply yes or send No Thanks and I'll tap that, not Assured"
-            tap = decline_tap(page) or "No Thanks"
+            tap = tap or "No Thanks"
         arm_pending_step(state, page, "addon_buy", tap=tap)
         return _stuck_line(
             state,
@@ -3788,8 +5259,16 @@ def _publish_kernel_otp_result(
         state["kernel_awaiting_otp"] = False
         state.pop("kernel_session_id", None)
         state["kernel_logged_in"] = seller
+        state["kernel_login_phone"] = str(state.get("login_phone") or state.get("phone") or "")
+        state.pop("require_otp", None)
         state["stage"] = "booking"
         spoken = f"You're logged in on {_seller_label(seller)}. Nothing paid."
+        if seller == "ixigo" and ixigo_checkout_gaps(state):
+            state["ixigo_awaiting_profile"] = True
+            spoken = (
+                "You're logged in on Ixigo. I'll open the form next. "
+                "If anything is missing or wrong I'll name it with a screenshot. Nothing paid."
+            )
     elif keep_kernel_otp_session(status):
         state["kernel_awaiting_otp"] = True
         state["kernel_session_id"] = session_id
@@ -3816,20 +5295,34 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
     if site_error_page(text, page_url):
         shown = "error"
     shot = str(result.get("screenshot") or "")
+    vision_seen = None
     if shot:
         try:
             from app.vision_agent import classify_with_vision, vision_enabled
+            from app.turn_loop import remember_shot
 
+            remember_shot(state, shot)
             if vision_enabled():
-                shown, _seen = classify_with_vision(
+                shown, vision_seen = classify_with_vision(
                     shown,
                     shot,
                     seller=seller,
                     hint=str(state.get("selected_hint") or ""),
                     page_text=text,
                 )
+                if vision_seen:
+                    state["last_vision"] = {
+                        "kind": vision_seen.get("kind"),
+                        "facts": vision_seen.get("facts") or [],
+                        "seat_map": bool(vision_seen.get("seat_map")),
+                        "meals_offered": bool(vision_seen.get("meals_offered")),
+                        "what": vision_seen.get("what") or "",
+                        "tap": vision_seen.get("tap") or "",
+                        "recommend": vision_seen.get("recommend") or "",
+                        "shot": shot,
+                    }
         except Exception:
-            pass
+            vision_seen = None
     # Contact sheet wins over a vision/text "pay" false positive (sidebar Payment options).
     from app.page_agent import _CONTACT_SHEET
     from app.step_read import form_sheet as _is_form_sheet
@@ -3847,6 +5340,7 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
             state["kernel_logged_in"] = seller
     # OTP/login sheets arm awaiting inside _booking_page_reply; clear only when not those.
     state["kernel_awaiting_otp"] = False
+    _keep_profile_from_disk(phone, state)
     state["seller"] = seller
     held_sid = str(result.get("session_id") or "")
     if held_sid:
@@ -3895,6 +5389,18 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         from app.turn_loop import remember_shot
 
         remember_shot(state, shot)
+    # Wrong-clock stop must beat contact_report Adult/blank copy on a leftover itinerary.
+    first_note = notes.split(" | ")[0].strip() if notes else ""
+    if re.search(r"Stopped: on-screen itinerary|verify_fail:", notes, re.I) or (
+        first_note.lower().startswith("stopped:") and "asked for" in first_note.lower()
+    ):
+        spoken = _wrong_itinerary_reply(notes, text, str(state.get("selected_hint") or ""))
+        state["stuck_kind"] = "results"
+        state["last_stuck"] = spoken
+        state.pop("live", None)
+        _save(phone, state)
+        _deliver(phone, spoken, None, secrets, shot_paths=shots)
+        return
     if shown == "error" or site_error_page(text, page_url):
         # Prefer silent reopen from _run_kernel_login; never WhatsApp the stumped sheet.
         state.pop("live", None)
@@ -3918,13 +5424,98 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         _deliver(phone, spoken, None, secrets)
         return
     first_note = notes.split(" | ")[0].strip()
-    if first_note and re.search(r"did not (open|leave)|click did not", first_note, re.I):
+    from app.page_agent import _on_addons_page
+
+    if first_note and _on_addons_page(text, shown) and re.search(
+        r"Continue stayed on Review Details", first_note, re.I
+    ):
+        first_note = ""
+    if first_note and re.search(
+        r"did not (open|leave)|click did not|could not select|did not move Review|"
+        r"Free Cancellation (is still|options are still)|could not tick|"
+        r"Continue stayed on Review Details|did not stay selected|"
+        r"Secure My Trip is still open|could not press No, Thanks|"
+        r"Adult traveller details are incomplete",
+        first_note,
+        re.I,
+    ):
+        named = field_correction_line(state, text)
+        if named:
+            drop_rejected_details(state, text)
+            state["awaiting_corrections"] = True
+            if seller == "ixigo":
+                state["ixigo_awaiting_profile"] = True
+            first_note = named
+        elif "screenshot" not in first_note.lower():
+            first_note = first_note[:440].rstrip() + " The screenshot is this page."
+        shots = _form_ask_shots(state, shots)
         state["last_stuck"] = first_note[:500]
         if shown:
             state["stuck_kind"] = shown
         _save(phone, state)
         _deliver(phone, first_note[:500], None, secrets, shot_paths=shots)
         return
+    # Confirm → No Thanks → Add-ons may log reached_addons then keep walking to pay.
+    # Prefer payment / left-addons handoff over a sticky "reached add-ons" ask.
+    if re.search(
+        r"reached_pay_after_(?:confirm|addons)|Payment handoff\.|left_addons_after_confirm",
+        notes,
+        re.I,
+    ):
+        state["stage"] = "payment"
+        state["stuck_kind"] = "pay"
+        state.pop("pending_step", None)
+        _save(phone, state)
+        payable = bool(
+            text
+            and re.search(
+                r"amount to be paid|total(?:\s+amount)?\s*₹|fare summary|₹\s*[0-9]",
+                text,
+                re.I,
+            )
+        )
+        from app.page_agent import _on_addons_page as _addons_open
+
+        if (payable or state.get("direct_checkout")) and not _addons_open(text, shown):
+            _send_checkout_ready(phone, state, text, secrets, shots)
+            return
+        spoken = first_note if re.search(r"payment handoff|left add-ons|nothing paid", first_note, re.I) else (
+            f"Payment handoff on {label}. Nothing paid."
+        )
+        state["last_stuck"] = spoken[:500]
+        _save(phone, state)
+        _deliver(phone, spoken[:500], None, secrets, shot_paths=shots)
+        return
+    if re.search(r"reached_addons_after_confirm|^Reached the Add-ons page", notes, re.I):
+        # Auto-skip is in progress (post-confirm No Thanks / leave add-ons) — don't ask the user.
+        if re.search(
+            r"post_confirm_no_thanks|post_confirm_optout|addons_fast_no_thanks|left_addons_after_confirm|"
+            r"addons_skip:|addons_left:",
+            notes,
+            re.I,
+        ):
+            pass
+        else:
+            # Progress-bar "Add-ons" on Review Details must not count — email/contact still open.
+            still_review = bool(
+                re.search(
+                    r"please enter an email|contact email is empty|review & traveller|billing address|"
+                    r"please select your title|contact details",
+                    f"{text or ''} {notes or ''}",
+                    re.I,
+                )
+            ) and not re.search(r"skip add-?ons|choose add-ons", f"{text or ''} {notes or ''}", re.I)
+            if not still_review:
+                spoken = first_note if first_note.lower().startswith("reached the add-ons") else (
+                    f"Reached add-ons for {str(state.get('selected_hint') or 'that flight')} on {label}. "
+                    "Nothing paid."
+                )
+                state["stuck_kind"] = "addons"
+                state["last_stuck"] = spoken[:500]
+                state.pop("pending_step", None)
+                _save(phone, state)
+                _deliver(phone, spoken[:500], None, secrets, shot_paths=shots)
+                return
     if notes.startswith("Skip add-ons is on screen") and shown in {"addons", ""}:
         spoken = notes.split(" | ")[0][:500]
         state["stuck_kind"] = "addons"
@@ -3946,7 +5537,50 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
     state["form_filled"] = bool(filled or contact_filled)
     from app.page_agent import contact_report
 
+    from app.page_agent import ixigo_header_needs_login
+
+    if seller == "ixigo" and ixigo_header_needs_login(text):
+        spoken = (
+            "Ixigo is not logged in. Log in/Sign up is still on the page. "
+            "I should have opened that, typed your mobile, and asked for the OTP. "
+            "Reply the mobile again and I'll do that before any passenger details. Nothing paid."
+        )
+        state["require_otp"] = True
+        state.pop("kernel_logged_in", None)
+        state["last_stuck"] = spoken
+        shots = _form_ask_shots(state, shots)
+        _save(phone, state)
+        _deliver(phone, spoken, None, secrets, shot_paths=shots)
+        return
     report = contact_report(notes, text)
+    correction = field_correction_line(state, text)
+    if correction and shown not in {"pay", "addons", "results", "loading"}:
+        drop_rejected_details(state, text)
+        state["awaiting_corrections"] = True
+        if seller == "ixigo":
+            state["ixigo_awaiting_profile"] = True
+        shots = _form_ask_shots(state, shots)
+        state["last_stuck"] = correction[:500]
+        _save(phone, state)
+        _deliver(phone, correction, None, secrets, shot_paths=shots)
+        return
+    from app.step_read import form_sheet as _form_open
+
+    if (
+        seller == "ixigo"
+        and ixigo_checkout_gaps(state)
+        and shown not in {"pay", "addons", "results", "loading", "home", "cookie"}
+        and (_form_open(text or "") or re.search(r"billing|contact details|traveller|please enter", text or "", re.I))
+    ):
+        asked = ixigo_profile_reply(state)
+        if asked and "screenshot" not in asked.lower():
+            asked += " The screenshot is this page."
+        state["ixigo_awaiting_profile"] = True
+        shots = _form_ask_shots(state, shots)
+        state["last_stuck"] = asked[:500]
+        _save(phone, state)
+        _deliver(phone, asked, None, secrets, shot_paths=shots)
+        return
     _save(phone, state)
     waiting = _form_ask_if_needed(state)
     from app.page_agent import flight_unavailable as _flight_gone
@@ -3978,10 +5612,21 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         )
     else:
         spoken = _booking_page_reply(state, str(state.get("selected_hint") or ""), text, _Session())  # type: ignore[arg-type]
+    if state.get("direct_checkout") and _checkout_summary_open(text, shown) and not _on_addons_page(text, shown):
+        state["stage"] = "payment"
+        state["stuck_kind"] = "pay"
+        state.pop("pending_step", None)
+        _save(phone, state)
+        _send_checkout_ready(phone, state, text, secrets, shots)
+        return
     if payment_sheet_open(text, shown) and shown == "pay":
         state.pop("stuck_kind", None)
         trip = _window_phrase(state)
         spoken = f"I stopped before payment for {trip} on {label}. Nothing paid. The screenshot is that page."
+    if re.search(r"missing|invalid|incorrect|still need|empty|pin code|pincode|send your", spoken or "", re.I):
+        shots = _form_ask_shots(state, shots)
+        if shots and "screenshot" not in spoken.lower():
+            spoken = spoken.rstrip() + " The screenshot is this page."
     _save(phone, state)
     _deliver(phone, spoken, None, secrets, shot_paths=shots)
 
@@ -4023,6 +5668,7 @@ def _run_kernel_login(
         loaded.pop("chosen_tap", None)
         _save(phone, loaded)
     announced = False
+    otp_published = False
 
     def on_code_requested(result: dict[str, str]) -> None:
         nonlocal announced
@@ -4031,13 +5677,76 @@ def _run_kernel_login(
         if release_lock is not None:
             release_lock()
 
+    def on_otp_result(result: dict[str, str]) -> None:
+        """Reply as soon as the code is typed — do not wait for post-login checkout."""
+        nonlocal otp_published
+        otp_published = True
+        _publish_kernel_otp_result(
+            phone,
+            seller,
+            str(result.get("session_id") or ""),
+            result,
+            secrets,
+        )
+
+    # Re-absorb this turn (email/mobile/pin) and merge any concurrent saves before checkout.
+    loaded = absorb_details(dict(loaded), text or "")
+    latest = _load(phone)
+    for key in (
+        "name",
+        "email",
+        "phone",
+        "dob",
+        "gender",
+        "pincode",
+        "billing_address",
+        "city",
+        "billing_state",
+        "kernel_auth_mode",
+        "kernel_session_id",
+        "login_phone",
+    ):
+        if latest.get(key) and not loaded.get(key):
+            loaded[key] = latest[key]
+        elif key in {"email", "phone", "pincode", "billing_address", "city", "billing_state"} and latest.get(key):
+            loaded[key] = latest[key]
+    from app.page_agent import _clean_traveller_name, _traveller_name_parts
+
+    raw_name = str(loaded.get("name") or "")
+    title_hint, _first, _last = _traveller_name_parts(raw_name)
     profile = {
         **{
             key: str(loaded.get(key) or "")
-            for key in ("name", "email", "phone", "dob", "gender", "pincode", "billing_state")
+            for key in (
+                "name",
+                "email",
+                "phone",
+                "dob",
+                "gender",
+                "pincode",
+                "billing_address",
+                "city",
+                "billing_state",
+            )
         },
         "auth_mode": str(loaded.get("kernel_auth_mode") or ""),
+        # Default returning-user preference: never buy Assured without asking.
+        "extras_preference": str(loaded.get("extras_preference") or "decline"),
     }
+    # Keep display name clean so First Name never becomes "Pick".
+    cleaned = _clean_traveller_name(raw_name)
+    if cleaned:
+        # Preserve title in the string filled into Adult 1 (Mr Sudipta Saikia).
+        profile["name"] = f"{title_hint} {cleaned}".strip() if title_hint else cleaned.title()
+        # Persist the clean name so the next turn never re-stores "Pick Mr …".
+        loaded["name"] = profile["name"]
+        if title_hint and not profile.get("gender"):
+            profile["gender"] = "male" if title_hint == "Mr" else ("female" if title_hint in {"Ms", "Mrs"} else "")
+    if not profile["phone"]:
+        profile["phone"] = str(loaded.get("login_phone") or "")
+    if loaded.get("direct_checkout"):
+        profile["direct_checkout"] = "1"
+        seller = "ixigo"
     auth_mode = str(loaded.get("kernel_auth_mode") or "").strip().lower()
     resume = resume_booking_url(loaded, text)
     session_id = str(loaded.get("kernel_session_id") or "")
@@ -4052,6 +5761,55 @@ def _run_kernel_login(
             sellers_to_try = [seller, seller, seller]
     else:
         sellers_to_try = [seller, seller, seller]
+    if loaded.get("direct_checkout"):
+        sellers_to_try = ["ixigo", "ixigo"]
+
+    # No clock yet: read the Ixigo list, keep the cheapest, then book that row.
+    if loaded.get("direct_checkout") and not hint:
+        try:
+            preview = begin_login(
+                seller="ixigo",
+                whatsapp_phone=phone,
+                explicit=str(loaded.get("login_phone") or loaded.get("phone") or ""),
+                origin=origin,
+                destination=destination,
+                depart=depart,
+                hint="",
+                profile=profile,
+                on_code_requested=on_code_requested,
+                on_otp_result=on_otp_result,
+                resume_url="",
+                chosen_tap="",
+                session_id=session_id,
+                fresh_browser=False,
+            )
+        except Exception:
+            logger.exception("Direct checkout fare list failed")
+            preview = {}
+        options = fare_options(str(preview.get("page") or ""))
+        status = str(preview.get("status") or "")
+        if options and status in {"fares", "already_logged_in", "held"}:
+            best = _pick_best(options, "cheapest")
+            alt_fare = _nonstop_alternative(options, best)
+            held_state = _load(phone)
+            held_state["options"] = [_slim_option(item) for item in options]
+            held_state["direct_pick"] = _slim_option(best)
+            if alt_fare:
+                held_state["direct_alt"] = _slim_option(alt_fare)
+            else:
+                held_state.pop("direct_alt", None)
+            held_state["selected_hint"] = str(best.get("depart") or "")
+            held_state["seller"] = "ixigo"
+            held_state["direct_checkout"] = True
+            _save(phone, held_state)
+            hint = held_state["selected_hint"]
+            session_id = str(preview.get("session_id") or session_id)
+            chosen_tap = "Book"
+            loaded["selected_hint"] = hint
+            seller = "ixigo"
+        elif preview:
+            result = preview
+            sellers_to_try = []
 
     for attempt, try_seller in enumerate(sellers_to_try):
         seller = try_seller
@@ -4066,10 +5824,12 @@ def _run_kernel_login(
                 hint=hint,
                 profile=profile,
                 on_code_requested=on_code_requested,
-                resume_url=resume if attempt == 0 else "",
+                on_otp_result=on_otp_result,
+                resume_url="" if loaded.get("require_otp") else (resume if attempt == 0 else ""),
                 chosen_tap=chosen_tap if attempt == 0 else "",
-                session_id=session_id if attempt == 0 else "",
-                fresh_browser=attempt > 0,
+                session_id="" if loaded.get("require_otp") else (session_id if attempt == 0 else ""),
+                fresh_browser=bool(loaded.get("require_otp")) or attempt > 0,
+                require_otp=bool(loaded.get("require_otp")),
             )
         except Exception:
             logger.exception("Kernel booking failed")
@@ -4109,6 +5869,16 @@ def _run_kernel_login(
             # No WhatsApp, no error screenshot — next cookieless tab (or other Kernel seller).
             continue
         break
+    stale = _stale(phone, started_at)
+    if stale:
+        fresh = _load(phone)
+        same_trip = str(fresh.get("origin") or "") == str(loaded.get("origin") or "") and str(
+            fresh.get("destination") or ""
+        ) == str(loaded.get("destination") or "")
+        if not same_trip and not fresh.get("pending_tap"):
+            logger.info("kernel browse stale and trip changed; not publishing")
+            return
+        logger.info("kernel browse stale; publishing the open page anyway")
     status = str(result.get("status") or "")
     if status == "otp_sent" and not announced:
         on_code_requested(result)
@@ -4152,6 +5922,7 @@ def _run_kernel_login(
                         hint=hint,
                         profile=profile,
                         on_code_requested=on_code_requested,
+                        on_otp_result=on_otp_result,
                         resume_url=url_now,
                         chosen_tap="Continue",
                         session_id=sid,
@@ -4237,13 +6008,95 @@ def _run_kernel_login(
                 secrets,
             )
     else:
-        _publish_kernel_otp_result(
-            phone,
-            seller,
-            str(result.get("session_id") or ""),
-            result,
-            secrets,
+        # OTP outcome already WhatsApp'd when typed. A later held page is the booking sheet.
+        if otp_published and str(result.get("status") or "") in {"held", "already_logged_in", "fares"}:
+            _deliver_signed_in_page(phone, seller, result, secrets)
+        elif not otp_published:
+            _publish_kernel_otp_result(
+                phone,
+                seller,
+                str(result.get("session_id") or ""),
+                result,
+                secrets,
+            )
+    queued = _load(phone)
+    queued_tap = str(queued.pop("pending_tap", "") or "")
+    pending_text = str(queued.pop("pending_text", "") or "")
+    if queued_tap:
+        # User may have sent email/mobile while checkout was in flight — absorb into a
+        # fresh profile. Never reuse the stale profile from the browse that just finished.
+        if pending_text:
+            queued = absorb_details(queued, pending_text)
+        _save(phone, queued)
+        fresh_profile = {
+            **{
+                key: str(queued.get(key) or "")
+                for key in (
+                    "name",
+                    "email",
+                    "phone",
+                    "dob",
+                    "gender",
+                    "pincode",
+                    "billing_address",
+                    "city",
+                    "billing_state",
+                )
+            },
+            "auth_mode": str(
+                queued.get("kernel_auth_mode") or profile.get("auth_mode") or ""
+            ),
+        }
+        if not fresh_profile["phone"]:
+            fresh_profile["phone"] = str(
+                queued.get("login_phone") or loaded.get("login_phone") or ""
+            )
+        logger.info(
+            "browse applying queued tap=%s email=%s phone=%s",
+            queued_tap,
+            bool(fresh_profile.get("email")),
+            bool(fresh_profile.get("phone")),
         )
+        try:
+            follow = begin_login(
+                seller=seller,
+                whatsapp_phone=phone,
+                explicit=str(
+                    queued.get("login_phone")
+                    or queued.get("phone")
+                    or loaded.get("login_phone")
+                    or loaded.get("phone")
+                    or ""
+                ),
+                origin=origin,
+                destination=destination,
+                depart=depart,
+                hint=hint,
+                profile=fresh_profile,
+                on_code_requested=on_code_requested,
+                on_otp_result=on_otp_result,
+                resume_url=str((result or {}).get("url") or resume or ""),
+                chosen_tap=queued_tap,
+                session_id=str((result or {}).get("session_id") or session_id or ""),
+                fresh_browser=False,
+            )
+            if str(follow.get("status") or "") in {"already_logged_in", "fares", "held"}:
+                _deliver_signed_in_page(phone, seller, follow, secrets)
+            else:
+                _deliver(
+                    phone,
+                    f"I tried {queued_tap}, but the page did not move on. Nothing paid.",
+                    None,
+                    secrets,
+                )
+        except Exception:
+            logger.exception("queued tap failed")
+            _deliver(
+                phone,
+                f"I could not press {queued_tap} after the open step. Nothing paid.",
+                None,
+                secrets,
+            )
     _clear_busy(phone, started_at)
 
 
@@ -4317,7 +6170,19 @@ def _run_browse(phone: str, text: str, started_at: float | None = None, kind: st
         acquired = _LOCK.acquire(timeout=40)
         lock_held = bool(acquired)
         if not acquired:
-            _deliver(phone, "Another live page is still open. I'll send that result first.", None, secrets)
+            logger.info("browse lock busy after 40s; in-flight checkout must still publish")
+            held = _load(phone)
+            held["pending_tap"] = str(held.get("pending_tap") or held.get("chosen_tap") or "Continue")
+            if text:
+                held["pending_text"] = (text or "")[:200]
+                held = absorb_details(held, text)
+            _save(phone, held)
+            _deliver(
+                phone,
+                "Still on the open page. I'll send that result next instead of starting a second browser. Nothing paid.",
+                None,
+                secrets,
+            )
             _clear_busy(phone, started_at)
             return
         try:
@@ -4889,4 +6754,8 @@ def _load_row(user: dict[str, Any]) -> dict[str, Any]:
 
 
 def _save(phone: str, state: dict[str, Any]) -> None:
+    latest = _load(phone)
+    # An in-flight booking must not write a cleared mobile back over New user.
+    if str(latest.get("profile_reset_at") or "") > str(state.get("profile_reset_at") or ""):
+        return
     db.update_user(phone, interests=state, display_name=str(state.get("name") or "") or None)

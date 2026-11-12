@@ -279,7 +279,7 @@ def _local_turn(text: str, page: str, state: dict[str, Any]) -> dict[str, Any]:
             "source": "local",
         }
     looks_details = bool(
-        re.search(r"@|\bmale\b|\bfemale\b|\bother\b|\d{1,2}/\d{1,2}/\d{2,4}", raw, re.I)
+        re.search(r"@|\bmale\b|\bfemale\b|\bother\b|\d{1,2}/\d{1,2}/\d{2,4}|\b\d{6}\b", raw, re.I)
         or indian_national(raw)
         or re.search(r"\b(?:use|fill)\b.+\b(?:mobile|phone)\b", raw, re.I)
     )
@@ -473,15 +473,29 @@ def interpret_turn(
         tap = ""
         reply = ""
     # Gemini goal wins for traveller actions; local is fallback when Gemini omitted goal.
-    local_goal = str(local.get("goal") or "")
-    if goal in {"pick_traveller", "select_traveller"} or (
-        intent == "book"
-        and re.search(
-            r"\b(saved traveller|tick|select|pick one|click.+\bname)\b",
-            f"{what} {recommend} {reply} {text}",
+    # Bare continue/yes is forward — never re-arm pick from a stale "tick the name" recommend.
+    bare_forward = bool(
+        re.fullmatch(
+            r"continue|go on|yes|yeah|yep|ok|okay|sure|confirm",
+            (text or "").strip(),
             re.I,
         )
-        and not re.search(r"\b(delete|remove)\b", f"{goal} {what} {recommend}", re.I)
+    )
+    local_goal = str(local.get("goal") or "")
+    if bare_forward and goal in {"pick_traveller", "select_traveller"}:
+        goal = "forward"
+        tap = ""
+    elif (not bare_forward) and (
+        goal in {"pick_traveller", "select_traveller"}
+        or (
+            intent == "book"
+            and re.search(
+                r"\b(saved traveller|tick|select|pick one|click.+\bname)\b",
+                f"{what} {recommend} {reply} {text}",
+                re.I,
+            )
+            and not re.search(r"\b(delete|remove)\b", f"{goal} {what} {recommend}", re.I)
+        )
     ):
         goal = "pick_traveller"
         intent = "book"
@@ -493,18 +507,14 @@ def interpret_turn(
         goal = "delete_traveller"
         intent = "book"
         tap = "__delete_traveller__"
-    elif local_goal in {"pick_traveller", "delete_traveller"}:
+    elif (not bare_forward) and local_goal in {"pick_traveller", "delete_traveller"}:
         goal = local_goal
         intent = "book"
         tap = "__select_traveller__" if local_goal == "pick_traveller" else "__delete_traveller__"
-    # Noted/saved reply + contact values → details action (never note-only).
+    # Contact VALUES (email/phone/pin/…) beat a stale pick_traveller / note-only reply.
     if _contact_value_in(text) or _wants_fill_field(text):
-        if goal in {"ask", "status", ""} or re.search(
-            r"\b(?:noted|saved|i(?:'ll| will) remember|got (?:it|those|that))\b",
-            reply,
-            re.I,
-        ):
-            goal, intent = "details", "details"
+        goal, intent = "details", "details"
+        tap = ""
     if not shot and not page and not stored_fare_list(state):
         if trip_ready and intent in {"status", "select", "book", "chat", ""}:
             intent = "search"
@@ -541,13 +551,20 @@ def format_turn_reply(turn: dict[str, Any]) -> str:
 
 
 def has_live_facts(state: dict[str, Any]) -> bool:
-    """True when this booking has a screenshot, a vision read, or a saved fare list."""
+    """True when this booking has a screenshot, a vision read, a saved fare list, or an open sheet."""
     if _shot_from(state):
         return True
     vision = state.get("last_vision") if isinstance(state.get("last_vision"), dict) else {}
     if vision.get("kind"):
         return True
-    return stored_fare_list(state)
+    if stored_fare_list(state):
+        return True
+    # Kernel checkout or a remembered sheet is still mid-booking — do not restart Google search.
+    if str(state.get("kernel_session_id") or "").strip():
+        return True
+    if str(state.get("stuck_page") or "").strip():
+        return True
+    return False
 
 
 def _contact_value_in(text: str) -> bool:
@@ -738,6 +755,33 @@ def _align_ok(goal: str, do: str) -> bool:
     return do in allowed
 
 
+def declines_login(text: str) -> bool:
+    """Traveller is refusing sign-in, not asking for OTP."""
+    raw = text or ""
+    return bool(
+        re.search(
+            r"\b(?:no need(?: for)?|don'?t|do not|without|skip|not|no)\b.{0,40}\b(?:log\s*in|sign\s*in|otp|login)\b"
+            r"|\b(?:log\s*in|sign\s*in|login)\b.{0,24}\b(?:not needed|no thanks|unnecessary)\b"
+            r"|\bas a guest\b|\bbook as guest\b",
+            raw,
+            re.I,
+        )
+    )
+
+
+def wants_login(text: str) -> bool:
+    """Explicit OTP/account login. Negations ('no need for login') are guest."""
+    if declines_login(text):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:log\s*in|sign\s*in|with (?:an? )?otp|use (?:an? )?otp|use (?:my )?account)\b",
+            text or "",
+            re.I,
+        )
+    )
+
+
 def _intent_first(text: str, state: dict[str, Any], turn: dict[str, Any]) -> tuple[str, str]:
     """User message wins over screenshot-biased Gemini goals."""
     goal = str(turn.get("goal") or "").strip().lower()
@@ -761,11 +805,7 @@ def _intent_first(text: str, state: dict[str, Any], turn: dict[str, Any]) -> tup
     # Bare yes/ok on the pay sheet = payment handoff options, not Continue/Book.
     if on_pay and re.fullmatch(r"yes|yep|yeah|ok|okay|sure", raw, re.I):
         return "pay", "pay"
-    if re.search(
-        r"\b(?:log\s*in|sign\s*in|with (?:an? )?otp|use (?:an? )?otp|use (?:my )?account)\b",
-        raw,
-        re.I,
-    ):
+    if wants_login(raw):
         return "login", "login"
     # Departure time (+ optional seller) is select/book, not a doubt.
     if re.search(r"\b\d{1,2}[:.]\d{2}\b", raw):
@@ -780,6 +820,16 @@ def _intent_first(text: str, state: dict[str, Any], turn: dict[str, Any]) -> tup
         re.I,
     ) or goal == "delete_traveller" or tap in {"__delete_traveller__", "__remove_traveller__"}:
         return "delete_traveller", "book"
+    # Bare continue/yes wins over a stale Gemini pick_traveller goal.
+    if re.fullmatch(
+        r"continue|go on|yes|yeah|yep|ok|okay|sure|confirm",
+        raw.strip(),
+        re.I,
+    ):
+        return ("skip" if goal == "skip" else "forward"), "book"
+    # Contact VALUES (pin/email/…) beat a stale pick_traveller goal.
+    if _contact_value_in(raw) or _wants_fill_field(raw):
+        return "details", "details"
     if re.search(
         r"\b(?:click|pick|select\w*|tick|choose|use|tap)\b.+\b(?:name|names|traveller|traveler|profile|saved|one of)\b"
         r"|\b(?:traveller|traveler)\s+as\b"
@@ -787,11 +837,11 @@ def _intent_first(text: str, state: dict[str, Any], turn: dict[str, Any]) -> tup
         r"|\buse (?:the |an? )?existing\b",
         raw,
         re.I,
-    ) or goal == "pick_traveller" or tap in {"__select_traveller__", "__pick_traveller__"}:
+    ) or (
+        (goal == "pick_traveller" or tap in {"__select_traveller__", "__pick_traveller__"})
+        and not re.search(r"\b(?:continue|go on|skip(?:\s+add)?|confirm)\b", raw, re.I)
+    ):
         return "pick_traveller", "book"
-    # Contact VALUES or explicit fill — not Gemini details alone on a question.
-    if _contact_value_in(raw) or _wants_fill_field(raw):
-        return "details", "details"
     if (goal == "details" or intent == "details") and not _wants_clarify(raw):
         return "details", "details"
     if re.search(r"\b(?:continue|go on|skip(?:\s+add)?|confirm|book it|book this)\b", raw, re.I) or goal in {
@@ -863,6 +913,39 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
     clock = bool(re.search(r"\b\d{1,2}[:.]\d{2}\b", text or ""))
     goal, intent = _intent_first(text, state, turn)
     turn = {**turn, "goal": goal, "intent": intent}
+    # Bare continue/yes never keeps a stale pick tap into checkout.
+    if re.fullmatch(
+        r"continue|go on|yes|yeah|yep|ok|okay|sure|confirm",
+        (text or "").strip(),
+        re.I,
+    ):
+        if goal == "pick_traveller" or tap in {"__select_traveller__", "__pick_traveller__"}:
+            goal = "forward"
+            tap = ""
+            turn = {**turn, "goal": "forward", "tap": ""}
+        if str(state.get("chosen_tap") or "") in {"__select_traveller__", "__pick_traveller__"}:
+            state.pop("chosen_tap", None)
+    if declines_login(text):
+        # Ixigo cannot ticket a guest. Cleartrip can still continue without OTP.
+        seller_now = str(state.get("kernel_seller") or state.get("seller") or "").strip().lower()
+        state["kernel_auth_mode"] = "login" if seller_now == "ixigo" else "guest"
+        state["kernel_awaiting_auth_mode"] = False
+        state.pop("kernel_awaiting_phone", None)
+        state.pop("kernel_awaiting_otp", None)
+
+    from app.intent import parse_updates
+
+    route = parse_updates(text or "")
+    # Known traveller + "book … from A to B on a date" goes to Ixigo checkout,
+    # not a Google fare list that waits for another reply.
+    from app.travel_agent import wants_direct_ixigo_checkout
+
+    if wants_direct_ixigo_checkout(text or "", state):
+        return _plan(do="book", kind="book", turn=turn, goal="book", intent="book")
+    if route.get("origin") and route.get("destination") and not re.search(
+        r"\b(?:guest|login|otp)\b", text or "", re.I
+    ):
+        return _plan(do="search", kind="search", turn=turn, goal="search", intent="search")
 
     if goal == "stop" or intent == "cancel":
         return _plan(do="reply", kind="cancel", turn=turn, goal="stop", intent="cancel", reply=str(turn.get("reply") or ""))
@@ -916,6 +999,11 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
             intent="book",
         )
     if goal == "pick_traveller":
+        from app.step_read import _fare_list_sheet
+
+        if _fare_list_sheet(str(state.get("stuck_page") or "")):
+            state.pop("chosen_tap", None)
+            return _plan(do="book", kind="book", tap="", turn=turn, goal="forward", intent="book")
         return _plan(
             do="book",
             kind="book",
@@ -938,14 +1026,7 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
         from app.search import named_seller
 
         named = named_seller(text)
-        wants_login = bool(
-            re.search(
-                r"\b(?:log\s*in|sign\s*in|with (?:an? )?otp|use (?:an? )?otp|use (?:my )?account)\b",
-                text or "",
-                re.I,
-            )
-        )
-        if wants_login:
+        if wants_login(text):
             state["kernel_auth_mode"] = "login"
             state.pop("kernel_logged_in", None)
             state.pop("stuck_kind", None)
@@ -1009,6 +1090,72 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
             reply=format_turn_reply(turn),
         )
 
+    stuck_preview = str(state.get("stuck_page") or "")
+    # Ixigo login drawer with a saved mobile: continue/go on fills that number — not a grey Continue mash.
+    on_login_drawer = str(state.get("stuck_kind") or "") == "login" or bool(
+        re.search(r"log in to ixigo|enter mobile number", stuck_preview, re.I)
+    )
+    if goal in {"skip", "forward"} and on_login_drawer:
+        from app.kernel_otp import indian_national
+
+        if indian_national(str(state.get("login_phone") or state.get("phone") or "")) and not re.search(
+            r"verify your mobile|enter the otp|enter otp|otp sent", stuck_preview, re.I
+        ):
+            state["kernel_auth_mode"] = "login"
+            state["kernel_awaiting_phone"] = False
+            state.pop("chosen_tap", None)
+            return _plan(do="book", kind="book", tap="", turn=turn, goal="forward", intent="book")
+
+    # Free-cancellation radios: skip/yes means pick the decline option (or named radio), never a new search.
+    if stuck_preview and goal in {"skip", "forward"}:
+        from app.step_read import accept_choice, classify_sheet, decide_sheet, upsell_choice_labels
+
+        if classify_sheet(stuck_preview) == "upsell" or str(state.get("stuck_kind") or "") in {
+            "upsell",
+            "addon_buy",
+        }:
+            upsell_move = decide_sheet(
+                stuck_preview,
+                state,
+                front=str(state.get("stuck_front") or ""),
+                controls=str(state.get("stuck_controls") or ""),
+                overlay=bool(state.get("stuck_front")),
+            )
+            if str(upsell_move.get("sheet") or "") == "upsell" or upsell_choice_labels(stuck_preview):
+                choices = [str(item) for item in (upsell_move.get("fills") or []) if str(item).strip()]
+                if not choices:
+                    choices = upsell_choice_labels(stuck_preview)
+                pending = {
+                    "tap": str(upsell_move.get("tap") or ""),
+                    "page": stuck_preview,
+                    "kind": "upsell",
+                    "controls": choices or None,
+                }
+                chosen = accept_choice(text or "", pending)
+                if not chosen and re.search(
+                    r"\b(?:yes|yep|yeah|ok|okay|sure|continue|skip)\b", text or "", re.I
+                ):
+                    chosen = str(
+                        upsell_move.get("tap")
+                        or next(
+                            (
+                                item
+                                for item in choices
+                                if re.search(r"don.?t want|no,?\s*thanks|without assured", item, re.I)
+                            ),
+                            choices[-1] if choices else "",
+                        )
+                    )
+                if chosen:
+                    return _plan(
+                        do="book",
+                        kind="book",
+                        tap=chosen,
+                        turn=turn,
+                        goal="skip",
+                        intent="book",
+                    )
+
     if not live:
         if trip:
             return _plan(do="search", kind="search", turn=turn, goal="search", intent="search")
@@ -1021,6 +1168,10 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
             reply=str(turn.get("reply") or ""),
         )
 
+    from app.step_read import _fare_list_sheet
+
+    if _fare_list_sheet(str(state.get("stuck_page") or "")) and sheet not in {"pay", "otp", "login", "error"}:
+        sheet = "results"
     if sheet in {"results", "loading"}:
         if clock or goal in {"forward", "select"} or intent in {"select", "book"}:
             return _plan(
@@ -1077,15 +1228,91 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
         if str(state.get("chosen_tap") or "") in {"__select_traveller__", "__pick_traveller__"}:
             state.pop("chosen_tap", None)
 
+    # Name-confirm / Assured ask: traveller already named Confirm, Edit, or an Assured radio.
+    if (
+        on_this_sheet
+        and sheet_move.get("action") == "ask"
+        and not sheet_move.get("missing")
+        and move_sheet in {"name_confirm", "upsell"}
+    ):
+        from app.step_read import accept_choice, upsell_choice_labels
+
+        pending = {
+            "tap": str(sheet_move.get("tap") or ""),
+            "page": stuck_page,
+            "kind": "name_confirm" if move_sheet == "name_confirm" else "upsell",
+            "controls": list(sheet_move.get("fills") or []) or None,
+        }
+        chosen = accept_choice(text or "", pending)
+        if chosen:
+            return _plan(
+                do="book",
+                kind="book",
+                tap=chosen,
+                turn=turn,
+                goal="skip" if move_sheet == "upsell" else "forward",
+                intent="book",
+            )
+        if move_sheet == "upsell" and re.search(
+            r"\b(?:yes|yep|yeah|ok|okay|sure|continue|skip)\b", text or "", re.I
+        ):
+            choices = upsell_choice_labels(stuck_page)
+            return _plan(
+                do="book",
+                kind="book",
+                tap=str(sheet_move.get("tap") or (choices[-1] if choices else "")),
+                turn=turn,
+                goal="skip",
+                intent="book",
+            )
+
     # decide_sheet owns the next act on this sheet (fill / ask / click).
     if on_this_sheet and sheet_move.get("action") in {"ask", "reply", "stop"}:
         if sheet_move.get("action") == "stop":
             reply = "This is the payment page. I won't press Pay unless you say pay with card or you'll pay yourself. Nothing paid."
         elif sheet_move.get("missing"):
+            from app.step_read import forward_tap, visible_forward
+
+            missing_now = [str(item).strip().lower() for item in (sheet_move.get("missing") or [])]
+            # Soft billing gaps (address/city/state) must not block an explicit Continue —
+            # checkout prepares then clicks. Hard blockers (email/pin/mobile/name) still ask.
+            soft_only = bool(missing_now) and all(
+                item in {"address", "city", "state", "billing_state"} for item in missing_now
+            )
+            if soft_only and re.fullmatch(
+                r"continue|go on|confirm",
+                (text or "").strip(),
+                re.I,
+            ):
+                return _plan(
+                    do="book",
+                    kind="book",
+                    tap=str(
+                        sheet_move.get("tap")
+                        or forward_tap(stuck_page)
+                        or visible_forward(stuck_page)
+                        or "Continue"
+                    ),
+                    turn=turn,
+                    goal="forward",
+                    intent="book",
+                )
             fields = " and ".join(str(item) for item in sheet_move["missing"])
             reply = (
                 f"The open page needs your {fields} before I press a button. "
                 "Send it and I'll type it in. Nothing paid."
+            )
+        elif move_sheet == "name_confirm" and sheet_move.get("tap"):
+            reply = (
+                f"Review Details wants {sheet_move['tap']}. "
+                "Reply confirm (or yes) to press it, or edit / exit for Edit. Nothing paid."
+            )
+        elif move_sheet == "upsell" and (sheet_move.get("fills") or sheet_move.get("tap")):
+            choices = [str(item) for item in (sheet_move.get("fills") or []) if str(item).strip()]
+            listed = " / ".join(choices) if choices else str(sheet_move.get("tap") or "No, Thanks")
+            reply = (
+                f"Free cancellation options are open: {listed}. "
+                "Pick one and I'll tick it. Nothing paid."
             )
         elif sheet_move.get("tap"):
             reply = f"The page is blocked. Reply if you want me to press {sheet_move['tap']}. Nothing paid."
@@ -1093,6 +1320,56 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
             reply = "Tell me which flight time you want. I won't press a button that isn't the next step. Nothing paid."
         return _plan(do="reply", kind="form", turn=turn, goal="ask", intent="details", reply=reply)
     if on_this_sheet and sheet_move.get("action") == "fill":
+        from app.step_read import (
+            _assured_radio_gate,
+            decline_tap,
+            forward_tap,
+            upsell_choice_labels,
+            visible_forward,
+        )
+
+        # Continue on Review Details with Assured radios open: decline first — never
+        # a contact-only fill that mashes Continue with travellers still unticked.
+        if re.search(r"\b(?:continue|go on|yes|yeah|ok|okay|sure|skip)\b", text or "", re.I) and (
+            _assured_radio_gate(stuck_page) or len(upsell_choice_labels(stuck_page)) >= 2
+        ):
+            choices = upsell_choice_labels(stuck_page)
+            chosen = (
+                decline_tap(stuck_page)
+                or next(
+                    (
+                        item
+                        for item in choices
+                        if re.search(r"don.?t want|no,?\s*thanks|without assured", item, re.I)
+                    ),
+                    choices[-1] if choices else "",
+                )
+            )
+            if chosen:
+                return _plan(
+                    do="book",
+                    kind="book",
+                    tap=chosen,
+                    turn=turn,
+                    goal="skip",
+                    intent="book",
+                )
+        # Explicit continue/go on/confirm → press Continue (prepare+click). Bare yes/ok
+        # still fills missing contact first — do not invent a Continue mash.
+        if re.fullmatch(r"continue|go on|confirm", (text or "").strip(), re.I):
+            return _plan(
+                do="book",
+                kind="book",
+                tap=str(
+                    sheet_move.get("tap")
+                    or forward_tap(stuck_page)
+                    or visible_forward(stuck_page)
+                    or "Continue"
+                ),
+                turn=turn,
+                goal="forward",
+                intent="book",
+            )
         return _plan(
             do="details",
             kind="details",
@@ -1108,23 +1385,6 @@ def align_action(text: str, state: dict[str, Any], turn: dict[str, Any] | None =
             tap=str(sheet_move["tap"]),
             turn=turn,
             goal="skip" if goal == "skip" else "forward",
-            intent="book",
-        )
-    # Upsell ask with a named safe decline — yes presses that tap.
-    if (
-        on_this_sheet
-        and move_sheet == "upsell"
-        and sheet_move.get("action") == "ask"
-        and sheet_move.get("tap")
-        and not sheet_move.get("missing")
-        and re.search(r"\b(?:confirm|yes|yep|yeah|ok|okay|sure|continue|skip)\b", text or "", re.I)
-    ):
-        return _plan(
-            do="book",
-            kind="book",
-            tap=str(sheet_move["tap"]),
-            turn=turn,
-            goal="skip",
             intent="book",
         )
 

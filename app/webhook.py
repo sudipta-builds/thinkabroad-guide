@@ -5,7 +5,6 @@ from urllib.parse import parse_qs
 
 from fastapi import APIRouter, BackgroundTasks, Query, Request, Response
 from fastapi.responses import PlainTextResponse
-from twilio.twiml.messaging_response import MessagingResponse
 
 from app import agent
 from app.config import get_settings
@@ -16,6 +15,13 @@ from app.twilio_wa import digits_only, remember_inbound, send_whatsapp
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _twilio_messaging_response():
+    """Lazy import — Meta Cloud API / lab do not need the twilio package."""
+    from twilio.twiml.messaging_response import MessagingResponse
+
+    return MessagingResponse()
 
 
 async def _form_fields(request: Request) -> dict[str, str]:
@@ -115,13 +121,13 @@ async def twilio_whatsapp_inbound(request: Request):
     reply = for_send(reply, reacted=reacted)
 
     if not (reply.text or "").strip() and not reply.media_urls:
-        return Response(content=str(MessagingResponse()), media_type="application/xml")
+        return Response(content=str(_twilio_messaging_response()), media_type="application/xml")
 
     if reply.media_urls and (settings.meta_wa_ready or settings.twilio_ready):
         send_whatsapp(phone, reply)
-        return Response(content=str(MessagingResponse()), media_type="application/xml")
+        return Response(content=str(_twilio_messaging_response()), media_type="application/xml")
 
-    twiml = MessagingResponse()
+    twiml = _twilio_messaging_response()
     msg = twiml.message((reply.text or "")[:1500])
     if reply.media_urls:
         msg.media(reply.media_urls[0])

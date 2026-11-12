@@ -6,12 +6,15 @@ never written to logs. Payment is not part of this flow.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import threading
 import time
 from collections.abc import Callable
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from app.config import get_settings
 from app.page_agent import (
@@ -45,6 +48,26 @@ class _RetryBeginLogin(Exception):
 def should_hunt_login(stage: str) -> bool:
     """Open a mobile field only when this sheet is login. Continue on extras is not login."""
     return stage in {"login", "otp"}
+
+
+def should_type_login_phone(stage: str, text: str) -> bool:
+    """Type the saved mobile on the Ixigo sign-in drawer.
+
+    That drawer says Enter Mobile Number while Fare Summary / Review & Traveller
+    stays behind it. The words "mobile number" must not be treated as a contact form.
+    """
+    hay = text or ""
+    if re.search(r"log in to ixigo", hay, re.I) and not re.search(
+        r"verify your mobile|enter the otp|enter otp|otp sent", hay, re.I
+    ):
+        return True
+    if stage not in {"login", "otp"}:
+        return False
+    from app.step_read import form_sheet
+
+    if form_sheet(hay) or re.search(r"add contact details|email address|review traveller", hay, re.I):
+        return False
+    return True
 
 
 def after_checkout_status(stage: str) -> str:
@@ -137,14 +160,17 @@ def viewport_click(metrics: dict[str, float], box: dict[str, Any]) -> tuple[int,
 
 def otp_failure_detail(*, boxes_open: bool, verifying: bool = False) -> str:
     if boxes_open:
-        return "The code is in the boxes, but Verify did not submit. Say Ixigo again for a new code."
+        return (
+            "That OTP is incorrect. The code boxes are still open. "
+            "Reply with a new code and I'll type it on this same screen. Nothing paid."
+        )
     if verifying:
         return "Ixigo is still checking that code. The account did not appear."
     return "The code screen closed, but Ixigo still shows Log in. Say Ixigo again for a new code."
 
 
 def resume_kernel_otp(state: dict[str, Any], text: str) -> str:
-    """What WhatsApp should do with a code. Never opens a second browser connection."""
+    """What WhatsApp should do with a code. Prefer the live login connection."""
     if not should_resume_kernel_otp(state, text):
         return ""
     seller = str(state.get("kernel_seller") or "ixigo")
@@ -152,12 +178,24 @@ def resume_kernel_otp(state: dict[str, Any], text: str) -> str:
         return "need_digits"
     if handoff_whatsapp_otp(state, text):
         return "type"
-    return "closed"
+    # Lab restart drops the in-memory waiter; reconnect and type on the same Kernel tab.
+    return "reconnect"
 
 
 def keep_kernel_otp_session(status: str) -> bool:
     """The login page is still waiting, so the same Kernel browser should stay up."""
-    return status in {"bad_code", "still_otp"}
+    return status in {"bad_code", "still_otp", "boxes_miss"}
+
+
+def checkout_step_budget(seller: str, chosen_tap: str, passenger: dict | None) -> int:
+    """How many checkout clicks this pass may take. Direct Ixigo checkout is one turn."""
+    if re.search(r"skip add", chosen_tap or "", re.I):
+        return 6
+    if seller == "cleartrip":
+        return 28
+    if str((passenger or {}).get("direct_checkout") or "") == "1":
+        return 32
+    return 16
 
 
 def keep_kernel_browser(status: str) -> bool:
@@ -314,7 +352,8 @@ def _find(page, kind: str, seller: str):
               const ml = i.getAttribute('maxlength');
               const mode = (i.getAttribute('inputmode') || '') + (i.autocomplete || '') + (i.name || '') + (i.id || '');
               if (seller === 'cleartrip') return r.width > 40 && r.width < 70 && r.height > 40 && r.height < 70;
-              return ml === '1' || /one-time|otp|numeric/i.test(mode);
+              return ml === '1' || /one-time|otp|numeric/i.test(mode)
+                || (r.width >= 24 && r.width <= 72 && r.height >= 24 && r.height <= 72);
             });
             boxes.sort((a,b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x);
             if (boxes.length > need) boxes = boxes.slice(-need);
@@ -532,12 +571,14 @@ def begin_login(
     explicit: str = "",
     profile: dict[str, str] | None = None,
     on_code_requested: Callable[[dict[str, str]], None] | None = None,
+    on_otp_result: Callable[[dict[str, str]], None] | None = None,
     otp_wait_sec: int = 300,
     resume_url: str = "",
     chosen_tap: str = "",
     session_id: str = "",
     error_retry: int = 0,
     fresh_browser: bool = False,
+    require_otp: bool = False,
 ) -> dict[str, str]:
     """Open the seller and request one OTP.
 
@@ -592,6 +633,9 @@ def begin_login(
             resume_kept = False
             dead_error = False
             skip_tap = bool(re.search(r"skip add", chosen_tap or "", re.I))
+            # "Book" means pick a clock on the fare list — never reopen a stale itinerary
+            # (that is how 1:15 go-on landed on a leftover 20:15 Review page).
+            book_tap = bool(re.fullmatch(r"book", (chosen_tap or "").strip(), re.I))
             text, url = _read_visible(page)
             stage = classify_page(text, url, book_count=_book_count(page))
             dead_resume = bool(
@@ -615,12 +659,14 @@ def begin_login(
                     "hint": hint,
                     "profile": guest_profile,
                     "on_code_requested": on_code_requested,
+                    "on_otp_result": on_otp_result,
                     "otp_wait_sec": otp_wait_sec,
                     "resume_url": "",
                     "chosen_tap": "",
                     "session_id": "",
                     "error_retry": error_retry + (1 if bump else 0),
                     "fresh_browser": True,
+                    "require_otp": require_otp,
                 }
 
             if dead_resume:
@@ -641,14 +687,10 @@ def begin_login(
                     origin=origin,
                     destination=destination,
                     depart=depart,
-                    expect_flight="IX1513" if hint == "1:15" else "",
+                    expect_flight="",
                     allow_pay=False,
                     pause_on_auth=True,
-                    max_steps=(
-                        6
-                        if re.search(r"skip add", chosen_tap or "", re.I)
-                        else (28 if seller == "cleartrip" else 16)
-                    ),
+                    max_steps=checkout_step_budget(seller, chosen_tap, passenger),
                     profile=passenger,
                     chosen_tap=chosen_tap,
                 )
@@ -690,6 +732,9 @@ def begin_login(
                     chosen_tap = ""
                     skip_tap = False
             # Saved checkout URL is a fallback when that tab is gone.
+            # Book a clock from results — do not reopen a leftover Review Details URL.
+            if book_tap:
+                resume_url = ""
             if not resume_kept and not dead_error and hint and resume_url and is_resume_booking_url(resume_url, seller):
                 try:
                     page.goto(resume_url, wait_until="domcontentloaded", timeout=45000 if chosen_tap else 120000)
@@ -755,7 +800,7 @@ def begin_login(
                     # before the traveller has chosen a flight.
                     text, url = _read_visible(page)
                     outcome = {
-                        "status": "already_logged_in" if _logged_in(page, seller) else "fares",
+                        "status": "fares" if require_otp else ("already_logged_in" if _logged_in(page, seller) else "fares"),
                         "session_id": sid,
                         "seller": seller,
                         "screenshot": _shot(page, seller, sid, "fares"),
@@ -770,19 +815,24 @@ def begin_login(
                         origin=origin,
                         destination=destination,
                         depart=depart,
-                        expect_flight="IX1513" if hint == "1:15" else "",
+                        expect_flight="",
                         allow_pay=False,
                         pause_on_auth=True,
-                        max_steps=(
-                            6
-                            if re.search(r"skip add", chosen_tap or "", re.I)
-                            else (28 if seller == "cleartrip" else 16)
-                        ),
+                        max_steps=checkout_step_budget(seller, chosen_tap, passenger),
                         profile=passenger,
                         chosen_tap=chosen_tap,
                     )
                     checkout_notes = ((checkout.handoff + " | ") if checkout.handoff else "") + " | ".join(checkout.log)[:1500]
                     page = _latest(page)
+                if seller == "ixigo" and (require_otp or auth_mode == "login"):
+                    from app.page_agent import _click_ixigo_header_login, ixigo_header_needs_login
+
+                    text, url = _read_visible(page)
+                    if ixigo_header_needs_login(text):
+                        _click_ixigo_header_login(page)
+                        page.wait_for_timeout(800)
+                        hunt_otp = True
+                        national = indian_national(explicit) or national
                 if hint and checkout and should_hunt_login(classify_page(*_read_visible(page), book_count=_book_count(page))):
                     for _ in range(8):
                         page = _latest(page)
@@ -835,7 +885,12 @@ def begin_login(
                         "url": url or "",
                         "notes": checkout_notes,
                     }
-            if outcome is None and _logged_in(page, seller) and not _otp_visible(page, seller):
+            if (
+                outcome is None
+                and _logged_in(page, seller)
+                and not _otp_visible(page, seller)
+                and not require_otp
+            ):
                 text, url = _read_visible(page)
                 stage = classify_page(text, url, book_count=_book_count(page))
                 if stage not in {"error", "home"} and not site_error_page(text, url):
@@ -847,32 +902,95 @@ def begin_login(
                         "page": (text or "")[:8000],
                         "url": url or "",
                     }
+            elif outcome is None and require_otp and _logged_in(page, seller) and not _otp_visible(page, seller):
+                # Someone else's Ixigo session. Do not skip OTP for this new number.
+                try:
+                    page.evaluate(
+                        """() => {
+                          const els = [...document.querySelectorAll('a,button,[role=button]')];
+                          const hit = els.find(e => /^log\\s*out$|^sign\\s*out$/i.test((e.innerText || '').trim()));
+                          if (hit) hit.click();
+                        }"""
+                    )
+                    page.wait_for_timeout(1200)
+                except Exception:
+                    pass
             ok = False
             if outcome is None and should_hunt_login(stage) and not hunt_otp:
-                # Guest booking: leave the login/OTP sheet for WhatsApp; do not request a code.
                 text, url = _read_visible(page)
-                outcome = {
-                    "status": "held",
-                    "session_id": sid,
-                    "seller": seller,
-                    "screenshot": _shot(page, seller, sid, "held"),
-                    "page": (text or "")[:8000],
-                    "url": url or "",
-                    "notes": (checkout_notes + " | guest_skip_otp").strip(" |"),
-                }
+                saved_mobile = indian_national(explicit)
+                otp_sheet = stage == "otp" or bool(
+                    re.search(r"verify your mobile|enter the otp|enter otp|otp sent", text or "", re.I)
+                )
+                mobile_sheet = (not otp_sheet) and (
+                    stage == "login"
+                    or bool(re.search(r"log in to ixigo|enter mobile number", text or "", re.I))
+                )
+                if saved_mobile and (mobile_sheet or otp_sheet):
+                    # Remembered mobile: type it (if still on the number sheet) and wait for the OTP.
+                    hunt_otp = True
+                    national = saved_mobile
+                elif mobile_sheet or otp_sheet:
+                    # No saved mobile yet: keep the sign-in sheet and let WhatsApp ask for it.
+                    outcome = {
+                        "status": "held",
+                        "session_id": sid,
+                        "seller": seller,
+                        "screenshot": _shot(page, seller, sid, "held"),
+                        "page": (text or "")[:8000],
+                        "url": url or "",
+                        "notes": (checkout_notes + " | login_need_mobile").strip(" |"),
+                    }
             if outcome is None and should_hunt_login(stage):
                 ok = _otp_visible(page, seller)
-            if outcome is None and should_hunt_login(stage) and not ok:
+            if outcome is None and not ok:
                 text, url = _read_visible(page)
                 stage = classify_page(text, url, book_count=_book_count(page))
-                from app.step_read import form_sheet
+                # The Ixigo sign-in drawer says Enter Mobile Number on top of Review & Traveller.
+                # That is the login field. A contact form with the same words is not.
+                if should_type_login_phone(stage, text) and len(national) == 10:
+                    phone_box = _find(page, "phone", seller)
+                    if not phone_box:
+                        from app.page_agent import _fill_ixigo_login_phone
 
-                # Contact validation ("Please enter Mobile Number") is not the OTP login sheet.
-                if (
-                    stage not in {"login", "otp"}
-                    or form_sheet(text)
-                    or re.search(r"add contact details|email address|review traveller", text or "", re.I)
-                ):
+                        note = _fill_ixigo_login_phone(page, national)
+                        if str(note).startswith("filled_mobile"):
+                            send = _find(page, "send", seller)
+                            if send:
+                                _click(client, sid, page, send)
+                            else:
+                                client.browsers.computer.press_key(sid, keys=["Return"])
+                            phone_box = {"x": 0, "y": 0}
+                        else:
+                            shot = _shot(page, seller, sid, "otp-miss")
+                            try:
+                                pw.close()
+                            except Exception:
+                                pass
+                            _drop(client, sid)
+                            return {
+                                "status": "phone_miss",
+                                "detail": "Mobile field did not open.",
+                                "session_id": sid,
+                                "seller": seller,
+                                "screenshot": shot,
+                            }
+                    if phone_box.get("x") or phone_box.get("y"):
+                        _click(client, sid, page, phone_box)
+                        page.wait_for_timeout(300)
+                        client.browsers.computer.type_text(sid, text=national, delay=40)
+                        page.wait_for_timeout(300)
+                        send = _find(page, "send", seller)
+                        if send:
+                            _click(client, sid, page, send)
+                        client.browsers.computer.press_key(sid, keys=["Return"])
+                    for _ in range(30):
+                        page = _latest(page)
+                        if _otp_visible(page, seller):
+                            ok = True
+                            break
+                        page.wait_for_timeout(400)
+                elif should_hunt_login(stage):
                     outcome = {
                         "status": "held",
                         "session_id": sid,
@@ -882,44 +1000,15 @@ def begin_login(
                         "url": url or "",
                         "notes": checkout_notes,
                     }
-                else:
-                    phone_box = _find(page, "phone", seller)
-                    if not phone_box:
-                        shot = _shot(page, seller, sid, "otp-miss")
-                        try:
-                            pw.close()
-                        except Exception:
-                            pass
-                        _drop(client, sid)
-                        return {
-                            "status": "phone_miss",
-                            "detail": "Mobile field did not open.",
-                            "session_id": sid,
-                            "seller": seller,
-                            "screenshot": shot,
-                        }
-                    _click(client, sid, page, phone_box)
-                    page.wait_for_timeout(300)
-                    client.browsers.computer.type_text(sid, text=national, delay=40)
-                    page.wait_for_timeout(300)
-                    send = _find(page, "send", seller)
-                    if send:
-                        _click(client, sid, page, send)
-                    client.browsers.computer.press_key(sid, keys=["Return"])
-                    for _ in range(30):
-                        page = _latest(page)
-                        if _otp_visible(page, seller):
-                            ok = True
-                            break
-                        page.wait_for_timeout(400)
             shot = ""
             if ok:
                 try:
                     from app.media_files import ensure_media_dir
 
                     dest = ensure_media_dir() / f"otp-{seller}-{sid[:8]}.jpg"
-                    page.screenshot(path=str(dest), type="jpeg", quality=55)
-                    shot = str(dest)
+                    from app.vision_agent import capture_user_shot
+
+                    shot = capture_user_shot(page, dest=dest, tag="otp") or ""
                 except Exception:
                     shot = ""
             if outcome is None and not should_hunt_login(stage):
@@ -973,17 +1062,28 @@ def begin_login(
                     outcome = _apply_otp(client, sid, page, seller, code)
                     outcome["session_id"] = sid
                     outcome["seller"] = seller
+                    # Tell WhatsApp now — do not wait for the post-login checkout loop.
+                    if on_otp_result is not None:
+                        try:
+                            on_otp_result(dict(outcome))
+                        except Exception:
+                            logger.exception("on_otp_result failed")
                     if hint and seller == "ixigo" and outcome.get("status") == "logged_in":
                         page = _latest(page)
-                        page.goto(
-                            ixigo_results_url(origin, destination, depart),
-                            wait_until="domcontentloaded",
-                            timeout=120000,
-                        )
-                        for _ in range(40):
-                            if _book_count(page) >= 2:
-                                break
-                            page.wait_for_timeout(400)
+                        try:
+                            stayed_on_booking = is_resume_booking_url(page.url or "", seller)
+                        except Exception:
+                            stayed_on_booking = False
+                        if not stayed_on_booking:
+                            page.goto(
+                                ixigo_results_url(origin, destination, depart),
+                                wait_until="domcontentloaded",
+                                timeout=120000,
+                            )
+                            for _ in range(40):
+                                if _book_count(page) >= 2:
+                                    break
+                                page.wait_for_timeout(400)
                         checkout = run_checkout_agent(
                             page,
                             hint=hint,
@@ -991,10 +1091,10 @@ def begin_login(
                             origin=origin,
                             destination=destination,
                             depart=depart,
-                            expect_flight="IX1513" if hint == "1:15" else "",
+                            expect_flight="",
                             allow_pay=False,
                             pause_on_auth=True,
-                            max_steps=16,
+                            max_steps=checkout_step_budget(seller, chosen_tap, passenger),
                             profile=passenger,
                             chosen_tap=chosen_tap,
                         )
@@ -1043,12 +1143,14 @@ def begin_login(
                     hint=hint,
                     profile=guest_profile,
                     on_code_requested=on_code_requested,
+                    on_otp_result=on_otp_result,
                     otp_wait_sec=otp_wait_sec,
                     resume_url="",
                     chosen_tap="",
                     session_id="",
                     error_retry=error_retry + 1,
                     fresh_browser=True,
+                    require_otp=require_otp,
                 )
             except Exception as retry_exc:
                 detail = f"{detail} | retry {type(retry_exc).__name__}: {str(retry_exc)[:120]}"
@@ -1056,17 +1158,13 @@ def begin_login(
 
 
 def _shot(page, seller: str, session_id: str, tag: str) -> str:
+    """Traveller-facing Kernel screenshot — clean, readable (not vision debug)."""
     try:
         from app.media_files import ensure_media_dir
-        from app.page_agent import settle_visible_sheet
+        from app.vision_agent import capture_user_shot
 
-        try:
-            settle_visible_sheet(page)
-        except Exception:
-            pass
         dest = ensure_media_dir() / f"{tag}-{seller}-{session_id[:8]}.jpg"
-        page.screenshot(path=str(dest), type="jpeg", quality=55)
-        return str(dest)
+        return capture_user_shot(page, dest=dest, tag=tag) or ""
     except Exception:
         return ""
 
@@ -1085,7 +1183,14 @@ def _otp_page(context, seller: str):
 
 
 def _press_verify(client, session_id: str, page) -> bool:
-    """One OS click on the Verify button. No guessed coordinate."""
+    """Click the Verify button on the element, then fall back to one OS click."""
+    try:
+        button = page.get_by_role("button", name=re.compile(r"^verify$", re.I)).last
+        if button.count() and button.is_visible():
+            button.click(timeout=3000)
+            return True
+    except Exception:
+        pass
     hit = _find(page, "verify", "ixigo")
     if not hit:
         return False
@@ -1093,8 +1198,44 @@ def _press_verify(client, session_id: str, page) -> bool:
     return True
 
 
+def _otp_box_text(page, seller: str) -> str:
+    boxes = _find(page, "otp", seller) or []
+    return "".join(re.sub(r"\D", "", str(box.get("v") or "")) for box in boxes)
+
+
+def _type_otp_fields(page, digits: str, need: int) -> bool:
+    """Type into the OTP inputs themselves. A mouse click misses these small boxes."""
+    try:
+        handles = page.locator(
+            "input[maxlength='1'], input[inputmode='numeric'], input[autocomplete='one-time-code']"
+        )
+        visible = []
+        count = min(handles.count(), 12)
+        for index in range(count):
+            box = handles.nth(index)
+            try:
+                if box.is_visible():
+                    visible.append(box)
+            except Exception:
+                continue
+        if len(visible) > need:
+            visible = visible[-need:]
+        if len(visible) < need:
+            return False
+        visible[0].click(timeout=2000)
+        page.keyboard.type(digits[:need], delay=60)
+        page.wait_for_timeout(200)
+        return True
+    except Exception:
+        return False
+
+
 def _type_otp(client, session_id: str, page, seller: str, digits: str) -> None:
-    """One Kernel click and one character per box. Same as the local login."""
+    """Type one character per OTP box. Element typing first; OS click only if that misses."""
+    need = 6 if seller == "ixigo" else 4
+    _type_otp_fields(page, digits, need)
+    if _otp_box_text(page, seller) == digits[:need]:
+        return
     boxes = _find(page, "otp", seller) or []
     if not boxes:
         return
@@ -1122,14 +1263,24 @@ def _apply_otp(client, session_id: str, page, seller: str, code: str) -> dict[st
         }
     _type_otp(client, session_id, page, seller, digits)
     page.wait_for_timeout(400)
+    if _otp_box_text(page, seller) != digits:
+        shot = _shot(page, seller, session_id, "otp-empty")
+        return {
+            "status": "boxes_miss",
+            "detail": "The code did not land in the OTP boxes. Reply with the same digits again.",
+            "screenshot": shot,
+            "session_id": session_id,
+            "seller": seller,
+        }
     if seller == "ixigo":
         _press_verify(client, session_id, page)
     logged = False
     still = False
     verifying = False
+    empty_rounds = 0
     # The working login stayed on this page through "Please wait while we verify".
     # Leaving, or closing the browser, while that text is up drops the account.
-    for _attempt in range(150):
+    for _attempt in range(20):
         page.wait_for_timeout(1000)
         try:
             if page.is_closed():
@@ -1140,38 +1291,60 @@ def _apply_otp(client, session_id: str, page, seller: str, code: str) -> dict[st
         if seller == "ixigo" and ixigo_verify_in_progress(text):
             verifying = True
             still = False
+            empty_rounds = 0
             continue
         if _logged_in(page, seller):
             logged = True
             verifying = False
             break
+        if re.search(
+            r"incorrect otp|invalid otp|wrong otp|otp is (?:incorrect|invalid|wrong)|"
+            r"entered otp is incorrect|please enter (?:a )?valid otp",
+            text or "",
+            re.I,
+        ):
+            shot = _shot(page, seller, session_id, "otp-rejected")
+            return {
+                "status": "still_otp",
+                "detail": (
+                    "That OTP is incorrect. Reply with a new code and I'll type it on this same screen. "
+                    "Nothing paid."
+                ),
+                "screenshot": shot,
+                "session_id": session_id,
+                "seller": seller,
+            }
         if _code_boxes_open(page, seller):
             still = True
+            if _otp_box_text(page, seller) != digits:
+                empty_rounds += 1
+                # Digits never stuck — stop early instead of waiting in silence.
+                if empty_rounds >= 8:
+                    break
+            else:
+                empty_rounds = 0
             continue
         still = False
         if verifying:
             verifying = False
             break
-    if seller == "ixigo" and not logged and not _code_boxes_open(page, seller) and not verifying:
-        try:
-            page.goto("https://www.ixigo.com/", wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(2500)
-        except Exception:
-            pass
-        logged = _logged_in(page, seller)
-    if seller == "ixigo" and logged:
-        try:
-            page.goto("https://www.ixigo.com/", wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(2500)
-        except Exception:
-            pass
-        logged = _logged_in(page, seller)
+    # Stay on the open flight. A hop to the Ixigo homepage drops the chosen fare
+    # and leaves WhatsApp silent until that navigation finishes.
     shot = _shot(page, seller, session_id, "otp-after")
     if logged:
         return {"status": "logged_in", "seller": seller, "screenshot": shot}
+    if still:
+        # Same Kernel tab stays up so the next digits retry this OTP step only.
+        return {
+            "status": "still_otp",
+            "detail": otp_failure_detail(boxes_open=True),
+            "screenshot": shot,
+            "session_id": session_id,
+            "seller": seller,
+        }
     return {
         "status": "no_session",
-        "detail": otp_failure_detail(boxes_open=still, verifying=verifying),
+        "detail": otp_failure_detail(boxes_open=False, verifying=verifying),
         "screenshot": shot,
     }
 

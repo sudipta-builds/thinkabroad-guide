@@ -138,6 +138,21 @@ class DateAndMemory(unittest.TestCase):
         self.assertEqual(stuck["depart"], "2026-12-04")
         self.assertEqual(stuck["name"], "Sudipta Saikia")
         self.assertEqual(infer_intent(stuck, "Sudipta Saikia"), "details")
+        casual = absorb_details(
+            {"phone": "8638586171"},
+            "sudipta saikia, 29/07/1997/male, jorhat, assam, 785001",
+        )
+        self.assertEqual(casual.get("name"), "Sudipta Saikia")
+        self.assertEqual(casual.get("dob"), "29/07/1997")
+        self.assertEqual(casual.get("gender"), "Male")
+        self.assertEqual(casual.get("city"), "Jorhat")
+        self.assertEqual(casual.get("billing_state"), "Assam")
+        self.assertEqual(casual.get("pincode"), "785001")
+        self.assertIn("Jorhat", str(casual.get("billing_address") or ""))
+        mailed = absorb_details(casual, "sudipta saikia, sudiptasaikia6@gmail.com, India, Jorhat, 785001")
+        self.assertEqual(mailed.get("email"), "sudiptasaikia6@gmail.com")
+        self.assertEqual(mailed.get("name"), "Sudipta Saikia")
+        self.assertEqual(mailed.get("city"), "Jorhat")
 
     def test_half_details_are_named_and_full_details_are_ready(self) -> None:
         from app.travel_agent import passenger_details_reply, passenger_gaps
@@ -250,6 +265,19 @@ class DateAndMemory(unittest.TestCase):
         )
         self.assertIn("I don't want Free Cancellation", radio)
         self.assertTrue("yes" in radio.lower() or "skip" in radio.lower())
+        # Empty Adult 1 wins over Assured — fill traveller first, not Free Cancellation yes.
+        blank_adult = _booking_page_reply(
+            {**booking, "selected_hint": "6:20", "name": "Sudipta Saikia"},
+            "6:20",
+            "Add Free Cancellation to your trip Please select an option before proceeding "
+            "I don't want Free Cancellation. Pay ₹3,999 fee if you cancel or reschedule "
+            "Traveller Details Choose from the saved list Mr Sudipta Saikia "
+            "Adult 1 Please select your title First & Middle Name Last Name Continue",
+            _Session(),  # type: ignore[arg-type]
+        )
+        self.assertRegex(blank_adult, r"fill|tick|saved traveller|Adult 1", re.I)
+        self.assertIn("Continue", blank_adult)
+        self.assertNotIn("I'll press I don't want Free Cancellation", blank_adult)
         assured = _booking_page_reply(
             {**booking, "selected_hint": "12:30"},
             "12:30",
@@ -342,15 +370,48 @@ class DateAndMemory(unittest.TestCase):
         )
         confirm_page = "Review Details Please ensure that your name matches your govt ID Confirm Edit Mr Sudipta"
         self.assertEqual(accept_choice("confirm", {"tap": "", "page": confirm_page, "kind": "name_confirm"}), "Confirm")
-        from app.step_read import decide_front, forward_tap, is_name_confirm, is_paid_upsell
+        self.assertEqual(accept_choice("edit", {"tap": "Confirm", "page": confirm_page, "kind": "name_confirm"}), "Edit")
+        self.assertEqual(accept_choice("exit", {"tap": "Confirm", "page": confirm_page, "kind": "name_confirm"}), "Edit")
+        from app.step_read import decide_front, decide_sheet, forward_tap, is_name_confirm, is_paid_upsell, upsell_choice_labels
         from app.travel_agent import extract_user_ask, infer_intent
 
         self.assertTrue(is_name_confirm(confirm_page))
         self.assertFalse(is_paid_upsell(confirm_page))
         self.assertEqual(forward_tap(confirm_page), "Confirm")
+        named_sheet = decide_sheet(confirm_page, {})
+        self.assertEqual(named_sheet.get("action"), "ask")
+        self.assertEqual(named_sheet.get("tap"), "Confirm")
+        self.assertIn("Edit", named_sheet.get("fills") or [])
         named = decide_front(confirm_page, "btn[ ] Confirm\nbtn[ ] Edit", seller="ixigo", hint="12:30")
-        self.assertEqual(named.get("action"), "click")
+        self.assertEqual(named.get("action"), "ask")
         self.assertEqual(named.get("tap"), "Confirm")
+        radio_choices = (
+            "Add Free Cancellation Please select an option before proceeding "
+            "Assured Free Cancellation Assured Flex I don't want Free Cancellation Continue"
+        )
+        self.assertEqual(
+            upsell_choice_labels(radio_choices),
+            [
+                "Assured Free Cancellation",
+                "Assured Flex",
+                "I don't want Free Cancellation",
+            ],
+        )
+        self.assertEqual(
+            accept_choice(
+                "Assured Free Cancellation",
+                {"tap": "I don't want Free Cancellation", "page": radio_choices, "kind": "upsell"},
+            ),
+            "Assured Free Cancellation",
+        )
+        self.assertEqual(
+            accept_choice("flex", {"tap": "", "page": radio_choices, "kind": "upsell"}),
+            "Assured Flex",
+        )
+        self.assertEqual(
+            accept_choice("I don't want free cancellation", {"tap": "", "page": radio_choices, "kind": "upsell"}),
+            "I don't want Free Cancellation",
+        )
         upsell = decide_front(
             "Free Cancellation No, Thanks Secure My Trip",
             "btn[ ] No, Thanks\nbtn[ ] Secure My Trip",
@@ -462,7 +523,13 @@ class DateAndMemory(unittest.TestCase):
         front = apply_front_text(behind, surface)
         self.assertEqual(front, "Free Cancellation No, Thanks")
         self.assertNotEqual(_addon_upsell(front), "radio")
-        self.assertEqual(_addon_upsell(behind), "radio")
+        # Saved-list copy owns the full page — buried "I don't want" is not the Assured gate.
+        self.assertEqual(_addon_upsell(behind), "")
+        radio_gate = (
+            "Add Free Cancellation Please select an option before proceeding "
+            "Assured Free Cancellation Assured Flex I don't want Free Cancellation Continue"
+        )
+        self.assertEqual(_addon_upsell(radio_gate), "radio")
         self.assertIn("[role=dialog]", _SURFACE_JS)
         self.assertIn("overlay", inspect.getsource(read_surface))
 
@@ -720,9 +787,9 @@ class LocalLabMatchesProdAgent(unittest.TestCase):
 
     def test_send_whatsapp_goes_to_lab_outbox_when_local(self) -> None:
         from app.config import get_settings
-        from app.lab import capture_outbound, lab_enabled, outbox_since
+        from app.lab import lab_enabled, outbox_since, set_typing, typing_active
         from app.reply import Reply
-        from app.twilio_wa import send_whatsapp
+        from app.twilio_wa import send_typing, send_whatsapp
 
         get_settings.cache_clear()
         os.environ["GUIDE_LOCAL"] = "1"
@@ -730,15 +797,34 @@ class LocalLabMatchesProdAgent(unittest.TestCase):
         try:
             self.assertTrue(lab_enabled())
             before = max((item["id"] for item in outbox_since(0)), default=0)
+            set_typing(True)
+            self.assertTrue(typing_active())
+            self.assertTrue(send_typing("lab_sid"))
             ok = send_whatsapp("919999000001", Reply.of("Lab capture check.", "http://127.0.0.1:8000/media/x.png"))
             self.assertTrue(ok)
             items = outbox_since(before)
             self.assertTrue(items)
             self.assertEqual(items[-1]["text"], "Lab capture check.")
             self.assertIn("http://127.0.0.1:8000/media/x.png", items[-1]["media_urls"])
+            # A real WhatsApp send clears the typing bubble.
+            self.assertFalse(typing_active())
         finally:
             os.environ.pop("GUIDE_LOCAL", None)
             get_settings.cache_clear()
+
+    def test_lab_ui_paints_outbox_once_not_reply_and_poll(self) -> None:
+        """Regression: painting data.reply AND /lab/outbox duplicated every bot line."""
+        from app.lab import _LAB_HTML
+
+        self.assertIn("seen.has", _LAB_HTML)
+        self.assertIn("data.typing", _LAB_HTML)
+        self.assertIn("Guide is typing", _LAB_HTML)
+        self.assertNotIn("data.reply.text", _LAB_HTML)
+        self.assertIn("send_whatsapp(phone, reply)", Path("app/lab.py").read_text(encoding="utf-8"))
+        # Stale after=N after server restart must resync (otherwise replies never show).
+        self.assertIn("data.boot", _LAB_HTML)
+        self.assertIn("max_id", _LAB_HTML)
+        self.assertIn("serverBoot !== boot", _LAB_HTML)
 
     def test_lab_routes_and_runner_exist(self) -> None:
         from app.lab import router as lab_router
@@ -1608,6 +1694,147 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(classify_page(hay, "https://www.cleartrip.com/flights/results"), "results")
         self.assertNotEqual(classify_page(hay, "https://www.cleartrip.com/flights/results"), "addons")
 
+    def test_logged_in_traveller_form_is_not_assured_popup(self) -> None:
+        """Adult 1 + Contact + Continue is the traveller form, even with Refund on Cancellation copy."""
+        from app.step_read import classify_sheet
+        from app.travel_agent import _addon_upsell, _booking_page_reply
+
+        page = (
+            "Review & Traveller Details Hey Ixigoer Fare Summary Total Amount ₹9,813 "
+            "Refund on Cancellation Add Free Cancellation "
+            "Mr Sudipta Saikia Adult 1 Title First & Middle Name Last Name Nationality India "
+            "Contact Details +91 8638586171 Email Continue"
+        )
+        self.assertEqual(classify_sheet(page), "traveller")
+        self.assertEqual(_addon_upsell(page), "")
+
+        class _Session:
+            page = None
+
+        spoken = _booking_page_reply(
+            {
+                "seller": "ixigo",
+                "selected_hint": "09:10",
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-12-04",
+                "kernel_logged_in": "ixigo",
+                "name": "Sudipta Saikia",
+                "phone": "+918638586171",
+            },
+            "09:10",
+            page,
+            _Session(),  # type: ignore[arg-type]
+        )
+        self.assertNotIn("Assured pop-up", spoken)
+        self.assertNotIn("I don't want Free Cancellation", spoken)
+
+    def test_skip_free_cancellation_clicks_decline_not_search(self) -> None:
+        """On Assured radios, skip means I don't want Free Cancellation + Continue — not a Google search."""
+        from app.turn_loop import align_action, has_live_facts
+
+        page = (
+            "Add Free Cancellation Please select an option before proceeding "
+            "Assured Free Cancellation Assured Flex I don't want Free Cancellation Continue"
+        )
+        state = {
+            "stage": "booking",
+            "stuck_kind": "addon_buy",
+            "stuck_page": page,
+            "selected_hint": "09:10",
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "ixigo",
+            "kernel_session_id": "sess-skip",
+            "kernel_auth_mode": "guest",
+        }
+        self.assertTrue(has_live_facts(state))
+        plan = align_action("skip", state)
+        self.assertEqual(plan.get("do"), "book")
+        self.assertIn("don't want", str(plan.get("tap") or "").lower())
+        self.assertNotEqual(plan.get("do"), "search")
+        agent = Path("app/page_agent.py").read_text(encoding="utf-8")
+        self.assertIn("user_tap_upsell_continue", agent)
+
+    def test_ixigo_login_popup_asks_for_mobile_then_otp(self) -> None:
+        """Sign-in drawer over Fare Summary is login. Ask for a mobile, remember it, then the OTP."""
+        from app.travel_agent import _booking_page_reply
+
+        popup = (
+            "Review & Traveller Details Fare Summary Refund on Cancellation Total Amount ₹10,098 "
+            "Log in to Ixigo Enter Mobile Number Continue Log in with Google"
+        )
+        self.assertEqual(
+            classify_page(popup, "https://www.ixigo.com/flight/booking/review"),
+            "login",
+        )
+        otp = (
+            "Verify Your Mobile Number Enter the OTP received via SMS on +91 8638586171 "
+            "Guwahati New Delhi Fri 04 Dec 09:10"
+        )
+        self.assertEqual(
+            classify_page(otp, "https://www.ixigo.com/flight/booking/review"),
+            "otp",
+        )
+
+        class _Session:
+            page = None
+
+        state = {
+            "seller": "ixigo",
+            "kernel_auth_mode": "guest",
+            "selected_hint": "09:10",
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "kernel_session_id": "sess",
+        }
+        spoken = _booking_page_reply(state, "09:10", popup, _Session())  # type: ignore[arg-type]
+        self.assertIn("10-digit mobile", spoken)
+        self.assertNotIn("close that popup", spoken)
+        self.assertTrue(state.get("kernel_awaiting_phone"))
+        self.assertEqual(state.get("kernel_auth_mode"), "login")
+
+        remembered = dict(state)
+        remembered["login_phone"] = "+918638586171"
+        remembered["kernel_awaiting_phone"] = False
+        spoken_saved = _booking_page_reply(remembered, "09:10", popup, _Session())  # type: ignore[arg-type]
+        self.assertIn("6171", spoken_saved)
+        self.assertIn("continue", spoken_saved.lower())
+        self.assertFalse(remembered.get("kernel_awaiting_phone"))
+        self.assertNotIn("close that popup", spoken_saved)
+
+        from app.turn_loop import align_action
+
+        plan_login = align_action("continue", remembered)
+        self.assertEqual(plan_login.get("do"), "book")
+        self.assertEqual(plan_login.get("tap") or "", "")
+        agent_src = Path("app/page_agent.py").read_text(encoding="utf-8")
+        self.assertIn("login_phone_typed", agent_src)
+        self.assertIn("login_clear_continue_tap", agent_src)
+        from app.kernel_otp import keep_kernel_otp_session, should_type_login_phone
+        from app.step_read import form_sheet
+
+        drawer = (
+            "Review & Traveller Details Fare Summary Log in to Ixigo "
+            "Enter Mobile Number Continue Log in with Google"
+        )
+        self.assertTrue(form_sheet(drawer))
+        self.assertTrue(should_type_login_phone("login", drawer))
+        contact = "Add contact details Email address Please enter Mobile Number Continue"
+        self.assertFalse(should_type_login_phone("other", contact))
+        self.assertTrue(keep_kernel_otp_session("boxes_miss"))
+        otp_src = Path("app/kernel_otp.py").read_text(encoding="utf-8")
+        self.assertIn("on_otp_result", otp_src)
+        agent_src2 = Path("app/travel_agent.py").read_text(encoding="utf-8")
+        self.assertIn('action == "reconnect"', agent_src2)
+
+        spoken_otp = _booking_page_reply(remembered, "09:10", otp, _Session())  # type: ignore[arg-type]
+        self.assertIn("6 digits", spoken_otp)
+        self.assertTrue(remembered.get("kernel_awaiting_otp"))
+        agent = Path("app/page_agent.py").read_text(encoding="utf-8")
+        self.assertEqual(agent.count("_close_ixigo_login_modal(page)"), 1)
+
     def test_addons_sheet_with_fare_is_not_a_results_list(self) -> None:
         """Seat map still shows 18:20 and a price. That must not restart login."""
         import inspect
@@ -1637,8 +1864,8 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn('status == "resume_lost"', agent)
         self.assertIn("fresh fare list", agent)
         self.assertIn("did not open login", agent)
-        self.assertIn('session_id=session_id if attempt == 0 else ""', agent)
-        self.assertIn("fresh_browser=attempt > 0", agent)
+        self.assertIn('session_id if attempt == 0 else ""', agent)
+        self.assertIn("fresh_browser=bool(loaded.get(\"require_otp\")) or attempt > 0", agent)
 
     def test_fare_drawer_over_results_is_fare_sheet(self) -> None:
         from app.page_agent import _looks_like_fare_sheet
@@ -1748,7 +1975,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
         )
         self.assertIn("send your email", bare.lower())
         self.assertNotIn("I'll press Continue", bare)
-        from app.step_read import decide_sheet
+        from app.step_read import _fare_list_sheet, classify_sheet, decide_sheet
 
         self.assertEqual(
             decide_sheet(contact, {"email": "sudiptasaikia6@gmail.com"}).get("action"),
@@ -1758,6 +1985,88 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("email", decide_sheet(contact, {}).get("missing") or [])
         fare_list = "IndiGo 08:55 Book ₹9,100 Air India 13:15 Book ₹9,400 SpiceJet 18:20 Book ₹8,900"
         self.assertEqual(decide_sheet(fare_list, {}).get("action"), "pick")
+        assured_list = (
+            fare_list + " Assured Free cancellation I don't want Free Cancellation"
+        )
+        self.assertEqual(classify_sheet(assured_list), "results")
+        self.assertNotEqual(decide_sheet(assured_list, {}).get("sheet"), "upsell")
+        one_card = (
+            "GAU Guwahati DEL New Delhi Fri 04 Dec Sort by Departure "
+            "Akasa Air 09:10 19:10 ₹8,365 Book I don't want Free Cancellation"
+        )
+        self.assertTrue(_fare_list_sheet(one_card))
+        self.assertEqual(classify_sheet(one_card), "results")
+        self.assertNotEqual(decide_sheet(one_card, {}).get("sheet"), "upsell")
+        real_upsell = "Please select an option before proceeding Assured Free Cancellation I don't want Free Cancellation"
+        self.assertEqual(classify_sheet(real_upsell), "upsell")
+        list_spoken = _booking_page_reply(
+            {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-12-04",
+                "seller": "ixigo",
+                "selected_hint": "09:10",
+            },
+            "09:10",
+            "Akasa Air 09:10 19:10 ₹8,365 Book IndiGo 18:20 21:05 ₹10,263 Book Assured Free cancellation",
+            _Fake(),  # type: ignore[arg-type]
+        )
+        self.assertNotIn("Assured pop-up", list_spoken)
+        self.assertIn("09:10", list_spoken)
+        from app.turn_loop import align_action
+
+        go = align_action(
+            "go on",
+            {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-12-04",
+                "seller": "ixigo",
+                "selected_hint": "09:10",
+                "stage": "booking",
+                "stuck_kind": "addon_buy",
+                "stuck_page": assured_list,
+                "options": [{"depart": "09:10", "airline": "Akasa Air", "price": "8365"}],
+                "kernel_auth_mode": "guest",
+            },
+        )
+        self.assertEqual(go["do"], "book")
+        picked = align_action(
+            "saved traveller",
+            {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-12-04",
+                "seller": "ixigo",
+                "selected_hint": "09:10",
+                "stage": "booking",
+                "stuck_kind": "addon_buy",
+                "stuck_page": one_card,
+                "options": [{"depart": "09:10", "airline": "Akasa Air", "price": "8365"}],
+                "kernel_auth_mode": "guest",
+            },
+        )
+        self.assertEqual(picked["do"], "book")
+        self.assertNotEqual(picked.get("tap"), "__select_traveller__")
+        from app.turn_loop import align_action as _align
+
+        fresh = _align(
+            "ghy to delhi 4th dec",
+            {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-12-04",
+                "seller": "ixigo",
+                "stage": "login",
+                "stuck_kind": "login",
+                "kernel_auth_mode": "guest",
+                "stuck_page": "Log in to Ixigo Enter Mobile Number Log in with Google",
+                "last_vision": {"kind": "login", "what": "Ixigo login"},
+                "options": [{"depart": "09:10", "airline": "Akasa Air", "price": "8365"}],
+            },
+        )
+        self.assertEqual(fresh["do"], "search")
+        self.assertEqual(fresh["kind"], "search")
         addons = "Choose add-ons No meal selected Skip add-ons"
         self.assertEqual(decide_sheet(addons, {}).get("action"), "click")
         self.assertIn("Skip", str(decide_sheet(addons, {}).get("tap") or ""))
@@ -1767,15 +2076,29 @@ class SellerChoiceAndProxy(unittest.TestCase):
         ready = decide_sheet("Review your itinerary Fare summary Continue", {"email": "a@b.co"})
         self.assertEqual(ready.get("action"), "click")
         self.assertEqual(ready.get("tap"), "Continue")
-        # Confirm modal covers Contact Details — must click, not fill behind it.
+        # Confirm modal covers Contact Details — ask Confirm/Edit, never fill behind it.
         name_over_contact = (
             "Review Details Contact Details Email Mobile Please ensure that your name matches "
             "your govt ID such as Aadhaar Confirm Edit Mr Sudipta"
         )
         self.assertTrue(is_name_confirm(name_over_contact))
         self.assertFalse(is_contact_form(name_over_contact))
-        self.assertEqual(decide_sheet(name_over_contact, {"email": "a@b.co"}).get("action"), "click")
-        self.assertEqual(decide_sheet(name_over_contact, {"email": "a@b.co"}).get("tap"), "Confirm")
+        name_ask = decide_sheet(name_over_contact, {"email": "a@b.co"})
+        self.assertEqual(name_ask.get("action"), "ask")
+        self.assertEqual(name_ask.get("tap"), "Confirm")
+        self.assertIn("Edit", name_ask.get("fills") or [])
+        # Modal with Title / First & Middle Name still wins when billing OCR is behind it.
+        modal_over_billing = (
+            "Review Details Please ensure that your name matches your govt. ID such as "
+            "Aadhaar, Passport or Driver's License Adult Title Mr First & Middle Name "
+            "Sudipta Last Name Saikia Edit Confirm "
+            "Billing Address Pin code 785001 City Jorhat State Assam Continue"
+        )
+        self.assertTrue(is_name_confirm(modal_over_billing))
+        self.assertEqual(classify_sheet(modal_over_billing), "name_confirm")
+        modal_ask = decide_sheet(modal_over_billing, {"pincode": "785001", "email": "a@b.co"})
+        self.assertEqual(modal_ask.get("action"), "ask")
+        self.assertEqual(modal_ask.get("tap"), "Confirm")
 
     def test_saved_traveller_sheet_continues_not_confirm(self) -> None:
         """Saved list: Continue + fill conscience. Never Confirm; free-cancellation stays upsell."""
@@ -1833,18 +2156,28 @@ class SellerChoiceAndProxy(unittest.TestCase):
         billing_ask = decide_sheet(buried, {"email": "a@b.co", "name": "Sudipta Saikia"})
         self.assertEqual(billing_ask.get("sheet"), "traveller")
         self.assertEqual(billing_ask.get("action"), "ask")
-        self.assertEqual(set(billing_ask.get("missing") or []), {"pincode", "state"})
+        self.assertEqual(set(billing_ask.get("missing") or []), {"pincode", "state", "address"})
         filled_billing = decide_sheet(
             buried,
             {
                 "email": "a@b.co",
                 "name": "Sudipta Saikia",
                 "pincode": "781001",
+                "billing_address": "12 Zoo Road",
                 "billing_state": "Assam",
             },
         )
         self.assertEqual(filled_billing.get("action"), "fill")
         self.assertEqual(filled_billing.get("tap"), "Continue")
+        city_sheet = (
+            "Review Details Traveller Details Adult 1 Mr Sudipta Saikia "
+            "Billing Address Address Pincode City State Continue"
+        )
+        city_ask = decide_sheet(city_sheet, {"email": "a@b.co", "name": "Sudipta Saikia"})
+        self.assertEqual(
+            set(city_ask.get("missing") or []),
+            {"pincode", "state", "address", "city"},
+        )
         # decide_sheet is the stuck narrative owner — no parallel name-check branch.
         spoken_buried = _booking_page_reply(
             {
@@ -1872,6 +2205,11 @@ class SellerChoiceAndProxy(unittest.TestCase):
         absorbed = absorb_details({}, "781001 Assam")
         self.assertEqual(absorbed.get("pincode"), "781001")
         self.assertEqual(absorbed.get("billing_state"), "Assam")
+        absorbed_full = absorb_details({}, "address 12 Zoo Road city Guwahati 781001 Assam")
+        self.assertEqual(absorbed_full.get("pincode"), "781001")
+        self.assertEqual(absorbed_full.get("billing_state"), "Assam")
+        self.assertEqual(absorbed_full.get("city"), "Guwahati")
+        self.assertIn("Zoo Road", str(absorbed_full.get("billing_address") or ""))
         cont_state = {
             "origin": "Guwahati",
             "destination": "Delhi",
@@ -1901,7 +2239,10 @@ class SellerChoiceAndProxy(unittest.TestCase):
             },
         ):
             cont = align_action("continue", cont_state)
-        self.assertEqual(cont["do"], "details")
+        # Explicit continue presses Continue (fill gaps in checkout) — never a details-only turn
+        # and never keep a stale pick-traveller tap.
+        self.assertEqual(cont["do"], "book")
+        self.assertEqual(cont.get("tap"), "Continue")
         self.assertNotEqual(cont.get("tap"), "__select_traveller__")
         # Free-cancellation radio with a name behind it is not the saved-list sheet.
         radio = (
@@ -1962,13 +2303,52 @@ class SellerChoiceAndProxy(unittest.TestCase):
             "continue",
             {**base, "stuck_page": contact, "stuck_kind": "review", "email": "a@b.co"},
         )
-        self.assertEqual(filled["do"], "details")
+        # Explicit continue presses Continue (checkout fills gaps then clicks) — not a
+        # details-only turn that types and never advances.
+        self.assertEqual(filled["do"], "book")
+        self.assertEqual(filled.get("tap"), "Continue")
         self.assertEqual(decide_sheet(contact, {"email": "a@b.co"})["action"], "fill")
 
         review = "Review your itinerary Fare summary Continue"
         clicked = align_action("continue", {**base, "stuck_page": review, "stuck_kind": "review"})
         self.assertEqual(clicked["do"], "book")
         self.assertEqual(clicked.get("tap"), "Continue")
+
+        # Gemini "still missing DOB" must not steal an explicit continue into details-only.
+        billing_ready = (
+            "Review Details Fare Summary Total Amount ₹9,848 "
+            "Billing Address Pin code 785001 City Jorhat State Assam Continue "
+            "GST Details I would like to add my GST Number"
+        )
+        gem_dob = {
+            "goal": "ask",
+            "intent": "details",
+            "kind": "form",
+            "what": "Missing date of birth",
+            "why": "form needs dob",
+            "recommend": "send dob",
+            "tap": "Continue",
+            "reply": "I still need date of birth.",
+            "facts": [],
+            "source": "gemini",
+        }
+        from unittest.mock import patch
+
+        with patch("app.turn_loop.interpret_turn", return_value=gem_dob):
+            cont_ready = align_action(
+                "continue",
+                {
+                    **base,
+                    "stuck_page": billing_ready,
+                    "stuck_kind": "form",
+                    "email": "a@b.co",
+                    "pincode": "785001",
+                    "name": "Sudipta Saikia",
+                    "live": {"host": "www.ixigo.com"},
+                },
+            )
+        self.assertEqual(cont_ready["do"], "book")
+        self.assertEqual(cont_ready.get("tap"), "Continue")
 
         pay = align_action(
             "continue",
@@ -2788,6 +3168,30 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(compare["do"], "search")
         self.assertTrue(compare.get("aligned", True))
         self.assertEqual(infer_intent(pay, "I'd like to login"), "login")
+        from app.turn_loop import declines_login, wants_login
+
+        self.assertTrue(wants_login("I'd like to login"))
+        self.assertTrue(declines_login("no need for login click continue"))
+        self.assertFalse(wants_login("no need for login click continue"))
+        guest_again = {
+            **pay,
+            "stage": "booking",
+            "stuck_kind": "review",
+            "kernel_auth_mode": "login",
+            "stuck_page": "Fare Summary Total Amount Continue Log in/Sign up Review & Traveller Details",
+        }
+        plan_guest = align_action("no need for login click continue", guest_again)
+        self.assertEqual(plan_guest["do"], "book")
+        self.assertEqual(guest_again.get("kernel_auth_mode"), "guest")
+        from app.page_agent import classify_page
+
+        self.assertEqual(
+            classify_page(
+                "Log in/Sign up Fare Summary Total Amount ₹9,813 Continue Review & Traveller Details Refund on Cancellation",
+                "https://www.ixigo.com/flight/booking/1",
+            ),
+            "review",
+        )
         self.assertEqual(infer_intent(pay, "how much on ixigo"), "search")
         self.assertEqual(_coerce_kind("6:20 on Ixigo", "select", pay), "book")
         self.assertEqual(_coerce_kind("price on EaseMyTrip", "chat", pay), "search")
@@ -2848,7 +3252,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
             )
         )
         run_src = inspect.getsource(_run_kernel_login)
-        self.assertIn("fresh_browser=attempt > 0", run_src)
+        self.assertIn('fresh_browser=bool(loaded.get("require_otp")) or attempt > 0', run_src)
         self.assertIn("_kernel_result_is_site_error", run_src)
         self.assertIn("sellers_to_try", run_src)
         self.assertIn('alt = "ixigo"', run_src)
@@ -3080,9 +3484,9 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertEqual(_booking_seller_id(google_list, "Cleartrip 10:45"), "cleartrip")
         src = inspect.getsource(_ht)
         self.assertIn("remember_results_page", inspect.getsource(__import__("app.travel_agent", fromlist=["_publish_fares"])._publish_fares))
-        fallback = inspect.getsource(_ht).split('if kind == "search":')[-1][:900]
-        self.assertIn("origin", fallback)
-        self.assertIn("_search_ack", fallback)
+        self.assertIn('if kind == "search":', src)
+        self.assertIn("_search_ack", src)
+        self.assertRegex(src, r'if kind == "search":[\s\S]{0,2500}?_search_ack')
 
     def test_fare_list_memory_connects_sites(self) -> None:
         from app.search import default_bookable_seller, seller_can_book
@@ -3176,6 +3580,42 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertFalse(_needs_book_site_choice(ready, "Ixigo"))
         ask = _book_site_choice_reply(ready, "2:20")
         self.assertIn("Reply Ixigo", ask)
+        # Continue/Confirm on an open Ixigo fare sheet must click — not re-quote sellers.
+        from app.travel_agent import _checkout_owns_turn, _commit_bookable_seller
+
+        open_ixigo = {
+            **waiting,
+            "seller": "ixigo",
+            "kernel_seller": "ixigo",
+            "stage": "booking",
+            "kernel_auth_mode": "guest",
+            "stuck_kind": "fare_sheet",
+            "stuck_page": "Fare Summary Total Amount ₹9,813 Continue",
+            "chosen_tap": "Continue",
+            "selected_hint": "10:45",
+            "awaiting_book_site": True,
+        }
+        self.assertTrue(_checkout_owns_turn(open_ixigo, "continue"))
+        self.assertFalse(_needs_book_site_choice(open_ixigo, "continue"))
+        self.assertFalse(_needs_book_site_choice(open_ixigo, "confirm"))
+        # Busy open sheet + continue must click, not soft-hold or re-quote.
+        self.assertFalse(_hold_live(open_ixigo, "continue", busy=True, changed=False))
+        # A second continue must not start another browser while the first still holds the lock.
+        import time
+
+        from app.travel_agent import _LOCK, _defer_live_browse
+
+        self.assertFalse(_defer_live_browse({**open_ixigo, "busy_at": f"{time.time():.3f}"}))
+        _LOCK.acquire()
+        try:
+            self.assertTrue(_defer_live_browse({**open_ixigo, "busy_at": f"{time.time():.3f}"}))
+        finally:
+            _LOCK.release()
+        self.assertFalse(_needs_book_site_choice({**open_ixigo, "busy_at": "1"}, "continue"))
+        cleared = dict(waiting)
+        _commit_bookable_seller(cleared, "ixigo")
+        self.assertEqual(cleared.get("seller"), "ixigo")
+        self.assertNotIn("awaiting_book_site", cleared)
 
     def test_dead_itinerary_opens_fresh_fares_not_login(self) -> None:
         import inspect
@@ -3346,6 +3786,41 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("Book", front)
         self.assertIn("₹10,283", front)
         self.assertEqual(nearest_depart_hint(body, "18:20"), "18:25")
+        # Arrival 13:15 on a 10:20 card must not satisfy hint 1:15.
+        afternoon = (
+            "Air India Express I4 2229 10:20 13:15 Book ₹10,263 "
+            "Air India Express 17:40 20:45 Book ₹10,263"
+        )
+        self.assertEqual(nearest_depart_hint(afternoon, "1:15"), "1:15")
+        self.assertNotEqual(nearest_depart_hint(afternoon, "1:15"), "13:15")
+        self.assertEqual(nearest_depart_hint(afternoon, "10:15"), "10:20")
+        morning = "Akasa 09:10 19:10 Book ₹8,021 IndiGo 18:20 21:05 Book ₹10,263"
+        self.assertEqual(nearest_depart_hint(morning, "9:40"), "9:40")
+
+    def test_book_tap_skips_stale_itinerary_resume(self) -> None:
+        """go on + Book must open the fare list, not a leftover Review Details URL."""
+        import inspect
+
+        from app import kernel_otp
+        from app.page_agent import extract_trip_facts, verify_trip_facts
+
+        src = inspect.getsource(kernel_otp.begin_login)
+        self.assertIn("book_tap", src)
+        self.assertLess(src.index("if book_tap:"), src.index("is_resume_booking_url(resume_url, seller)"))
+        self.assertIn("resume_url = \"\"", src)
+        checkout = inspect.getsource(
+            __import__("app.page_agent", fromlist=["run_checkout_agent"]).run_checkout_agent
+        )
+        self.assertIn("_stop_wrong_itinerary", checkout)
+        wrong = (
+            "Fare Summary Total Amount ₹9,863 Review & Traveller Details "
+            "Air-India Express | IX 1036 Fri, 04 Dec 20:15 GAU - Guwahati "
+            "23:25 DEL - New Delhi Adult 1 Please select your title Continue"
+        )
+        facts = extract_trip_facts(wrong, "https://www.ixigo.com/flight/booking/x?fareKey=GAU-DEL-IX1036")
+        ok, problems = verify_trip_facts(facts, expect_hint="1:15", expect_origin="GAU", expect_dest="DEL")
+        self.assertFalse(ok)
+        self.assertTrue(any("depart=" in p for p in problems))
 
     def test_results_reply_recommends_not_button_ask(self) -> None:
         from app.travel_agent import _booking_page_reply
@@ -3389,6 +3864,246 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("no longer available", spoken.lower())
         self.assertNotIn("Filled your details", spoken)
 
+    def test_rejected_pincode_is_not_a_filled_contact(self) -> None:
+        """A red 'valid pincode' error is a blocker. A new pin is typed; the old one is not success."""
+        from app.page_agent import contact_report
+        from app.step_read import decide_sheet, format_sheet_move
+        from app.travel_agent import absorb_details
+
+        page = (
+            "Billing Address Pin code 537031 Please enter a valid pincode "
+            "Address By lane 14 City Jorhat State Assam Continue"
+        )
+        same = decide_sheet(page, {"pincode": "537031", "email": "a@b.co", "city": "Jorhat", "billing_state": "Assam"})
+        self.assertEqual(same.get("action"), "ask")
+        self.assertIn("a valid pincode", same.get("missing") or [])
+        what, _why, nxt = format_sheet_move(same, seller="Ixigo", which="9:10")
+        self.assertIn("6-digit", nxt)
+        self.assertNotIn("typed the contact", nxt.lower())
+
+        fresh = decide_sheet(page, {"pincode": "785001", "email": "a@b.co"})
+        self.assertEqual(fresh.get("action"), "fill")
+        self.assertIn("pincode", fresh.get("fills") or [])
+
+        empty = decide_sheet(
+            "Billing Address Pin code Address City State Continue",
+            {"email": "a@b.co"},
+        )
+        self.assertEqual(empty.get("action"), "ask")
+        self.assertIn("pincode", empty.get("missing") or [])
+
+        saved = absorb_details({"phone": "+919999000001"}, "Pin code : 785001")
+        self.assertEqual(saved.get("pincode"), "785001")
+        self.assertNotEqual(saved.get("phone"), "785001")
+
+        spoken = contact_report("email:ok | phone:ok | pincode:ok", page)
+        self.assertIn("not valid", spoken.lower())
+        self.assertIn("incorrect", spoken.lower())
+        self.assertNotIn("typed the contact details", spoken.lower())
+        asked = contact_report("email:ok | phone:ok", page)
+        self.assertIn("rejected the pin", asked.lower())
+        # A Continue click that did not leave Review Details is not "typed the contact".
+        stuck = (
+            "Review & Traveller Details Billing Address Pin code 785001 "
+            "I don't want Free Cancellation Continue"
+        )
+        blocked = contact_report(
+            "email:ok | phone:none | optout_miss | user_tap_upsell_continue:0",
+            stuck,
+        )
+        self.assertIn("free cancellation", blocked.lower())
+        self.assertNotIn("typed the contact details", blocked.lower())
+
+    def test_billing_pin_digits_are_not_login_otp(self) -> None:
+        """Bare 6 digits on a rejected pincode ask fill billing — they are not an OTP."""
+        from unittest.mock import patch
+
+        from app.travel_agent import _capture_private, _needs_billing_pin, absorb_details, handle_turn
+        from app.turn_loop import align_action
+
+        page = (
+            "Billing Address Pin code 537031 Please enter a valid pincode "
+            "Address By lane 14 City Jorhat State Assam Continue"
+        )
+        state = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "ixigo",
+            "kernel_seller": "ixigo",
+            "stage": "booking",
+            "live": {"host": "www.ixigo.com", "prices": True},
+            "email": "a@b.co",
+            "phone": "+919999000001",
+            "stuck_page": page,
+            "stuck_kind": "form",
+            "last_vision": {"kind": "form", "errors": ["Please enter a valid pincode"], "fields": ["Pin code"]},
+            "selected_hint": "9:10",
+        }
+        self.assertTrue(_needs_billing_pin(state))
+        self.assertEqual(_capture_private("919999000001", "785001", dict(state)), "")
+        # Mid-booking without a pin ask must also not invent an OTP from bare digits.
+        self.assertEqual(_capture_private("919999000001", "785001", {"stage": "booking"}), "")
+        saved = absorb_details(dict(state), "785001")
+        self.assertEqual(saved.get("pincode"), "785001")
+        plan = align_action("785001", state)
+        self.assertEqual(plan.get("do"), "details")
+
+        with (
+            patch("app.travel_agent._run_browse") as browse,
+            patch("app.travel_agent.db") as fake_db,
+            patch("app.travel_agent._save"),
+            patch("app.travel_agent.remember_inbound"),
+            patch("app.travel_agent.get_settings") as settings,
+            patch("app.travel_agent.resolve_intent", return_value=("details", "")),
+            patch("app.kernel_otp.kernel_configured", return_value=True),
+        ):
+            settings.return_value = type("S", (), {"gemini_api_key": "x", "llm_ready": True})()
+            fake_db.add_message = lambda *a, **k: None
+            reply = handle_turn("919999000001", "785001", dict(state), [])
+        spoken = str(reply.text or "")
+        self.assertNotIn("OTP", spoken)
+        self.assertTrue(browse.called)
+
+        # Real login OTP wait still captures digits when billing is not open.
+        otp_state = {"stage": "login", "kernel_awaiting_otp": True}
+        note = _capture_private("919999000001", "529779", otp_state)
+        self.assertIn("OTP", note)
+
+    def test_ixigo_saved_traveller_not_unknown_form_sheet(self) -> None:
+        """Review Details with Mr/Ms + Contact Details stays traveller/review — not unknown other."""
+        import inspect
+
+        from app.page_agent import classify_page, deterministic_action
+        from app.step_read import classify_sheet, form_sheet, is_saved_traveller_sheet
+
+        saved = (
+            "Review Details Traveller Details Mr Sudipta Saikia Adult "
+            "Ms Someone Else Contact Details Email Mobile Number +91 Continue"
+        )
+        self.assertTrue(is_saved_traveller_sheet(saved))
+        self.assertFalse(form_sheet(saved))
+        self.assertEqual(classify_sheet(saved), "traveller")
+        stage = classify_page(saved, "https://www.ixigo.com/")
+        self.assertEqual(stage, "review")
+        self.assertEqual(
+            deterministic_action(stage, hint="9:10", recovers=0, url="https://www.ixigo.com/"),
+            {"action": "review_continue", "target": "", "value": ""},
+        )
+        # Pure contact sheet (no saved names) still uses the form_sheet fill path.
+        contact_only = (
+            "Add Contact details +91 Email address Mobile number Continue Review traveller details"
+        )
+        self.assertTrue(form_sheet(contact_only))
+        checkout = inspect.getsource(
+            __import__("app.page_agent", fromlist=["run_checkout_agent"]).run_checkout_agent
+        )
+        self.assertIn('tap_pending in {"__select_traveller__", "__pick_traveller__"}', checkout)
+        self.assertLess(
+            checkout.index('tap_pending in {"__select_traveller__", "__pick_traveller__"}'),
+            checkout.index('sheet_move.get("action") == "ask" and sheet_move.get("missing")'),
+        )
+        self.assertIn("not _saved_travellers(text)", checkout)
+        self.assertIn("is_saved_traveller_sheet(hay) or _traveller_form_open(hay)", inspect.getsource(
+            __import__("app.step_read", fromlist=["form_sheet"]).form_sheet
+        ))
+        pick_src = inspect.getsource(
+            __import__("app.page_agent", fromlist=["_select_saved_traveller"])._select_saved_traveller
+        )
+        self.assertIn("scrollIntoView", pick_src)
+        self.assertIn("input[type=checkbox]", pick_src)
+        self.assertNotIn("input[type=radio]", pick_src.split("querySelectorAll")[1][:120])
+        opt = inspect.getsource(
+            __import__("app.page_agent", fromlist=["_ixigo_opt_out_cancellation"])._ixigo_opt_out_cancellation
+        )
+        self.assertIn("optout_mouse", opt)
+        self.assertIn("page.mouse.click", opt)
+        prep = inspect.getsource(
+            __import__("app.page_agent", fromlist=["_ixigo_prepare_review"])._ixigo_prepare_review
+        )
+        self.assertIn("_ixigo_opt_out_cancellation", prep)
+        self.assertIn("_ensure_review_traveller", prep)
+        checkout = inspect.getsource(
+            __import__("app.page_agent", fromlist=["run_checkout_agent"]).run_checkout_agent
+        )
+        self.assertIn("_ixigo_prepare_review(page, profile, log)", checkout)
+        self.assertIn("ixigo_prepare:after_fill", checkout)
+
+    def test_continue_on_assured_traveller_page_declines_not_reticks(self) -> None:
+        """Bare continue on Review Details with Assured radios declines — never re-arms pick."""
+        from unittest.mock import patch
+
+        from app.step_read import _assured_radio_gate, classify_sheet
+        from app.turn_loop import align_action
+
+        page = (
+            "Review Details Add Free Cancellation "
+            "Assured Free Cancellation Assured Flex "
+            "I don't want Free Cancellation. Pay fee if you cancel "
+            "Traveller Details Choose from the saved list "
+            "Mr Sudipta Saikia Mr Sudipta Saikia Continue"
+        )
+        self.assertTrue(_assured_radio_gate(page))
+        self.assertEqual(classify_sheet(page), "upsell")
+        # Empty Adult 1 + Assured radios → traveller owns the sheet (fill first).
+        blank_adult = (
+            "Review Details Add Free Cancellation "
+            "Free Cancellation + Rescheduling "
+            "I don't want Free Cancellation. Pay ₹3,999 fee if you cancel or reschedule "
+            "Traveller Details Choose from the saved list Mr Sudipta Saikia "
+            "Adult 1 Please select your title First & Middle Name Last Name Continue"
+        )
+        self.assertTrue(_assured_radio_gate(blank_adult))
+        self.assertEqual(classify_sheet(blank_adult), "traveller")
+        # Newer Ixigo cards (no Assured Flex wording) still gate Continue.
+        from app.step_read import upsell_choice_labels
+
+        modern = (
+            "Add Free Cancellation to your trip Most Popular "
+            "Free Cancellation @₹1,179/traveller "
+            "Free Cancellation + Rescheduling @₹1,479/traveller "
+            "I don't want Free Cancellation. Pay ₹3,999 fee if you cancel or reschedule "
+            "Traveller Details Choose from the saved list Mr Sudipta Saikia Continue"
+        )
+        self.assertTrue(_assured_radio_gate(modern))
+        self.assertEqual(classify_sheet(modern), "upsell")
+        labels = upsell_choice_labels(modern)
+        self.assertTrue(any(re.search(r"don.?t want", item, re.I) for item in labels))
+        self.assertTrue(any(re.search(r"free cancellation", item, re.I) and not re.search(r"don.?t want", item, re.I) for item in labels))
+        state = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "ixigo",
+            "selected_hint": "9:10",
+            "stage": "booking",
+            "stuck_kind": "passenger",
+            "stuck_page": page,
+            "name": "Sudipta Saikia",
+            "chosen_tap": "__select_traveller__",
+            "last_vision": {"kind": "review"},
+        }
+        gemini_pick = {
+            "goal": "pick_traveller",
+            "intent": "book",
+            "kind": "review",
+            "what": "saved travellers",
+            "why": "tick a name",
+            "recommend": "tick Sudipta Saikia",
+            "tap": "__select_traveller__",
+            "reply": "I'll tick the name",
+            "facts": [],
+            "source": "gemini",
+        }
+        with patch("app.turn_loop.interpret_turn", return_value=gemini_pick):
+            cont = align_action("continue", dict(state))
+        self.assertEqual(cont["do"], "book")
+        self.assertNotEqual(cont.get("tap"), "__select_traveller__")
+        self.assertRegex(str(cont.get("tap") or ""), r"don.?t want Free Cancellation", re.I)
+        with patch("app.turn_loop.interpret_turn", return_value=gemini_pick):
+            pick = align_action("pick Mr Sudipta Saikia", dict(state))
+        self.assertEqual(pick.get("tap"), "__select_traveller__")
+
     def test_pick_saved_traveller_not_contact_fill(self) -> None:
         from unittest.mock import patch
 
@@ -3404,6 +4119,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertTrue(wants_pick_saved_traveller("pick one"))
         self.assertTrue(wants_pick_saved_traveller("selecte traveller as sudipta saikia"))
         self.assertTrue(wants_pick_saved_traveller("select traveller as Sudipta Saikia"))
+        self.assertTrue(wants_pick_saved_traveller("pick Mr Sudipta Saikia"))
         self.assertTrue(wants_delete_traveller("delete one of the profiles"))
         self.assertTrue(wants_delete_traveller("get rid of the duplicate profiles"))
         self.assertFalse(wants_pick_saved_traveller("8876233052"))
@@ -3411,6 +4127,7 @@ class SellerChoiceAndProxy(unittest.TestCase):
 
         self.assertEqual(traveller_name_from_ask("selecte traveller as sudipta saikia"), "sudipta saikia")
         self.assertEqual(traveller_name_from_ask("pick traveller as Sudipta Saikia"), "Sudipta Saikia")
+        self.assertEqual(traveller_name_from_ask("pick Mr Sudipta Saikia"), "Sudipta Saikia")
         state = {
             "stage": "booking",
             "stuck_kind": "form",
@@ -3790,6 +4507,18 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertTrue(callable(vision_agent.see_step))
         self.assertTrue(callable(vision_agent.classify_with_vision))
         self.assertTrue(callable(advance_forward_control))
+        from app.page_agent import _click_confirm_only
+
+        self.assertTrue(callable(_click_confirm_only))
+        fwd_src = inspect.getsource(advance_forward_control)
+        self.assertIn("_click_confirm_only", fwd_src)
+        self.assertIn('kind == "name_confirm"', fwd_src)
+        self.assertIn("_sheet_moved", fwd_src)
+        self.assertIn('return ""', fwd_src)
+        from app.page_agent import _decline_radio_checked, _ixigo_opt_out_cancellation
+
+        self.assertIn("_decline_radio_checked", inspect.getsource(_ixigo_opt_out_cancellation))
+        self.assertTrue(callable(_decline_radio_checked))
         self.assertTrue(callable(ground_tap))
         self.assertTrue(callable(parse_control_labels))
         src = inspect.getsource(run_checkout_agent)
@@ -3911,6 +4640,21 @@ class SellerChoiceAndProxy(unittest.TestCase):
         # Duplicate Book on one Ixigo card still matches by first clock.
         dup = ix + " Fare Type Regular Fare ₹9,516 Book Lock Price @₹349"
         self.assertTrue(card_matches_depart_hint(dup, "1:15"))
+        filtered = (
+            "Departure from Guwahati 12:40 - 13:40 17:40 - 18:40 "
+            "Air India Express 17:40 3h 5m 20:45 GAU DEL ₹10,263 Book"
+        )
+        self.assertTrue(card_matches_depart_hint(filtered, "17:40"))
+        self.assertFalse(card_matches_depart_hint(filtered, "12:40"))
+        from app.page_agent import _depart_clocks_on_fare_list
+
+        self.assertEqual(_depart_clocks_on_fare_list(filtered), ["17:40"])
+        from app.travel_agent import _wrong_itinerary_reply
+
+        self.assertIn(
+            "17:40 is on the Ixigo list",
+            _wrong_itinerary_reply("verify_fail:time", filtered, "17:40"),
+        )
 
     def test_ixigo_review_page_is_review_not_bare_other(self) -> None:
         text = (
@@ -4022,12 +4766,15 @@ class SellerChoiceAndProxy(unittest.TestCase):
             verify_fallback,
         )
 
-        self.assertIn("in the boxes", otp_failure_detail(boxes_open=True))
+        self.assertIn("incorrect", otp_failure_detail(boxes_open=True).lower())
+        self.assertIn("new code", otp_failure_detail(boxes_open=True).lower())
         self.assertIn("Log in", otp_failure_detail(boxes_open=False))
         self.assertIn("checking", otp_failure_detail(boxes_open=False, verifying=True))
+        self.assertTrue(keep_kernel_otp_session("still_otp"))
         waiting_live = {"kernel_awaiting_otp": True, "kernel_session_id": "sess", "kernel_seller": "ixigo"}
         self.assertEqual(resume_kernel_otp(waiting_live, "1234"), "need_digits")
-        self.assertEqual(resume_kernel_otp(waiting_live, "123456"), "closed")
+        # No live waiter in-process → reconnect the same Kernel tab and type the 6 digits.
+        self.assertEqual(resume_kernel_otp(waiting_live, "123456"), "reconnect")
 
         self.assertTrue(ixigo_verify_in_progress("Please wait while we verify your details."))
         self.assertFalse(ixigo_verify_in_progress("Verify Your Mobile Number Enter the OTP"))
@@ -4279,10 +5026,156 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("continue to payment", click.lower())
         self.assertIn("Continue\\b.*", click)
         self.assertNotIn('name=re.compile(r"^(continue|confirm|proceed|pay now)', click.lower())
+        from app.page_agent import _ixigo_click_no_thanks
+
+        self.assertTrue(callable(_ixigo_click_no_thanks))
+        no_thanks = inspect.getsource(_ixigo_click_no_thanks)
+        self.assertIn("optout_no_thanks", no_thanks)
+        self.assertIn("_ixigo_buy_this_visible", no_thanks)
         opt = inspect.getsource(_ixigo_opt_out_cancellation)
+        self.assertIn("_ixigo_click_no_thanks", opt)
+        self.assertIn("_ixigo_click_without_assured", opt)
+        self.assertLess(opt.index("_ixigo_click_no_thanks"), opt.index("optout_exact_pay"))
         self.assertIn("buy this", opt.lower())
-        self.assertIn("continue without", opt.lower())
-        self.assertIn("don.?t want Free Cancellation", inspect.getsource(_select_saved_traveller) + inspect.getsource(_ixigo_opt_out_cancellation))
+        self.assertIn("optout_exact_pay", opt)
+        # Decline radio alone must not skip dismissing Secure My Trip / No, Thanks.
+        self.assertIn("optout_no_thanks_miss", opt)
+        self.assertIn("_ixigo_buy_this_visible(page)", opt)
+        self.assertIn("_ixigo_assured_comparison_open(page)", opt)
+        self.assertLess(opt.index("optout_no_thanks_miss"), opt.index('return "optout_already"'))
+        self.assertIn("Without Assured", inspect.getsource(
+            __import__("app.page_agent", fromlist=["_ixigo_click_without_assured"])._ixigo_click_without_assured
+        ))
+        self.assertIn("Pay", opt)
+        self.assertIn("fee", opt.lower())
+        self.assertIn("scrollIntoView", opt)
+        self.assertIn("add free cancellation", opt.lower())
+        self.assertNotIn("input.checked = true", opt)
+        self.assertIn(
+            "don.?t want free cancellation",
+            (inspect.getsource(_select_saved_traveller) + inspect.getsource(_ixigo_opt_out_cancellation)).lower(),
+        )
+        from app.page_agent import (
+            _adult_traveller_gaps,
+            _clean_traveller_name,
+            _decline_option_text,
+            _decline_radio_checked,
+            _ensure_review_traveller,
+            _press_confirm_then_addons,
+            _review_continue_blocker,
+            _traveller_form_populated,
+        )
+
+        self.assertEqual(_clean_traveller_name("Pick Mr Sudipta Saikia"), "sudipta saikia")
+        self.assertTrue(callable(_adult_traveller_gaps))
+        self.assertTrue(callable(_traveller_form_populated))
+        self.assertTrue(callable(_ensure_review_traveller))
+        self.assertTrue(
+            _decline_option_text(
+                "I don't want Free Cancellation. Pay ₹3,999 fee if you cancel or reschedule"
+            )
+        )
+        self.assertFalse(_decline_option_text("Without Assured"))
+        self.assertFalse(_decline_option_text("With Assured"))
+        decline_src = inspect.getsource(_decline_radio_checked)
+        self.assertIn("selected|active|checked", decline_src)
+        self.assertIn("don.?t want free cancellation", decline_src)
+        blocker = inspect.getsource(_review_continue_blocker)
+        self.assertIn("_adult_traveller_gaps", blocker)
+        self.assertIn("Adult traveller details are incomplete", blocker)
+        self.assertIn("saved traveller not selected", blocker)
+        self.assertIn("_email_input_empty", blocker)
+        self.assertIn("Contact email is empty", blocker)
+        self.assertIn("Without Assured", blocker)
+        self.assertIn("Assured Free Cancellation is still open", blocker)
+        self.assertIn("after I tried Without Assured", blocker)
+        without_src = inspect.getsource(
+            __import__("app.page_agent", fromlist=["_ixigo_click_without_assured"])._ixigo_click_without_assured
+        )
+        # Card copy is longer than the bare label — exact ^without assured$ alone misses.
+        self.assertIn("160", without_src)
+        self.assertIn("without assured", without_src.lower())
+        self.assertIn("_ixigo_assured_comparison_open", without_src)
+        declined_src = inspect.getsource(
+            __import__("app.page_agent", fromlist=["_cancellation_declined"])._cancellation_declined
+        )
+        self.assertIn("optout_without_assured_miss", declined_src)
+        from unittest.mock import patch
+
+        from app.travel_agent import resolve_intent
+
+        skip_state = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "ixigo",
+            "stage": "booking",
+            "stuck_kind": "addon_buy",
+            "stuck_page": (
+                "Review Details Billing Address PIN code 785001 "
+                "Free Cancellation With Assured ₹9,813 Without Assured ₹8,964 Continue"
+            ),
+        }
+        with patch("app.travel_agent.get_settings") as gs:
+            gs.return_value.gemini_api_key = ""
+            gs.return_value.llm_ready = False
+            kind, spoken = resolve_intent("no thanks", skip_state, [])
+        self.assertEqual(kind, "book")
+        self.assertIn("skip", spoken.lower())
+        self.assertRegex(str(skip_state.get("chosen_tap") or ""), re.compile(r"without assured", re.I))
+        gaps_src = inspect.getsource(_adult_traveller_gaps)
+        self.assertIn("please select your title", gaps_src.lower())
+        self.assertIn("_decline_radio_checked", blocker)
+        self.assertIn("_ixigo_buy_this_visible", blocker)
+        self.assertIn("No, Thanks", blocker)
+        self.assertIn("pin code", blocker.lower())
+        prep = inspect.getsource(
+            __import__("app.page_agent", fromlist=["_ixigo_prepare_review"])._ixigo_prepare_review
+        )
+        self.assertIn("_ensure_review_traveller", prep)
+        self.assertIn("_commit_contact_email", prep)
+        pick = inspect.getsource(
+            __import__("app.page_agent", fromlist=["_select_saved_traveller"])._select_saved_traveller
+        )
+        self.assertIn("_traveller_form_populated", pick)
+        self.assertIn("traveller_already_empty", pick)
+        from app.page_agent import _email_input_empty, _on_addons_page
+
+        self.assertTrue(callable(_on_addons_page))
+        self.assertTrue(callable(_email_input_empty))
+        self.assertFalse(
+            _on_addons_page(
+                "Review & Traveller Details Contact Details Please enter an email address "
+                "Billing Address Continue Add-ons Payment",
+                "review",
+            )
+        )
+        self.assertTrue(
+            _on_addons_page("Choose add-ons Skip add-ons Add seats Add meals", "addons")
+        )
+        confirm_src = inspect.getsource(_press_confirm_then_addons)
+        self.assertIn("name_confirm", confirm_src)
+        self.assertIn("reached_addons_after_confirm", confirm_src)
+        self.assertIn("_on_addons_page", confirm_src)
+        self.assertIn("Confirm", confirm_src)
+        self.assertIn("_dismiss_post_confirm_secure_trip", confirm_src)
+        self.assertIn("_leave_addons", confirm_src)
+        self.assertIn("reached_pay_after", confirm_src)
+        dismiss_src = inspect.getsource(
+            __import__("app.page_agent", fromlist=["_dismiss_post_confirm_secure_trip"])._dismiss_post_confirm_secure_trip
+        )
+        self.assertIn("_ixigo_click_no_thanks", dismiss_src)
+        self.assertIn("post_confirm_no_thanks", dismiss_src)
+        deliver_src = inspect.getsource(
+            __import__("app.travel_agent", fromlist=["_deliver_signed_in_page"])._deliver_signed_in_page
+        )
+        self.assertIn("reached_pay_after_", deliver_src)
+        self.assertIn("post_confirm_no_thanks", deliver_src)
+        # Auto No Thanks / leave-addons must beat the sticky "reached add-ons" ask.
+        self.assertLess(
+            deliver_src.index("reached_pay_after_"),
+            deliver_src.index("reached_addons_after_confirm"),
+        )
         pick = inspect.getsource(_select_saved_traveller)
         self.assertIn("input[type=checkbox]", pick)
         review = inspect.getsource(run_checkout_agent)
@@ -4291,16 +5184,1093 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn('sum(1 for line in log if "review_continue" in line) < 3', review)
         self.assertNotIn('{"action": "done", "target": "review"', review)
         self.assertNotIn("_dismiss_overlays(page)", review.split("review_continue")[1][:700])
-        handler = review.split('if kind == "review_continue"')[1][:3500]
+        self.assertIn("_press_confirm_then_addons", review)
+        self.assertIn("_decline_radio_checked", review)
+        handler = review.split('if kind == "review_continue"')[1][:5500]
         self.assertGreaterEqual(handler.count("_safe_continue(page)"), 1)
-        self.assertIn("_ixigo_opt_out_cancellation", handler)
-        self.assertIn("_select_saved_traveller", handler)
+        self.assertIn("_ixigo_prepare_review", handler)
         self.assertIn("_ixigo_buy_this_visible", handler)
         self.assertIn("_pause_unknown", handler)
         self.assertIn("_clear_front_sheet", handler)
+        self.assertIn("_press_confirm_then_addons", handler)
         self.assertIn("Conscience", handler)
-        self.assertLess(handler.index("_select_saved_traveller"), handler.index("_safe_continue(page)"))
-        self.assertLess(handler.index("_pause_unknown"), handler.index("_safe_continue(page)"))
+        self.assertLess(handler.index("_ixigo_prepare_review"), handler.index("_safe_continue(page)"))
+        self.assertLess(handler.index("_safe_continue(page)"), handler.index("_press_confirm_then_addons"))
+        # Overlay / Assured must prepare (fill traveller) — never pause-ask first.
+        self.assertIn("_ixigo_prepare_review", handler)
+        self.assertNotIn(
+            "return _pause_unknown(\n                        page,\n                        seller=seller,\n                        hint=hint,\n                        text=text,\n                        url=url,\n                        log=log,\n                        facts=facts,\n                        checks=checks,\n                        step=step,\n                        chosen_tap=chosen_tap,\n                    )",
+            handler,
+        )
+        # No chosen_tap on Ixigo Review: autofill before ask.
+        self.assertIn("ixigo_autofill_before_ask", review)
+
+    def test_continue_confirm_addons_handoff_beats_contact_report(self) -> None:
+        """Review → Continue → Confirm → Add-ons must announce Add-ons, not 'typed contact'."""
+        import inspect
+
+        from app.page_agent import contact_report, run_checkout_agent
+        from app.travel_agent import _deliver_signed_in_page
+
+        stuck = (
+            "Review & Traveller Details Billing Address Pin code 785001 "
+            "I don't want Free Cancellation Continue"
+        )
+        blocked = contact_report(
+            "email:ok | phone:none | optout_miss | user_tap_upsell_continue:0",
+            stuck,
+        )
+        self.assertIn("free cancellation is still unselected", blocked.lower())
+        deliver = inspect.getsource(_deliver_signed_in_page)
+        self.assertIn("reached_addons_after_confirm", deliver)
+        self.assertIn("could not select", deliver)
+        self.assertIn("Free Cancellation", deliver)
+        checkout = inspect.getsource(run_checkout_agent)
+        self.assertIn("_review_continue_blocker", checkout)
+        self.assertIn("optout_exact_pay", inspect.getsource(
+            __import__("app.page_agent", fromlist=["_ixigo_opt_out_cancellation"])._ixigo_opt_out_cancellation
+        ))
+
+    def test_queued_continue_rebuilds_email_profile(self) -> None:
+        """Email sent while checkout is in flight must reach the queued Continue fill."""
+        import inspect
+
+        from app.page_agent import contact_report
+        from app.travel_agent import _run_kernel_login, absorb_details
+
+        src = inspect.getsource(_run_kernel_login)
+        self.assertIn("pending_text", src)
+        self.assertIn("fresh_profile", src)
+        self.assertIn("absorb_details(queued, pending_text)", src)
+        self.assertIn("profile=fresh_profile", src)
+        self.assertNotIn("profile=profile,\n                on_code_requested=on_code_requested,\n                on_otp_result=on_otp_result,\n                resume_url=str((result or {}).get(\"url\") or resume or \"\"),\n                chosen_tap=queued_tap", src)
+
+        fixed = absorb_details({}, "sudiptasaikia6@gmail.vom")
+        self.assertEqual(fixed.get("email"), "sudiptasaikia6@gmail.com")
+
+        empty = contact_report(
+            "email:none | phone:ok",
+            "Contact Details Please enter an email address Continue",
+        )
+        self.assertIn("empty", empty.lower())
+        # Still on Review with empty-email copy — never claim Continue succeeded.
+        stuck_email = contact_report(
+            "email:ok | phone:ok | user_tap_continue:1",
+            "Review & Traveller Details Contact Details Please enter an email address Continue",
+        )
+        self.assertIn("empty", stuck_email.lower())
+        self.assertNotIn("pressed Continue", stuck_email)
+        from app.page_agent import (
+            _commit_contact_email,
+            _ixigo_prepare_review,
+            _react_set_input_value,
+            _read_email_value,
+        )
+
+        prep = inspect.getsource(_ixigo_prepare_review)
+        self.assertIn("_commit_contact_email", prep)
+        self.assertNotIn('"email", "phone"', prep.split("fill_profile_slots")[1][:200])
+        self.assertLess(prep.index("_ensure_review_traveller"), prep.rindex("_commit_contact_email"))
+        commit_src = inspect.getsource(_commit_contact_email)
+        self.assertIn("press_sequentially", commit_src)
+        self.assertIn("_react_set_input_value", commit_src)
+        self.assertTrue(callable(_commit_contact_email))
+        self.assertTrue(callable(_read_email_value))
+        self.assertTrue(callable(_react_set_input_value))
+        checkout = inspect.getsource(
+            __import__("app.page_agent", fromlist=["run_checkout_agent"]).run_checkout_agent
+        )
+        self.assertIn("_commit_contact_email", checkout)
+        self.assertIn("please enter an email address", checkout)
+        deliver = inspect.getsource(
+            __import__("app.travel_agent", fromlist=["_deliver_signed_in_page"])._deliver_signed_in_page
+        )
+        self.assertIn("contact email is empty", deliver.lower())
+        self.assertIn("contact details", deliver.lower())
+
+
+class IxigoSavedTravellerAutofill(unittest.TestCase):
+    """Dirty profile names must tick/fill Adult 1 — never type 'Pick' into First Name."""
+
+    def test_name_parts_strip_pick_and_title(self) -> None:
+        from app.page_agent import _clean_traveller_name, _traveller_name_parts
+
+        self.assertEqual(_clean_traveller_name("Pick Mr Sudipta Saikia"), "sudipta saikia")
+        title, first, last = _traveller_name_parts("Pick Mr Sudipta Saikia")
+        self.assertEqual(title, "Mr")
+        self.assertEqual(first.lower(), "sudipta")
+        self.assertEqual(last.lower(), "saikia")
+
+    def test_fill_passenger_fields_uses_cleaned_name(self) -> None:
+        from playwright.sync_api import sync_playwright
+
+        from app.page_agent import _adult_traveller_gaps, _fill_passenger_fields, _traveller_form_populated
+
+        html = """
+        <html><body>
+          <label>Title<select id="t"><option value="">Title</option><option value="Mr">Mr</option></select></label>
+          <label>First & Middle Name<input id="f" /></label>
+          <label>Last Name<input id="l" /></label>
+        </body></html>
+        """
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_content(html)
+            notes = _fill_passenger_fields(
+                page, {"name": "Pick Mr Sudipta Saikia", "gender": "male"}
+            )
+            self.assertIn("title:ok", notes)
+            self.assertEqual(page.input_value("#t"), "Mr")
+            self.assertEqual(page.input_value("#f"), "Sudipta")
+            self.assertEqual(page.input_value("#l"), "Saikia")
+            self.assertNotEqual(page.input_value("#f").lower(), "pick")
+            self.assertTrue(_traveller_form_populated(page))
+            self.assertEqual(_adult_traveller_gaps(page), [])
+            browser.close()
+
+    def test_prepare_review_autofills_saved_traveller_and_email(self) -> None:
+        from playwright.sync_api import sync_playwright
+
+        from app.page_agent import (
+            _email_input_empty,
+            _ixigo_autonomous_gate,
+            _ixigo_prepare_review,
+            _traveller_form_populated,
+        )
+
+        html = """
+        <html><body>
+          <div>Review & Traveller Details</div>
+          <div>Add Free Cancellation Please select an option before proceeding
+            <label><input type="radio" name="fareType" id="standalone-none-fareType" />
+            I don't want Free Cancellation. Pay ₹3,999 fee if you cancel</label>
+          </div>
+          <h2>Traveller Details</h2>
+          <p>Choose from the saved list</p>
+          <label><input type="checkbox" id="sv" /> Mr Sudipta Saikia</label>
+          <div>
+            <p>Adult 1 Clear Details</p>
+            <label>Title<select id="t"><option value="">Title</option><option value="Mr">Mr</option></select></label>
+            <label>First & Middle Name<input id="f" /></label>
+            <label>Last Name<input id="l" /></label>
+          </div>
+          <label>Email<input id="e" type="email" /></label>
+          <label>Mobile Number<input id="m" /></label>
+          <label>PIN code<input id="p" /></label>
+          <script>
+            document.getElementById('sv').addEventListener('change', (ev) => {
+              if (ev.target.checked) {
+                document.getElementById('t').value = 'Mr';
+                document.getElementById('f').value = 'Sudipta';
+                document.getElementById('l').value = 'Saikia';
+              }
+            });
+          </script>
+        </body></html>
+        """
+        profile = {
+            "name": "Pick Mr Sudipta Saikia",
+            "email": "sudiptasaikia6@gmail.com",
+            "phone": "8638586171",
+            "pincode": "781001",
+            "auth_mode": "login",
+            "extras_preference": "decline",
+        }
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_content(html)
+            notes = _ixigo_prepare_review(page, profile)
+            self.assertTrue(any("traveller" in str(n) for n in notes))
+            self.assertIn("email:ok", notes)
+            self.assertEqual(page.input_value("#t"), "Mr")
+            self.assertEqual(page.input_value("#f"), "Sudipta")
+            self.assertEqual(page.input_value("#l"), "Saikia")
+            self.assertFalse(_email_input_empty(page))
+            self.assertTrue(_traveller_form_populated(page))
+            self.assertEqual(_ixigo_autonomous_gate(page, profile, []), "")
+            browser.close()
+
+    def test_empty_title_select_is_a_gap(self) -> None:
+        from playwright.sync_api import sync_playwright
+
+        from app.page_agent import _adult_traveller_gaps
+
+        html = """
+        <html><body>
+          <label>Title<select><option value="">Title</option><option value="Mr">Mr</option></select></label>
+          <label>First & Middle Name<input value="Sudipta" /></label>
+          <label>Last Name<input value="Saikia" /></label>
+        </body></html>
+        """
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_content(html)
+            self.assertIn("title", _adult_traveller_gaps(page))
+            browser.close()
+
+    def test_filled_title_input_is_not_a_gap_from_label(self) -> None:
+        """Ixigo keeps a visible 'Title' label beside a filled Mr text box — that is not a gap."""
+        from playwright.sync_api import sync_playwright
+
+        from app.page_agent import _adult_traveller_gaps, _traveller_form_populated
+
+        html = """
+        <html><body>
+          <span>Title</span>
+          <label>Title<input value="Mr" /></label>
+          <label>First & Middle Name<input value="Sudipta" /></label>
+          <label>Last Name<input value="Saikia" /></label>
+        </body></html>
+        """
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_content(html)
+            self.assertNotIn("title", _adult_traveller_gaps(page))
+            self.assertTrue(_traveller_form_populated(page))
+            browser.close()
+
+    def test_select_saved_traveller_clicks_offscreen_listitem_card(self) -> None:
+        """Ixigo saved people are role=listitem cards that can sit above the viewport."""
+        from playwright.sync_api import sync_playwright
+
+        from app.page_agent import _select_saved_traveller, _traveller_form_populated
+
+        html = """
+        <html><body style="margin:0">
+          <div style="height:900px">Offers spacer</div>
+          <div role="listitem" style="width:231px;height:44px">Mr Sudipta Saikia</div>
+          <div>
+            <label>Title<input id="t" value="" /></label>
+            <label>First & Middle Name<input id="f" value="" /></label>
+            <label>Last Name<input id="l" value="" /></label>
+          </div>
+          <script>
+            document.querySelector('[role=listitem]').addEventListener('click', () => {
+              document.getElementById('t').value = 'Mr';
+              document.getElementById('f').value = 'Sudipta';
+              document.getElementById('l').value = 'Saikia';
+            });
+          </script>
+        </body></html>
+        """
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_content(html)
+            page.set_viewport_size({"width": 1280, "height": 720})
+            note = _select_saved_traveller(page, "Pick Mr Sudipta Saikia")
+            self.assertRegex(note, r"traveller_(card|clicked|retry)")
+            self.assertEqual(page.input_value("#f"), "Sudipta")
+            self.assertTrue(_traveller_form_populated(page))
+            browser.close()
+
+
+class IxigoSkipToPaymentAndShots(unittest.TestCase):
+    """Add-ons Skip to Payment routing + clean user-facing screenshots."""
+
+    def test_skip_to_payment_is_not_a_trip_route(self) -> None:
+        from app.intent import parse_updates
+        from app.travel_agent import absorb_trip
+
+        self.assertEqual(parse_updates("skip to payment"), {})
+        self.assertEqual(parse_updates("continue without add-ons"), {})
+        kept = absorb_trip(
+            {"origin": "Guwahati", "destination": "Delhi", "depart": "2026-12-04"},
+            "skip to payment",
+        )
+        self.assertEqual(kept.get("origin"), "Guwahati")
+        self.assertEqual(kept.get("destination"), "Delhi")
+
+    def test_ixigo_addons_not_misclassified_as_review(self) -> None:
+        from app.page_agent import classify_page
+        from app.step_contract import left_addons
+
+        page = (
+            "Flight Selection Review & Traveller Details Add-ons Payment "
+            "Your Flight Guwahati New Delhi Fri, 04 Dec 6E-123 "
+            "Fare Summary Base Fare ₹8,241 Total Amount ₹9,813 "
+            "Seat Meal Insurance Skip to Payment > Meal Selection > "
+            "seat map Select Seat"
+        )
+        stage = classify_page(page, "https://www.ixigo.com/checkout/addons")
+        self.assertEqual(stage, "addons")
+        self.assertFalse(left_addons(page, stage))
+        self.assertFalse(left_addons(page, "review"))
+
+    def test_skip_to_payment_intent_sets_ixigo_tap(self) -> None:
+        from app.travel_agent import extract_user_ask
+
+        state = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "ixigo",
+            "stage": "booking",
+            "stuck_kind": "addons",
+            "stuck_page": (
+                "Seat Meal Insurance Skip to Payment > Meal Selection "
+                "Choose add-ons seat map"
+            ),
+        }
+        for phrase in (
+            "skip to payment",
+            "Skip to Payment",
+            "skip add-ons",
+            "I don't want seats or meals",
+            "continue without add-ons",
+        ):
+            asked = extract_user_ask(phrase, state)
+            self.assertEqual(asked.get("goal"), "skip", phrase)
+            self.assertEqual(asked.get("intent"), "book", phrase)
+        pay = extract_user_ask("skip to payment", state)
+        self.assertRegex(str(pay.get("tap") or ""), re.compile(r"skip to payment", re.I))
+
+    def test_skip_addons_recognises_skip_to_payment_label(self) -> None:
+        import inspect
+
+        from app.page_agent import _skip_addons
+        from app.step_read import addons_sheet, decline_tap, visible_forward
+
+        src = inspect.getsource(_skip_addons)
+        self.assertIn("Skip to Payment", src)
+        self.assertIn("skip to payment", src.lower())
+        page = "Seat Meal Insurance Skip to Payment > Meal Selection seat map"
+        self.assertTrue(addons_sheet(page))
+        self.assertRegex(decline_tap(page) or "", re.compile(r"skip to payment", re.I))
+        self.assertRegex(
+            visible_forward(page, "skip to payment") or "",
+            re.compile(r"skip to payment", re.I),
+        )
+
+    def test_skip_to_payment_clicks_and_leaves_addons(self) -> None:
+        from playwright.sync_api import sync_playwright
+
+        from app.page_agent import _leave_addons, _skip_addons, classify_page
+
+        html = """
+        <html><body>
+          <h1>Add-ons</h1>
+          <p>Review &amp; Traveller Details Fare Summary Total Amount ₹9,813 6E-212</p>
+          <a id="skip" href="#pay">Skip to Payment &gt;</a>
+          <div id="addons">Seat Meal Insurance seat map Meal Selection</div>
+          <div id="pay" style="display:none">Payment options Pay now UPI enter card number Total Amount ₹9,813</div>
+          <script>
+            document.getElementById('skip').addEventListener('click', (e) => {
+              e.preventDefault();
+              document.getElementById('skip').remove();
+              document.getElementById('addons').remove();
+              document.body.querySelector('h1').textContent = 'Payment';
+              document.getElementById('pay').style.display = 'block';
+              history.replaceState({}, '', '/payment');
+            });
+          </script>
+        </body></html>
+        """
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_content(html)
+            before = classify_page(page.inner_text("body"), page.url)
+            self.assertEqual(before, "addons")
+            log: list[str] = []
+            ok = _leave_addons(page, log, rounds=3)
+            hit = " ".join(log)
+            self.assertTrue(ok, log)
+            self.assertRegex(hit, re.compile(r"skip to payment|addons_left:pay", re.I))
+            self.assertTrue(page.locator("#pay").is_visible())
+            self.assertFalse(page.locator("#addons").is_visible())
+            after = classify_page(page.inner_text("body"), page.url)
+            self.assertEqual(after, "pay")
+            browser.close()
+
+    def test_skip_to_payment_does_not_loop_forever_when_disabled(self) -> None:
+        from playwright.sync_api import sync_playwright
+
+        from app.page_agent import _leave_addons
+
+        html = """
+        <html><body>
+          <h1>Add-ons</h1>
+          <p>Seat Meal Insurance seat map Skip to Payment Meal Selection Fare Summary ₹9,813</p>
+          <a id="skip" style="pointer-events:none;opacity:0.4">Skip to Payment &gt;</a>
+        </body></html>
+        """
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_content(html)
+            log: list[str] = []
+            ok = _leave_addons(page, log, rounds=2)
+            browser.close()
+        self.assertFalse(ok)
+        self.assertLessEqual(sum(1 for line in log if line.startswith("addons_skip:")), 4)
+
+    def test_user_shot_clears_selection_and_differs_from_vision_shot(self) -> None:
+        import inspect
+
+        from app.vision_agent import _clear_page_for_user_shot, capture_page_shot, capture_user_shot
+
+        user_src = inspect.getsource(capture_user_shot)
+        clear_src = inspect.getsource(_clear_page_for_user_shot)
+        vision_src = inspect.getsource(capture_page_shot)
+        self.assertIn("_clear_page_for_user_shot", user_src)
+        self.assertIn("removeAllRanges", clear_src)
+        self.assertIn("data-guide-hl", clear_src)
+        self.assertRegex(user_src, r'["\']quality["\']\s*:\s*9[02]')
+        self.assertIn("settle_visible_sheet", vision_src)
+        self.assertNotIn("settle_visible_sheet", user_src)
+
+    def test_user_shot_has_no_debug_overlay_pixels_contract(self) -> None:
+        from playwright.sync_api import sync_playwright
+
+        from app.vision_agent import capture_user_shot
+
+        html = """
+        <html><body style="background:#fff;color:#111;font:16px sans-serif">
+          <div data-guide-hl style="position:fixed;inset:0;background:rgba(0,0,255,0.5)"></div>
+          <h1>Fare Summary</h1>
+          <p>Total Amount ₹9,813</p>
+          <button>Skip to Payment</button>
+        </body></html>
+        """
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_content(html)
+            path = capture_user_shot(page, tag="clarity")
+            self.assertTrue(path)
+            # Overlay node must be removed before capture.
+            left = page.evaluate("() => document.querySelectorAll('[data-guide-hl]').length")
+            self.assertEqual(left, 0)
+            browser.close()
+
+
+class IxigoCheckoutDecisions(unittest.TestCase):
+    """Logged-in Ixigo autonomy: AUTO_FILL, ASK_USER, REQUIRE_APPROVAL. Does not pay."""
+
+    def _profile(self, **extra):
+        base = {
+            "name": "Sudipta Saikia",
+            "email": "sudiptasaikia6@gmail.com",
+            "phone": "8638586171",
+            "pincode": "781001",
+            "billing_address": "12 Zoo Road",
+            "city": "Guwahati",
+            "billing_state": "Assam",
+            "auth_mode": "login",
+            "extras_preference": "decline",
+        }
+        base.update(extra)
+        return base
+
+    def _ready_obs(self, **extra):
+        base = {
+            "stage": "review",
+            "on_review": True,
+            "text": "Review Details Mr Sudipta Saikia Email Mobile 8638586171 781001 Continue",
+            "traveller_gaps": [],
+            "traveller_ok": True,
+            "email_empty": False,
+            "phone_empty": False,
+            "pincode_empty": False,
+            "pincode_invalid": False,
+            "address_empty": False,
+            "city_empty": False,
+            "state_empty": False,
+            "session": "authenticated",
+        }
+        base.update(extra)
+        return base
+
+    def test_auto_fill_when_saved_review_is_complete(self) -> None:
+        from app.ixigo_decisions import AUTO_FILL, plan_ixigo_checkout
+
+        plan = plan_ixigo_checkout(self._ready_obs(), self._profile())
+        self.assertIn(AUTO_FILL, plan["classes"])
+        self.assertTrue(plan["continue_ok"])
+        self.assertEqual(plan["handoff"], "")
+        self.assertEqual(plan["extras"], "decline")
+
+    def test_ask_user_for_missing_traveller_email_and_invalid_pin(self) -> None:
+        from app.ixigo_decisions import ASK_USER, plan_ixigo_checkout
+
+        missing = plan_ixigo_checkout(
+            self._ready_obs(traveller_gaps=["title", "first name"], traveller_ok=False),
+            self._profile(name=""),
+        )
+        self.assertIn(ASK_USER, missing["classes"])
+        self.assertFalse(missing["continue_ok"])
+        self.assertIn("Passenger name", missing["handoff"])
+
+        pin = plan_ixigo_checkout(self._ready_obs(pincode_invalid=True), self._profile())
+        self.assertFalse(pin["continue_ok"])
+        self.assertIn("Pincode is invalid", pin["handoff"])
+
+        email = plan_ixigo_checkout(
+            self._ready_obs(email_empty=True),
+            self._profile(email=""),
+        )
+        self.assertIn("Email is missing", email["handoff"])
+        self.assertFalse(email["continue_ok"])
+
+    def test_saved_email_is_auto_fill_until_the_dom_holds_it(self) -> None:
+        from app.ixigo_decisions import AUTO_FILL, plan_ixigo_checkout
+
+        plan = plan_ixigo_checkout(self._ready_obs(email_empty=True), self._profile())
+        email = next(i for i in plan["items"] if i["field"] == "email")
+        self.assertEqual(email["class"], AUTO_FILL)
+        self.assertEqual(email["action"], "fill")
+        self.assertFalse(plan["continue_ok"])
+
+    def test_unauthorised_extras_require_approval_decline_does_not(self) -> None:
+        from app.ixigo_decisions import AUTO_FILL, REQUIRE_APPROVAL, plan_ixigo_checkout
+
+        open_sheet = self._ready_obs(
+            assured_open=True,
+            cancellation_declined=False,
+            text="With Assured ₹9,813 Without Assured ₹8,964",
+        )
+        decline = plan_ixigo_checkout(open_sheet, self._profile())
+        choice = next(i for i in decline["items"] if i["field"] == "free_cancellation")
+        self.assertEqual(choice["class"], AUTO_FILL)
+        self.assertEqual(choice["action"], "decline")
+        self.assertIn("9,813", choice["detail"])
+        self.assertFalse(decline["continue_ok"])
+
+        ask = plan_ixigo_checkout(open_sheet, self._profile(extras_preference="ask"))
+        paid = next(i for i in ask["items"] if i["field"] == "free_cancellation")
+        self.assertEqual(paid["class"], REQUIRE_APPROVAL)
+        self.assertIn("no thanks", paid["detail"].lower())
+        self.assertFalse(ask["continue_ok"])
+
+    def test_payment_and_addons_and_expired_session(self) -> None:
+        from app.ixigo_decisions import REQUIRE_APPROVAL, plan_ixigo_checkout, session_after_otp
+
+        pay = plan_ixigo_checkout(
+            self._ready_obs(stage="pay", on_review=False, payment_open=True, total="₹9,813"),
+            self._profile(),
+        )
+        self.assertIn(REQUIRE_APPROVAL, pay["classes"])
+        self.assertFalse(pay["continue_ok"])
+        self.assertIn("Final fare", pay["handoff"])
+        self.assertIn("will not click Pay", pay["handoff"])
+
+        addons = plan_ixigo_checkout(
+            {"stage": "addons", "on_addons": True, "text": "Choose add-ons Skip add-ons", "session": "authenticated"},
+            self._profile(),
+        )
+        skip = next(i for i in addons["items"] if i["field"] == "addons")
+        self.assertEqual(skip["action"], "skip")
+
+        otp = plan_ixigo_checkout(self._ready_obs(stage="otp", session="unauthenticated"), self._profile())
+        self.assertFalse(otp["continue_ok"])
+        self.assertIn("not authenticated", otp["handoff"])
+        self.assertEqual(session_after_otp(otp_status="fares", logged_in=False), "unauthenticated")
+        self.assertEqual(session_after_otp(otp_status="verified", logged_in=False), "unauthenticated")
+        self.assertEqual(session_after_otp(otp_status="ok", logged_in=True, still_otp=False), "authenticated")
+        self.assertEqual(session_after_otp(otp_status="ok", logged_in=True, still_otp=True), "unauthenticated")
+
+    def test_gate_skips_guests_and_checkout_calls_it(self) -> None:
+        import inspect
+
+        from app.page_agent import _ixigo_autonomous_gate, run_checkout_agent
+
+        self.assertEqual(_ixigo_autonomous_gate(None, {"auth_mode": "guest"}, []), "")
+        src = inspect.getsource(run_checkout_agent)
+        self.assertIn("_ixigo_autonomous_gate", src)
+        self.assertIn("allow_pay", src)
+
+    def test_ten_consecutive_local_review_plans_allow_continue(self) -> None:
+        """Ten identical ready reviews. This is the decision engine, not a live Ixigo payment."""
+        from app.ixigo_decisions import plan_ixigo_checkout
+
+        ready = 0
+        for _ in range(10):
+            plan = plan_ixigo_checkout(self._ready_obs(), self._profile())
+            self.assertTrue(plan["continue_ok"])
+            self.assertFalse(plan["blocks"])
+            ready += 1
+        self.assertEqual(ready, 10)
+
+
+class DirectIxigoCheckoutTests(unittest.TestCase):
+    """A known traveller who says book GHY–Delhi on a date goes straight to Ixigo checkout."""
+
+    def _ready(self) -> dict:
+        return {
+            "name": "Sudipta Saikia",
+            "email": "sudipta@example.com",
+            "dob": "1997-07-29",
+            "gender": "male",
+            "phone": "9810012345",
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+        }
+
+    def test_book_phrase_parses_ghy_delhi_4_dec(self) -> None:
+        from app.intent import parse_updates
+
+        from app.search import place_label
+
+        updates = parse_updates("book a flight from ghy to delhi 4th Dec")
+        self.assertEqual(place_label(str(updates.get("origin") or "")), "Guwahati")
+        self.assertEqual(place_label(str(updates.get("destination") or "")), "Delhi")
+        self.assertTrue(str(updates.get("depart") or "").endswith("-12-04"))
+        self.assertFalse(updates.get("depart_until"))
+
+    def test_known_traveller_books_instead_of_searching(self) -> None:
+        from app.turn_loop import align_action
+        from app.travel_agent import wants_direct_ixigo_checkout
+
+        bare = "book a flight from ghy to delhi 4th Dec"
+        named = "book a flight from ghy to delhi 4th Dec on ixigo"
+        ready = self._ready()
+        turn = {"goal": "search", "intent": "search", "kind": "", "tap": ""}
+        self.assertFalse(wants_direct_ixigo_checkout(bare, ready))
+        self.assertTrue(wants_direct_ixigo_checkout(named, ready))
+        self.assertTrue(wants_direct_ixigo_checkout("book ghy to delhi 4th Dec in ixigo", ready))
+        self.assertFalse(wants_direct_ixigo_checkout(named, {}))
+        self.assertEqual(align_action(bare, ready, turn)["do"], "search")
+        self.assertEqual(align_action(named, ready, turn)["do"], "book")
+
+    def test_ack_names_ixigo_checkout_before_charge(self) -> None:
+        from app.travel_agent import _arm_direct_ixigo_checkout, direct_checkout_ack
+
+        state = self._ready()
+        state["origin"] = "ghy"
+        state["destination"] = "delhi"
+        _arm_direct_ixigo_checkout(state, "book a flight from ghy to delhi 4th Dec")
+        self.assertEqual(state.get("origin"), "Guwahati")
+        self.assertEqual(state.get("destination"), "Delhi")
+        self.assertEqual(state.get("seller"), "ixigo")
+        self.assertEqual(state.get("kernel_auth_mode"), "login")
+        self.assertTrue(state.get("direct_checkout"))
+        self.assertEqual(
+            direct_checkout_ack(state),
+            "On it. I'll set up Guwahati to Delhi on 4 Dec in Ixigo "
+            "and show you the checkout page before anything is charged.",
+        )
+
+    def test_checkout_lines_match_the_ready_to_pay_brief(self) -> None:
+        from app.travel_agent import _checkout_summary_open, checkout_ready_lines
+
+        page = (
+            "Fare Summary Akasa Air QP1341 09:10 Guwahati layover in Bagdogra 19:10 Delhi "
+            "Total Amount ₹8,331 convenience fee ₹505 coupon ₹364 15 kg checked bag "
+            "expires in 9 min"
+        )
+        state = {
+            **self._ready(),
+            "direct_checkout": True,
+            "seller": "ixigo",
+            "direct_pick": {
+                "airline": "Akasa Air",
+                "depart": "09:10",
+                "arrive": "19:10",
+                "stops": "1 stop",
+                "price_n": 8365,
+                "minutes": 600,
+            },
+            "direct_alt": {
+                "airline": "SpiceJet",
+                "depart": "08:55",
+                "arrive": "11:55",
+                "stops": "Non-stop",
+                "price_n": 10006,
+                "minutes": 180,
+            },
+        }
+        self.assertTrue(_checkout_summary_open(page, "review"))
+        self.assertFalse(
+            _checkout_summary_open("Please enter your email Fare Summary Total Amount ₹8,331", "review")
+        )
+        lines = checkout_ready_lines(state, page)
+        self.assertEqual(
+            lines,
+            [
+                "Ready to pay on Ixigo, nothing charged. Cheapest on 4 Dec: Akasa Air, "
+                "leaves Guwahati 9:10 AM, lands Delhi 7:10 PM, one long layover in Bagdogra. "
+                "Total Rs 8,331 (includes a Rs 505 fee, after a Rs 364 coupon). 15 kg checked bag.",
+                "If you'd rather skip the layover, SpiceJet nonstop 8:55 AM to 11:55 AM "
+                "is about Rs 1,675 more.",
+                "Approve Rs 8,331 for the Akasa flight, or want the nonstop? And payment: "
+                "I can't do UPI myself. I can send a secure link to save your card and pay with it, "
+                "or you pay on the page yourself. The fare hold expires in about 9 minutes, so quick is good.",
+            ],
+        )
+
+    def test_seat_map_is_addons_not_a_stuck_review_form(self) -> None:
+        from app.page_agent import _on_addons_page, _review_continue_blocker
+
+        seat = (
+            "Flight Selection Review & Traveller Details Add-ons Payment "
+            "Skip to payment Your Flight 09:10 Guwahati 12:00 New Delhi Non-stop "
+            "Seat Meal Insurance Fare Summary Total Amount ₹9,813 Mr Sudipta Saikia"
+        )
+        review = (
+            "Review & Traveller Details Billing Address Contact Details "
+            "Please enter an email Continue Total Amount ₹9,813"
+        )
+
+        class _Page:
+            def __init__(self, body: str) -> None:
+                self.url = "https://www.ixigo.com/flight/booking/1"
+                self._body = body
+
+            def inner_text(self, _sel: str, timeout: int = 0) -> str:
+                return self._body
+
+        self.assertTrue(_on_addons_page(seat, "review"))
+        self.assertFalse(_on_addons_page(review, "review"))
+        self.assertEqual(_review_continue_blocker(_Page(seat)), "")
+        from app.travel_agent import _checkout_summary_open
+
+        self.assertFalse(_checkout_summary_open(seat, "addons"))
+        self.assertFalse(_checkout_summary_open(seat, "review"))
+        self.assertTrue(
+            _checkout_summary_open(
+                "Amount To Be Paid ₹10,328 Pay via any UPI app Credit/Debit card",
+                "pay",
+            )
+        )
+        review_form = (
+            "Review & Traveller Details Contact Details Mobile Number 8638586171 Email "
+            "GST Details Billing Address Continue Total Amount ₹9,823 Fare Summary"
+        )
+        self.assertFalse(_checkout_summary_open(review_form, "review"))
+        self.assertFalse(_checkout_summary_open(review_form, "pay"))
+
+    def test_payment_sheet_recommends_the_flight_on_screen(self) -> None:
+        from app.travel_agent import checkout_ready_lines
+
+        page = (
+            "Fare Summary Amount To Be Paid ₹10,328 GST & Conv. fee included "
+            "Yay! You saved ₹450 on this booking Your Flight Fri, 04 Dec IndiGo 6E 2174 "
+            "09:10 GAU 2h 50m 12:00 DEL Non-Stop Travellers 1. Sudipta Saikia 04:20 "
+            "Pay via any UPI app"
+        )
+        lines = checkout_ready_lines(self._ready(), page)
+        self.assertIn(
+            "Ready to pay on Ixigo, nothing charged. Cheapest on 4 Dec: IndiGo, "
+            "leaves Guwahati 9:10 AM, lands Delhi 12:00 PM, nonstop. "
+            "Total Rs 10,328 (GST and convenience fee included, after a Rs 450 saving).",
+            lines[0],
+        )
+        self.assertIn("Approve Rs 10,328 for the IndiGo flight?", lines[-1])
+        self.assertIn("I can't do UPI myself", lines[-1])
+        self.assertIn("fare hold expires in about 4 minutes", lines[-1])
+
+    def test_payment_total_beats_a_stale_fare_and_names_another_option(self) -> None:
+        from app.travel_agent import checkout_ready_lines
+
+        page = (
+            "Fare Summary Amount To Be Paid ₹10,328 GST & Conv. fee included "
+            "You saved ₹450 Your Flight IndiGo 6E 2174 09:10 GAU 12:00 DEL Non-Stop"
+        )
+        state = {
+            **self._ready(),
+            "direct_pick": {
+                "airline": "IndiGo",
+                "depart": "09:10",
+                "arrive": "12:00",
+                "stops": "Non-stop",
+                "price_n": 8190,
+            },
+            "options": [
+                {
+                    "airline": "Air India Express",
+                    "depart": "09:40",
+                    "arrive": "18:00",
+                    "stops": "1 stop",
+                    "price_n": 10016,
+                }
+            ],
+        }
+        lines = checkout_ready_lines(state, page)
+        self.assertIn("Total Rs 10,328", lines[0])
+        self.assertNotIn("8,190", " ".join(lines))
+        self.assertIn("Approve Rs 10,328", lines[-1])
+        self.assertTrue(any("Air India Express" in line for line in lines))
+
+    def test_a_time_after_google_asks_the_three_book_sites(self) -> None:
+        from app.travel_agent import _hold_live, _live_hold_reply, _quote_time_after_search
+
+        state = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "seller": "google",
+            "awaiting_book_site": True,
+            "direct_checkout": True,
+            "kernel_seller": "ixigo",
+        }
+        self.assertTrue(_quote_time_after_search("10:45", state))
+        self.assertFalse(_quote_time_after_search("10:45 on ixigo", state))
+        self.assertFalse(_quote_time_after_search("book 10:45 on ixigo", state))
+        self.assertFalse(_hold_live(state, "10:45", busy=True, changed=False))
+        quoted = {**state, "book_quotes_busy": True, "selected_hint": "10:45"}
+        self.assertTrue(_hold_live(quoted, "10:45", busy=True, changed=False))
+        self.assertIn("Cleartrip, Ixigo, and EaseMyTrip", _live_hold_reply(quoted, "10:45"))
+
+    def test_site_quotes_are_not_discarded_at_75_seconds(self) -> None:
+        import inspect
+
+        from app.book_quotes import collect_book_quotes
+
+        src = inspect.getsource(collect_book_quotes)
+        self.assertNotIn("join(75)", src)
+        self.assertIn("quotes_out", src)
+        self.assertIn("join(180)", src)
+
+    def test_naming_ixigo_with_saved_details_keeps_the_flight_and_goes_to_payment(self) -> None:
+        from app.travel_agent import _arm_ixigo_payment, direct_checkout_ack, ixigo_name_is_direct_book
+
+        from app.travel_agent import ixigo_checkout_step
+
+        ready = {**self._ready(), "selected_hint": "10:45"}
+        self.assertEqual(ixigo_checkout_step("Ixigo", ready), "login")
+        self.assertFalse(ixigo_name_is_direct_book("Ixigo", ready))
+        self.assertEqual(
+            ixigo_checkout_step(
+                "Ixigo",
+                {"origin": "Guwahati", "destination": "Delhi", "depart": "2026-12-04"},
+            ),
+            "phone",
+        )
+        full = {
+            **ready,
+            "kernel_logged_in": "ixigo",
+            "pincode": "781001",
+            "billing_address": "12 Zoo Road",
+            "city": "Guwahati",
+            "billing_state": "Assam",
+        }
+        self.assertTrue(ixigo_name_is_direct_book("Ixigo", full))
+        self.assertEqual(ixigo_checkout_step("Ixigo", full), "pay")
+        _arm_ixigo_payment(ready, "Ixigo")
+        self.assertEqual(ready.get("selected_hint"), "10:45")
+        self.assertTrue(ready.get("direct_checkout"))
+        spoken = direct_checkout_ack(ready)
+        self.assertIn("10:45", spoken)
+        self.assertIn("payment page", spoken)
+
+    def test_new_ixigo_user_is_asked_to_log_in_then_for_billing(self) -> None:
+        from app.travel_agent import (
+            field_correction_line,
+            ixigo_checkout_step,
+            ixigo_profile_reply,
+            reset_lab_traveller,
+        )
+
+        trip = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "selected_hint": "9:40",
+            "name": "Sudipta Saikia",
+            "email": "sudipta@example.com",
+            "phone": "9810012345",
+            "book_quotes": [{"seller": "ixigo"}],
+        }
+        fresh = reset_lab_traveller(trip)
+        self.assertEqual(fresh.get("origin"), "Guwahati")
+        self.assertEqual(fresh.get("selected_hint"), "9:40")
+        self.assertNotIn("name", fresh)
+        self.assertNotIn("phone", fresh)
+        self.assertEqual(ixigo_checkout_step("Ixigo", fresh), "phone")
+        logged = {**fresh, "kernel_logged_in": "ixigo", "login_phone": "+919810012345"}
+        spoken = ixigo_profile_reply(logged)
+        self.assertIn("billing address", spoken)
+        self.assertIn("pin code", spoken)
+        self.assertIn("full name", spoken)
+        rejected = field_correction_line(
+            {"pincode": "537031", "email": "bad@example.com"},
+            "Billing Address Pin code 537031 Please enter a valid pincode Please enter a valid email",
+        )
+        self.assertIn("wrong", rejected.lower())
+        self.assertIn("pin code", rejected)
+        self.assertIn("email", rejected)
+        self.assertIn("screenshot", rejected.lower())
+        missing = field_correction_line(
+            {},
+            "Please enter an email address Please enter a pin code Please enter your address",
+        )
+        self.assertIn("Still missing", missing)
+        self.assertIn("email", missing)
+        self.assertIn("pin code", missing)
+        self.assertIn("billing address", missing)
+
+    def test_otp_is_skipped_only_for_the_same_logged_in_number(self) -> None:
+        from app.travel_agent import ixigo_session_for_number
+
+        same = {"kernel_logged_in": "ixigo", "kernel_login_phone": "+918876233052"}
+        other = {"kernel_logged_in": "ixigo", "kernel_login_phone": "+918638586171"}
+        header_only = {"kernel_logged_in": "ixigo"}
+        self.assertTrue(ixigo_session_for_number(same, "8876233052"))
+        self.assertFalse(ixigo_session_for_number(other, "8876233052"))
+        self.assertFalse(ixigo_session_for_number(header_only, "8876233052"))
+        self.assertFalse(ixigo_session_for_number({}, "8876233052"))
+
+    def test_new_user_does_not_restore_the_old_mobile_from_chat(self) -> None:
+        from app.travel_agent import _recover_trip, ixigo_checkout_step, ixigo_saved_mobile, reset_lab_traveller
+
+        fresh = reset_lab_traveller(
+            {
+                "origin": "Guwahati",
+                "destination": "Delhi",
+                "depart": "2026-12-04",
+                "selected_hint": "17:40",
+                "phone": "8876233052",
+                "login_phone": "+918876233052",
+                "name": "Sudipta Saikia",
+            }
+        )
+        self.assertNotIn("phone", fresh)
+        self.assertNotIn("login_phone", fresh)
+        self.assertEqual(fresh.get("selected_hint"), "17:40")
+        recovered = _recover_trip(
+            fresh,
+            [{"role": "user", "body": "8876233052", "created_at": "2020-01-01T00:00:00+00:00"}],
+            "Ixigo",
+        )
+        self.assertEqual(ixigo_saved_mobile(recovered), "")
+        self.assertEqual(ixigo_checkout_step("Ixigo", recovered), "phone")
+
+    def test_logged_out_header_is_not_a_filled_account(self) -> None:
+        from app.page_agent import ixigo_header_needs_login
+
+        review = (
+            "Review & Traveller Details Log in/Sign up Guwahati New Delhi "
+            "17:40 Air India Express Continue"
+        )
+        self.assertTrue(ixigo_header_needs_login(review))
+        self.assertFalse(ixigo_header_needs_login(review + " Hey Ixigoer Log out"))
+
+    def test_saved_profile_pays_and_new_profile_logs_in_before_payment(self) -> None:
+        """GHY–Delhi 4 Dec: saved login goes to pay; a new number must OTP, then details, then pay."""
+        from app.intent import parse_updates
+        from app.page_agent import ixigo_header_needs_login
+        from app.search import place_label
+        from app.travel_agent import (
+            _checkout_summary_open,
+            _recover_trip,
+            ixigo_checkout_gaps,
+            ixigo_checkout_step,
+            ixigo_profile_reply,
+            ixigo_session_for_number,
+            reset_lab_traveller,
+        )
+
+        route = parse_updates("book a flight from ghy to delhi 4th Dec")
+        self.assertEqual(place_label(str(route.get("origin") or "")), "Guwahati")
+        self.assertEqual(place_label(str(route.get("destination") or "")), "Delhi")
+        self.assertTrue(str(route.get("depart") or "").endswith("-12-04"))
+
+        saved = {
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "selected_hint": "17:40",
+            "name": "Sudipta Saikia",
+            "email": "sudipta@example.com",
+            "dob": "29/07/1997",
+            "gender": "Male",
+            "phone": "8638586171",
+            "login_phone": "+918638586171",
+            "pincode": "785001",
+            "billing_address": "By lane 14",
+            "city": "Jorhat",
+            "billing_state": "Assam",
+            "kernel_logged_in": "ixigo",
+            "kernel_login_phone": "+918638586171",
+        }
+        self.assertEqual(ixigo_checkout_gaps(saved), [])
+        self.assertTrue(ixigo_session_for_number(saved, "8638586171"))
+        self.assertEqual(ixigo_checkout_step("Ixigo", saved), "pay")
+        self.assertEqual(ixigo_profile_reply(saved), "")
+        pay = "Amount To Be Paid ₹10,328 Pay via any UPI app Credit/Debit card"
+        self.assertTrue(_checkout_summary_open(pay, "pay"))
+
+        review = (
+            "Review & Traveller Details Contact Details Mobile Number 8638586171 Email "
+            "GST Details Billing Address Continue Total Amount ₹9,823 Fare Summary"
+        )
+        self.assertFalse(_checkout_summary_open(review, "review"))
+        self.assertTrue(ixigo_header_needs_login("Review & Traveller Details Log in/Sign up Continue"))
+
+        fresh = reset_lab_traveller(saved)
+        recovered = _recover_trip(
+            fresh,
+            [{"role": "user", "body": "8638586171", "created_at": "2020-01-01T00:00:00+00:00"}],
+            "Ixigo",
+        )
+        self.assertEqual(ixigo_checkout_step("Ixigo", recovered), "phone")
+        self.assertFalse(ixigo_session_for_number(recovered, "8876233052"))
+        logging_in = {
+            **recovered,
+            "login_phone": "+918876233052",
+            "phone": "8876233052",
+        }
+        self.assertEqual(ixigo_checkout_step("Ixigo", logging_in), "login")
+        asked = ixigo_profile_reply(
+            {**logging_in, "kernel_logged_in": "ixigo", "kernel_login_phone": "+918876233052"}
+        )
+        self.assertIn("full name", asked)
+        self.assertIn("email", asked)
+        filled = {
+            **logging_in,
+            "kernel_logged_in": "ixigo",
+            "kernel_login_phone": "+918876233052",
+            "name": "Sudipta Saikia",
+            "email": "new@example.com",
+            "dob": "29/07/1997",
+            "gender": "Male",
+            "pincode": "785001",
+            "billing_address": "By lane 14",
+            "city": "Jorhat",
+            "billing_state": "Assam",
+        }
+        self.assertEqual(ixigo_checkout_gaps(filled), [])
+        self.assertEqual(ixigo_checkout_step("Ixigo", filled), "pay")
+        self.assertTrue(_checkout_summary_open(pay, "pay"))
+        self.assertFalse(_checkout_summary_open(review, "pay"))
+
+    def test_ixigo_decline_login_stays_on_login(self) -> None:
+        from app.turn_loop import align_action
+
+        state = {
+            "seller": "ixigo",
+            "kernel_seller": "ixigo",
+            "kernel_auth_mode": "login",
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+        }
+        align_action("no need for login click continue", state)
+        self.assertEqual(state.get("kernel_auth_mode"), "login")
+
+    def test_lab_new_user_route_exists(self) -> None:
+        from app.lab import _LAB_HTML
+        from app.lab import router as lab_router
+
+        paths = {getattr(route, "path", "") for route in lab_router.routes}
+        self.assertIn("/lab/new-user", paths)
+        self.assertIn("New user", _LAB_HTML)
+        self.assertIn("/lab/new-user", _LAB_HTML)
+
+    def test_wrong_ixigo_itinerary_rebooks_the_asked_time(self) -> None:
+        import inspect
+
+        from app.page_agent import run_checkout_agent
+
+        src = inspect.getsource(run_checkout_agent)
+        self.assertIn("def _rebook_requested_time", src)
+        self.assertLess(src.index("rebook_hint"), src.index("return wrong"))
 
 
 if __name__ == "__main__":

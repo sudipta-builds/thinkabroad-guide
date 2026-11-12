@@ -57,6 +57,9 @@ def composing(phone: str):
 def send_typing(message_sid: str) -> bool:
     settings = get_settings()
     if settings.guide_local:
+        from app.lab import set_typing
+
+        set_typing(True)
         return True
     if settings.meta_wa_ready:
         from app.meta_wa import send_typing as meta_typing

@@ -27,6 +27,22 @@ Checks:
 
 Keep prod keys in `.env` as usual: `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `KERNEL_API_KEY`, `VAULT_SECRET_KEY`, `PROXY_*`, etc.
 
+## GAU → DEL guest path (manual lab script)
+
+Hard-refresh `/lab`, then send one line at a time:
+
+1. `ghy to delhi 4th dec` — Google fares + screenshot  
+2. A clock from the list (e.g. `10:45`) — Cleartrip / Ixigo / EaseMyTrip quotes  
+3. `ixigo` — guest vs login ask  
+4. `guest` — opens Ixigo and books that time  
+5. If Assured radios: reply with one of  
+   `Assured Free Cancellation` / `Assured Flex` / `I don't want free cancellation`  
+6. If billing ask: `address 12 Zoo Road city Guwahati 781001 Assam`  
+7. On Review Details Confirm/Edit: `confirm` or `edit`  
+8. Stop before payment — never reply with a Pay tap  
+
+Needs `KERNEL_API_KEY` (+ Gemini/DeepSeek as usual). Screenshots and later browse replies poll into the outbox.
+
 ## Before push
 
 1. Exercise the bug in `/lab` (e.g. `confirm` on the name modal).

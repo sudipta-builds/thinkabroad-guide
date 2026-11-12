@@ -24,6 +24,10 @@ router = APIRouter(tags=["lab"])
 _LOCK = threading.Lock()
 _SEQ = 0
 _OUTBOX: list[dict[str, Any]] = []
+_TYPING = False
+_TYPING_UNTIL = 0.0
+# Bumps once per process so a stale lab tab (after=N from before restart) resets.
+_BOOT = int(time.time())
 
 LAB_PHONE_DEFAULT = "919999000001"
 
@@ -46,29 +50,43 @@ _LAB_HTML = """<!DOCTYPE html>
   .bot { align-self:flex-start; background:var(--panel); border:1px solid #2a3a52; }
   .bubble img { display:block; max-width:100%; margin-top:8px; border-radius:8px; }
   .meta { color:var(--muted); font-size:0.75rem; margin-top:4px; }
+  #typing { align-self:flex-start; color:var(--muted); font-size:0.9rem; font-style:italic; min-height:1.2em; opacity:0; transition:opacity .15s; }
+  #typing.on { opacity:1; }
   form { display:flex; gap:8px; padding:12px 16px; border-top:1px solid #243044; background:var(--panel); }
   input { flex:1; padding:10px 12px; border-radius:8px; border:1px solid #334155; background:#0b1220; color:var(--text); }
   button { padding:10px 16px; border:0; border-radius:8px; background:var(--accent); color:#fff; font-weight:600; cursor:pointer; }
+  button.ghost { background:#243044; color:var(--text); }
   button:disabled { opacity:0.5; cursor:wait; }
 </style>
 </head>
 <body>
 <header>
   <strong>Guide lab</strong>
-  <span>Same code path as WhatsApp / prod · phone <code id="phone"></code> · poll outbox for browse replies</span>
+  <span>Same code path as WhatsApp / prod · phone <code id="phone"></code> · outbox only (no double paint)</span>
 </header>
 <div id="log"></div>
+<div id="typing">Guide is typing…</div>
 <form id="f">
   <input id="msg" autocomplete="off" placeholder="Type like WhatsApp: confirm, continue, 781001 Assam…" />
   <button type="submit" id="go">Send</button>
+  <button type="button" id="fresh" class="ghost">New user</button>
 </form>
 <script>
 const log = document.getElementById('log');
 const phoneEl = document.getElementById('phone');
+const typingEl = document.getElementById('typing');
 let after = 0;
+let boot = 0;
 let phone = '';
+const seen = new Set();
+let pollBusy = false;
 
-function addBubble(role, text, media, ts) {
+function addBubble(role, text, media, ts, id) {
+  if (id != null) {
+    const key = boot + ':' + id;
+    if (seen.has(key)) return;
+    seen.add(key);
+  }
   const d = document.createElement('div');
   d.className = 'bubble ' + (role === 'user' ? 'user' : 'bot');
   d.textContent = text || '';
@@ -87,13 +105,36 @@ function addBubble(role, text, media, ts) {
 }
 
 async function refreshOutbox() {
-  const r = await fetch('/lab/outbox?after=' + after);
-  const data = await r.json();
-  phone = data.phone || phone;
-  phoneEl.textContent = phone;
-  for (const item of (data.items || [])) {
-    after = Math.max(after, item.id || 0);
-    addBubble('bot', item.text, item.media_urls || [], item.ts);
+  if (pollBusy) return;
+  pollBusy = true;
+  try {
+    const r = await fetch('/lab/outbox?after=' + after);
+    const data = await r.json();
+    phone = data.phone || phone;
+    phoneEl.textContent = phone;
+    typingEl.classList.toggle('on', !!data.typing);
+    // Server restart (or after cursor past the outbox) — resync from the start.
+    const serverBoot = Number(data.boot || 0);
+    const maxId = Number(data.max_id || 0);
+    if ((serverBoot && boot && serverBoot !== boot) || (after > 0 && maxId < after)) {
+      after = 0;
+      seen.clear();
+      boot = serverBoot;
+      const r2 = await fetch('/lab/outbox?after=0');
+      const data2 = await r2.json();
+      for (const item of (data2.items || [])) {
+        after = Math.max(after, item.id || 0);
+        addBubble('bot', item.text, item.media_urls || [], item.ts, item.id);
+      }
+      return;
+    }
+    if (serverBoot) boot = serverBoot;
+    for (const item of (data.items || [])) {
+      after = Math.max(after, item.id || 0);
+      addBubble('bot', item.text, item.media_urls || [], item.ts, item.id);
+    }
+  } finally {
+    pollBusy = false;
   }
 }
 
@@ -106,6 +147,7 @@ document.getElementById('f').addEventListener('submit', async (e) => {
   addBubble('user', text);
   input.value = '';
   btn.disabled = true;
+  typingEl.classList.add('on');
   try {
     const r = await fetch('/lab/message', {
       method: 'POST',
@@ -113,10 +155,11 @@ document.getElementById('f').addEventListener('submit', async (e) => {
       body: JSON.stringify({ text }),
     });
     const data = await r.json();
-    if (data.reply && data.reply.text) {
-      addBubble('bot', data.reply.text, data.reply.media_urls || []);
+    if (!data.ok) {
+      addBubble('bot', 'Lab error: ' + (data.error || r.status));
     }
-    after = Math.max(after, data.outbox_id || 0);
+    // Prod paints only via WhatsApp send — never also paint data.reply here.
+    await refreshOutbox();
   } catch (err) {
     addBubble('bot', 'Lab request failed: ' + err);
   } finally {
@@ -125,8 +168,22 @@ document.getElementById('f').addEventListener('submit', async (e) => {
   }
 });
 
+document.getElementById('fresh').addEventListener('click', async () => {
+  const btn = document.getElementById('fresh');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/lab/new-user', { method: 'POST' });
+    const data = await r.json();
+    addBubble('bot', data.reply || data.error || 'Could not reset.');
+  } catch (err) {
+    addBubble('bot', 'New user reset failed: ' + err);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 refreshOutbox();
-setInterval(refreshOutbox, 1500);
+setInterval(refreshOutbox, 800);
 </script>
 </body>
 </html>
@@ -142,11 +199,28 @@ def lab_phone() -> str:
     return "".join(ch for ch in raw if ch.isdigit()) or LAB_PHONE_DEFAULT
 
 
+def set_typing(active: bool = True, hold_seconds: float = 25.0) -> None:
+    """Mirror Meta/Twilio typing bubble into the lab UI."""
+    global _TYPING, _TYPING_UNTIL
+    with _LOCK:
+        _TYPING = bool(active)
+        _TYPING_UNTIL = time.time() + hold_seconds if active else 0.0
+
+
+def typing_active() -> bool:
+    with _LOCK:
+        if _TYPING and time.time() <= _TYPING_UNTIL:
+            return True
+        return False
+
+
 def capture_outbound(to_phone: str, reply: Reply) -> bool:
     """Store what would have been sent on WhatsApp. Always succeeds in lab mode."""
-    global _SEQ
+    global _SEQ, _TYPING, _TYPING_UNTIL
     with _LOCK:
         _SEQ += 1
+        _TYPING = False
+        _TYPING_UNTIL = 0.0
         item = {
             "id": _SEQ,
             "ts": time.time(),
@@ -167,6 +241,11 @@ def outbox_since(after_id: int = 0) -> list[dict[str, Any]]:
         return [dict(item) for item in _OUTBOX if int(item.get("id") or 0) > after_id]
 
 
+def outbox_max_id() -> int:
+    with _LOCK:
+        return int(_SEQ)
+
+
 @router.get("/lab", response_class=HTMLResponse)
 def lab_page() -> HTMLResponse:
     if not lab_enabled():
@@ -182,12 +261,41 @@ def lab_outbox(after: int = 0) -> JSONResponse:
     if not lab_enabled():
         return JSONResponse({"ok": False, "error": "lab_off"}, status_code=404)
     items = outbox_since(after)
-    return JSONResponse({"ok": True, "phone": lab_phone(), "items": items})
+    return JSONResponse(
+        {
+            "ok": True,
+            "phone": lab_phone(),
+            "typing": typing_active(),
+            "boot": _BOOT,
+            "max_id": outbox_max_id(),
+            "items": items,
+        }
+    )
+
+
+@router.post("/lab/new-user")
+def lab_new_user() -> JSONResponse:
+    """Drop passenger, login, and billing on the lab phone. Keep the trip."""
+    if not lab_enabled():
+        return JSONResponse({"ok": False, "error": "lab_off"}, status_code=404)
+    from app.kernel_otp import release_saved_kernel
+    from app.travel_agent import _load, _save, reset_lab_traveller
+
+    phone = lab_phone()
+    state = _load(phone)
+    release_saved_kernel(str(state.get("kernel_session_id") or ""))
+    fresh = reset_lab_traveller(state)
+    _save(phone, fresh)
+    reply = (
+        "Cleared this lab profile. Passenger, login, and billing are gone. "
+        "The trip stays if you already picked one. Reply Ixigo to log in with a mobile and OTP. Nothing paid."
+    )
+    return JSONResponse({"ok": True, "phone": phone, "reply": reply})
 
 
 @router.post("/lab/message")
 async def lab_message(request: Request) -> JSONResponse:
-    """Same inbound path as WhatsApp webhook → agent.handle_message."""
+    """Same inbound path as Meta WhatsApp webhook → agent → send_whatsapp."""
     if not lab_enabled():
         return JSONResponse({"ok": False, "error": "lab_off"}, status_code=404)
     try:
@@ -199,12 +307,16 @@ async def lab_message(request: Request) -> JSONResponse:
     if not text:
         return JSONResponse({"ok": False, "error": "empty"}, status_code=400)
 
+    from app.reply import for_send
+    from app.twilio_wa import send_whatsapp
     from app.webhook import _build_reply
 
     message_sid = f"lab_{int(time.time() * 1000)}"
+    set_typing(True)
     reply = _build_reply(phone, text, message_sid)
-    # Sync bubble (browse may also push later via send_whatsapp → capture_outbound).
-    capture_outbound(phone, reply)
+    reply = for_send(reply, reacted=False)
+    if (reply.text or "").strip() or reply.media_urls:
+        send_whatsapp(phone, reply)
     with _LOCK:
         outbox_id = _SEQ
     return JSONResponse(

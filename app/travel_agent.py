@@ -3531,6 +3531,14 @@ def _checkout_summary_open(page: str, shown: str) -> bool:
     pay_words = bool(
         re.search(r"amount to be paid\s*₹\s*[0-9,]|pay via any upi|credit/debit card", page or "", re.I)
     )
+    # Review Details popup (Edit / Continue) is still the traveller check, not payment.
+    if (
+        re.search(r"\breview details\b", page or "", re.I)
+        and re.search(r"\bedit\b", page or "", re.I)
+        and re.search(r"\bcontinue\b", page or "", re.I)
+        and not pay_words
+    ):
+        return False
     # Contact, GST, and billing are the review form. A total beside them is not payment.
     if re.search(
         r"contact details|billing address|gst details|email address|mobile number|add traveller",
@@ -5541,7 +5549,7 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         )
         from app.page_agent import _on_addons_page as _addons_open
 
-        if (payable or state.get("direct_checkout")) and not _addons_open(text, shown):
+        if _checkout_summary_open(text, shown) and not _addons_open(text, shown):
             _send_checkout_ready(phone, state, text, secrets, shots)
             return
         spoken = first_note if re.search(r"payment handoff|left add-ons|nothing paid", first_note, re.I) else (

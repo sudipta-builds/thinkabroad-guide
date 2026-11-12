@@ -5944,6 +5944,13 @@ class DirectIxigoCheckoutTests(unittest.TestCase):
         )
         self.assertFalse(_checkout_summary_open(review_form, "review"))
         self.assertFalse(_checkout_summary_open(review_form, "pay"))
+        name_check = (
+            "Review Details Please ensure your name matches your govt ID "
+            "Billing Address Edit Continue Fare Summary Total Amount ₹9,823"
+        )
+        self.assertFalse(_checkout_summary_open(name_check, "pay"))
+        popup = "Review Details Edit Continue Fare Summary Total Amount ₹9,823"
+        self.assertFalse(_checkout_summary_open(popup, "pay"))
 
     def test_payment_sheet_recommends_the_flight_on_screen(self) -> None:
         from app.travel_agent import checkout_ready_lines

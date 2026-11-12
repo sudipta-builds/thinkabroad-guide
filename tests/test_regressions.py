@@ -5951,6 +5951,16 @@ class DirectIxigoCheckoutTests(unittest.TestCase):
         self.assertFalse(_checkout_summary_open(name_check, "pay"))
         popup = "Review Details Edit Continue Fare Summary Total Amount ₹9,823"
         self.assertFalse(_checkout_summary_open(popup, "pay"))
+        from app.page_agent import contact_report, ixigo_filled_review
+
+        self.assertTrue(ixigo_filled_review(popup))
+        self.assertFalse(
+            ixigo_filled_review("Amount To Be Paid ₹10,328 Pay via any UPI app Credit/Debit card")
+        )
+        self.assertNotEqual(
+            contact_report("email:ok | phone:ok", popup),
+            "I typed the contact details. Nothing paid.",
+        )
 
     def test_payment_sheet_recommends_the_flight_on_screen(self) -> None:
         from app.travel_agent import checkout_ready_lines

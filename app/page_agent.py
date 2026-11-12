@@ -953,6 +953,21 @@ def _ixigo_scroll_until_depart(page, hint: str, *, rounds: int = 16) -> bool:
     return False
 
 
+def ixigo_filled_review(text: str) -> bool:
+    """Review Details already has the traveller data and Continue is the next click.
+
+    That is not a finished step and not the payment page.
+    """
+    hay = text or ""
+    if ixigo_header_needs_login(hay):
+        return False
+    if re.search(r"please enter|is required|is invalid|log in\s*/\s*sign\s*up", hay, re.I):
+        return False
+    if not re.search(r"\bcontinue\b", hay, re.I):
+        return False
+    return bool(re.search(r"\breview details\b|billing address", hay, re.I))
+
+
 def ixigo_header_needs_login(text: str) -> bool:
     """True when the Ixigo header still says Log in/Sign up. Hey Ixigoer is already in."""
     hay = text or ""
@@ -5514,7 +5529,7 @@ def contact_report(notes: str, page: str) -> str:
             return "Contact is saved. The page is on Review traveller details. Nothing paid."
         if (re.search(r"\btap:1\b", blob) or continue_moved) and not still_review:
             return "I typed the contact details and pressed Continue. Nothing paid."
-        if not still_review:
+        if not still_review and not ixigo_filled_review(page or ""):
             return "I typed the contact details. Nothing paid."
         return "Contact is filled, but Continue did not leave Review Details. Nothing paid."
     return ""
@@ -6219,6 +6234,38 @@ def run_checkout_agent(
         page = _latest(page)
         text, url, stage, facts = _snapshot()
         log.append(f"{step}:stage:{stage}")
+        # Details already on Review Details: Continue, skip add-ons, stop on payment.
+        if seller == "ixigo" and ixigo_filled_review(text):
+            tries = sum(1 for line in log if line.startswith("filled_review_continue"))
+            if tries < 4:
+                moved = _safe_continue(page)
+                log.append(f"filled_review_continue:{int(bool(moved))}")
+                if moved:
+                    walked = _press_confirm_then_addons(page, log)
+                    if walked is not None:
+                        return walked
+                _poll_ready(page, {"addons", "pay", "review", "passenger", "error"}, budget_ms=5000)
+                try:
+                    now, _now_url = _read(page)
+                except Exception:
+                    now = ""
+                if payment_sheet_open(now, ""):
+                    text, url, stage, facts = _snapshot()
+                    return CheckoutOutcome(
+                        "pay",
+                        text,
+                        url,
+                        log,
+                        facts=facts,
+                        checks=checks,
+                        handoff=(
+                            f"Payment handoff. Total {facts.get('total') or '?'}. "
+                            f"Link: {url}. No payment clicked."
+                        ),
+                    )
+                if _on_addons_page(now, ""):
+                    _leave_addons(page, log, rounds=2)
+                continue
         # Logged-out header: OTP before any traveller or billing ask.
         if seller == "ixigo" and ixigo_header_needs_login(text):
             if sum(1 for line in log if line == "opened_header_login") < 2:
@@ -7612,6 +7659,13 @@ def run_checkout_agent(
                         log.append(after)
                     continue
                 if _retry_known_traveller(page, profile, log):
+                    continue
+                if (
+                    seller == "ixigo"
+                    and ixigo_filled_review(text)
+                    and sum(1 for line in log if line.startswith("filled_review_continue")) < 4
+                ):
+                    log.append("filled_review_not_a_stop")
                     continue
                 log.append("passenger_unfilled")
                 handoff = contact_report(" | ".join(notes), text) or (

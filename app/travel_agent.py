@@ -552,8 +552,30 @@ def handle_turn(
     if step:
         from app.kernel_otp import kernel_configured as _kernel_ready
 
-        _arm_ixigo_payment(state, text)
-        state["kernel_auth_mode"] = "login"
+        page_now = str(state.get("stuck_page") or "")
+        from app.page_agent import ixigo_header_needs_login as _header_login
+
+        keep_open_review = (
+            step == "pay"
+            and re.search(r"review details|billing address|contact details", page_now, re.I)
+            and not _header_login(page_now)
+        )
+        if keep_open_review:
+            state["seller"] = "ixigo"
+            state["preferred_seller"] = "ixigo"
+            state["kernel_seller"] = "ixigo"
+            state["kernel_auth_mode"] = "login"
+            state["kernel_logged_in"] = "ixigo"
+            state["direct_checkout"] = True
+            state.pop("require_otp", None)
+            state["chosen_tap"] = "Continue"
+            if not state.get("kernel_login_phone"):
+                saved_mobile = ixigo_saved_mobile(state)
+                if saved_mobile:
+                    state["kernel_login_phone"] = saved_mobile
+        else:
+            _arm_ixigo_payment(state, text)
+            state["kernel_auth_mode"] = "login"
         if step == "phone":
             state["kernel_awaiting_phone"] = True
             state.pop("ixigo_awaiting_profile", None)
@@ -592,6 +614,11 @@ def handle_turn(
             reply = (
                 "You're logged in on Ixigo. I'll open the form and send a screenshot naming "
                 "any missing or wrong detail. Nothing is charged."
+            )
+        elif keep_open_review:
+            reply = (
+                "Details are saved and Ixigo is already signed in. "
+                "I'll press Continue through to the payment page. Nothing is charged."
             )
         else:
             reply = direct_checkout_ack(state)
@@ -4160,7 +4187,8 @@ def ixigo_should_require_otp(state: dict[str, Any], text: str) -> bool:
     raw = (text or "").strip()
     page = str(state.get("stuck_page") or "")
     on_review = bool(re.search(r"review details|billing address|contact details", page, re.I))
-    if re.fullmatch(r"confirm|continue|go on|yes", raw, re.I) and on_review and not ixigo_header_needs_login(page):
+    # A filled review with no Log in/Sign up is already signed in. Do not start OTP.
+    if on_review and not ixigo_header_needs_login(page) and not indian_national(raw):
         return False
     sent = indian_national(raw)
     if not sent and not ixigo_header_needs_login(page):
@@ -4230,7 +4258,11 @@ def ixigo_checkout_step(text: str, state: dict[str, Any]) -> str:
         return ""
     if not (state.get("origin") and state.get("destination") and state.get("depart")):
         return ""
-    if not ixigo_signed_in(state):
+    page = str(state.get("stuck_page") or "")
+    from app.page_agent import ixigo_header_needs_login
+
+    open_review = bool(re.search(r"review details|billing address|contact details", page, re.I)) and not ixigo_header_needs_login(page)
+    if not ixigo_signed_in(state) and not open_review:
         return "phone" if not ixigo_saved_mobile(state) else "login"
     if ixigo_checkout_gaps(state):
         return "profile"

@@ -6252,6 +6252,24 @@ class DirectIxigoCheckoutTests(unittest.TestCase):
             "direct_checkout": True,
         }
         self.assertFalse(ixigo_should_require_otp(review, "confirm"))
+        self.assertFalse(ixigo_should_require_otp(review, "ixigo"))
+        from app.travel_agent import ixigo_checkout_step
+
+        known = {
+            **review,
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "name": "Sudipta Saikia",
+            "email": "a@b.co",
+            "dob": "29/07/1997",
+            "gender": "Male",
+            "pincode": "785001",
+            "billing_address": "By lane 14",
+            "city": "Jorhat",
+            "billing_state": "Assam",
+        }
+        self.assertEqual(ixigo_checkout_step("Ixigo", known), "pay")
         self.assertTrue(ixigo_should_require_otp(review, "8638586171"))
         self.assertTrue(
             ixigo_should_require_otp(

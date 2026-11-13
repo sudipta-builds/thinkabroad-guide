@@ -11,6 +11,8 @@ _PLACES: dict[str, tuple[str, str, bool]] = {
     "delhi": ("DEL", "Delhi", True),
     "new delhi": ("DEL", "Delhi", True),
     "del": ("DEL", "Delhi", True),
+    # "dec" in "to dec" is Delhi. "5th dec" stays a date — mentioned_places skips that span.
+    "dec": ("DEL", "Delhi", True),
     "mumbai": ("BOM", "Mumbai", True),
     "bombay": ("BOM", "Mumbai", True),
     "bom": ("BOM", "Mumbai", True),
@@ -105,14 +107,23 @@ def resolve_place(name: str) -> tuple[str, str, bool] | None:
     return _PLACES[match[0]] if match else None
 
 
+_DEC_AS_MONTH = re.compile(
+    r"\b\d{1,2}(?:st|nd|rd|th)?(?:\s+of)?\s+dec\b|\bdec(?:ember)?\s+\d{1,2}(?:st|nd|rd|th)?\b",
+    re.I,
+)
+
+
 def mentioned_places(text: str) -> list[str]:
     """City or airport names in left-to-right order, one hit per airport."""
     raw = text or ""
+    month_spans = [match.span() for match in _DEC_AS_MONTH.finditer(raw)]
     occupied: list[tuple[int, int]] = []
     found: list[tuple[int, str]] = []
     for name in sorted(_PLACES, key=len, reverse=True):
         for match in re.finditer(rf"\b{re.escape(name)}\b", raw, flags=re.I):
             span = match.span()
+            if name == "dec" and any(start <= span[0] and span[1] <= end for start, end in month_spans):
+                continue
             if any(span[0] < end and span[1] > start for start, end in occupied):
                 continue
             occupied.append(span)

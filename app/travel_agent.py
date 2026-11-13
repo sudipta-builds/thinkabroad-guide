@@ -922,6 +922,8 @@ def handle_turn(
         from app.kernel_otp import kernel_configured
 
         book_seller = _booking_seller_id(state, text)
+        if arm_ixigo_flight_selection(state, text):
+            book_seller = "ixigo"
         kernel_book = kernel_configured() and book_seller in {"ixigo", "cleartrip"}
         if not chromium_ready() and not kernel_book:
             reply = "Chromium isn't installed on the server yet, so I can't open the booking page."
@@ -2111,6 +2113,25 @@ def _commit_bookable_seller(state: dict[str, Any], seller_id: str) -> None:
     state.pop("book_quotes_busy", None)
 
 
+def arm_ixigo_flight_selection(state: dict[str, Any], text: str) -> bool:
+    """A departure time on an open Ixigo fare list selects that flight.
+
+    A complete saved profile then goes through to the payment page.
+    A missing field stays on Ixigo and is asked for. This is not a new site search.
+    """
+    hint = _flight_hint(text)
+    if str(state.get("seller") or "") != "ixigo" or not hint:
+        return False
+    state["selected_hint"] = hint
+    state["seller"] = "ixigo"
+    state.pop("awaiting_book_site", None)
+    if not ixigo_checkout_gaps(state):
+        state["direct_checkout"] = True
+        state["kernel_seller"] = "ixigo"
+        state["preferred_seller"] = "ixigo"
+    return True
+
+
 def _quote_time_after_search(text: str, state: dict[str, Any]) -> bool:
     """A clock after Google Flights should price Cleartrip, Ixigo, and EaseMyTrip."""
     from app.search import NOT_BOOKABLE, named_seller, seller_can_book
@@ -2123,6 +2144,9 @@ def _quote_time_after_search(text: str, state: dict[str, Any]) -> bool:
     if re.search(r"\bbook\b", text or "", re.I) and named == "ixigo":
         return False
     seller = str(state.get("seller") or "")
+    # Already on Ixigo or Cleartrip fares: the clock books that row.
+    if seller in {"ixigo", "cleartrip"}:
+        return False
     return bool(
         state.get("origin")
         and state.get("destination")
@@ -2140,6 +2164,8 @@ def _needs_book_site_choice(state: dict[str, Any], text: str = "") -> bool:
         return False
     # Live Ixigo/Cleartrip sheet (or Continue/Confirm on it) beats stale awaiting_book_site.
     if _checkout_owns_turn(state, text):
+        return False
+    if str(state.get("seller") or "") in {"ixigo", "cleartrip"}:
         return False
     if state.get("awaiting_book_site"):
         return True
@@ -5422,6 +5448,8 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
     state["kernel_awaiting_otp"] = False
     _keep_profile_from_disk(phone, state)
     state["seller"] = seller
+    if seller in {"ixigo", "cleartrip"}:
+        state.pop("awaiting_book_site", None)
     held_sid = str(result.get("session_id") or "")
     if held_sid:
         state["kernel_session_id"] = held_sid

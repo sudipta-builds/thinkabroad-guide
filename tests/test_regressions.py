@@ -5812,6 +5812,23 @@ class DirectIxigoCheckoutTests(unittest.TestCase):
             "depart": "2026-12-04",
         }
 
+    def test_dec_as_a_city_is_delhi_and_a_date_stays_december(self) -> None:
+        from app.intent import parse_updates
+        from app.search import mentioned_places, place_label, resolve_place
+
+        self.assertEqual(resolve_place("dec")[0], "DEL")
+        self.assertEqual(place_label("dec"), "Delhi")
+        updates = parse_updates("guwahati to dec on 4th dec")
+        self.assertEqual(place_label(str(updates.get("destination") or "")), "Delhi")
+        self.assertEqual(place_label(str(updates.get("origin") or "")), "Guwahati")
+        self.assertTrue(str(updates.get("depart") or "").endswith("-12-04"))
+        only_date = parse_updates("5th dec")
+        self.assertNotIn("destination", only_date)
+        self.assertNotIn("place", only_date)
+        self.assertTrue(str(only_date.get("depart") or "").endswith("-12-05"))
+        self.assertEqual(mentioned_places("5th dec"), [])
+        self.assertIn("dec", mentioned_places("guwahati to dec"))
+
     def test_book_phrase_parses_ghy_delhi_4_dec(self) -> None:
         from app.intent import parse_updates
 
@@ -6040,6 +6057,26 @@ class DirectIxigoCheckoutTests(unittest.TestCase):
         self.assertTrue(_quote_time_after_search("10:45", state))
         self.assertFalse(_quote_time_after_search("10:45 on ixigo", state))
         self.assertFalse(_quote_time_after_search("book 10:45 on ixigo", state))
+        on_ixigo = {**state, "seller": "ixigo"}
+        self.assertFalse(_quote_time_after_search("14:20", on_ixigo))
+        from app.travel_agent import arm_ixigo_flight_selection
+
+        picked = {
+            **self._ready(),
+            "seller": "ixigo",
+            "awaiting_book_site": True,
+            "pincode": "785001",
+            "billing_address": "Jorhat, Assam",
+            "city": "Jorhat",
+            "billing_state": "Assam",
+        }
+        self.assertTrue(arm_ixigo_flight_selection(picked, "14:20"))
+        self.assertEqual(picked.get("selected_hint"), "14:20")
+        self.assertTrue(picked.get("direct_checkout"))
+        self.assertFalse(picked.get("awaiting_book_site"))
+        incomplete = {**self._ready(), "seller": "ixigo"}
+        self.assertTrue(arm_ixigo_flight_selection(incomplete, "14:20"))
+        self.assertFalse(incomplete.get("direct_checkout"))
         self.assertFalse(_hold_live(state, "10:45", busy=True, changed=False))
         quoted = {**state, "book_quotes_busy": True, "selected_hint": "10:45"}
         self.assertTrue(_hold_live(quoted, "10:45", busy=True, changed=False))

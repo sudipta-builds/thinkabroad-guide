@@ -6773,6 +6773,37 @@ def _assistant_message(msg: dict[str, Any]) -> dict[str, Any]:
     return {"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls}
 
 
+def _fit_message_with_page_links(spoken: str, limit: int = 3900) -> str:
+    """Keep the screenshot's page URL when the WhatsApp body is shortened."""
+    lines = (spoken or "").split("\n")
+    links = [line.strip() for line in lines if line.strip().startswith(("http://", "https://"))]
+    body = "\n".join(line for line in lines if line.strip() not in links).rstrip()
+    if not links:
+        return body[:limit]
+    extra = "\n" + "\n".join(dict.fromkeys(links))
+    room = limit - len(extra)
+    if room < 40:
+        return extra.strip()[:limit]
+    return body[:room].rstrip() + extra
+
+
+def attach_shot_page_links(spoken: str, shot_paths: list[str | Path]) -> str:
+    """Add the URL captured with each screenshot. Other links stay stripped."""
+    from app.vision_agent import shot_page_url
+
+    links: list[str] = []
+    body = spoken or ""
+    for raw in shot_paths or []:
+        link = shot_page_url(raw)
+        if link and link not in links and link not in body:
+            links.append(link)
+    if not links:
+        return body
+    extra = "\n".join(links)
+    body = body.rstrip()
+    return f"{body}\n{extra}" if body else extra
+
+
 def _deliver(
     phone: str,
     text: str,
@@ -6785,26 +6816,32 @@ def _deliver(
 
     spoken = strip_leading_emoji(_clean(text, secrets))
     urls: list[str] = []
+    shot_files: list[Path] = []
     had_shot = False
     if session is not None and session.unsent:
         had_shot = True
         for path in session.unsent[-2:]:
+            shot_files.append(Path(path))
             public = public_url_for(path)
             if public:
                 urls.append(public)
         session.unsent.clear()
     for raw_path in shot_paths or []:
+        shot_files.append(Path(raw_path))
+        had_shot = True
         public = public_url_for(Path(raw_path))
         if public:
             urls.append(public)
-            had_shot = True
+    if had_shot:
+        spoken = attach_shot_page_links(spoken, shot_files)
     if had_shot and not urls:
         spoken += "\nI have the live screenshot, but this server has no public URL set, so WhatsApp cannot show the image."
         logger.warning("Screenshot saved but GUIDE_PUBLIC_URL is empty")
+    spoken = _fit_message_with_page_links(spoken)
     emoji = "✈️"
     sid = inbound_sid(phone)
     reacted = bool(sid) and send_reaction(phone, sid, emoji)
-    outbound = for_send(Reply.of(spoken[:4000], *urls[:3], emoji=emoji), reacted=reacted)
+    outbound = for_send(Reply.of(spoken, *urls[:3], emoji=emoji), reacted=reacted)
     send_whatsapp(phone, outbound)
     db.add_message(phone, "assistant", outbound.text[:2000])
 

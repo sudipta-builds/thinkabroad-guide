@@ -1023,6 +1023,32 @@ def ixigo_saved_traveller_sheet(text: str) -> bool:
     )
 
 
+def ixigo_billing_ready(text: str) -> bool:
+    """Filled Ixigo billing block: pin, address, city, state, and Continue.
+
+    A saved email is not an empty field on this sheet. A leftover
+    'please enter an email address' line must not hold Continue.
+    """
+    hay = text or ""
+    if not re.search(r"billing address", hay, re.I):
+        return False
+    if not re.search(r"\bcontinue\b", hay, re.I):
+        return False
+    if not re.search(r"\b\d{6}\b", hay):
+        return False
+    if not re.search(r"\bcity\b", hay, re.I) or not re.search(r"\bstate\b", hay, re.I):
+        return False
+    if re.search(
+        r"please enter a valid pin\s*code|please enter a valid pincode|pincode is invalid|"
+        r"please enter (?:your |a )?city|please (?:enter|select) (?:your |a )?state|"
+        r"please enter (?:your |a )?(?:billing )?address",
+        hay,
+        re.I,
+    ):
+        return False
+    return True
+
+
 def ixigo_filled_review(text: str) -> bool:
     """Review Details already has the traveller data and Continue is the next click.
 
@@ -1032,7 +1058,8 @@ def ixigo_filled_review(text: str) -> bool:
     if ixigo_header_needs_login(hay):
         return False
     if re.search(r"please enter|is required|is invalid|log in\s*/\s*sign\s*up", hay, re.I):
-        return False
+        if not ixigo_billing_ready(hay):
+            return False
     if not re.search(r"\bcontinue\b", hay, re.I):
         return False
     if re.search(r"contact details|gst details", hay, re.I) and re.search(r"fare summary", hay, re.I):
@@ -3280,7 +3307,9 @@ def named_form_issues(hay: str) -> tuple[list[str], list[str]]:
     if re.search(r"please enter a valid email|email is invalid", text, re.I):
         add(wrong, "email")
     elif re.search(r"please enter an email address|contact email is empty", text, re.I):
-        add(missing, "email")
+        # Filled billing (pin, city, state, Continue) is not an empty email box.
+        if not ixigo_billing_ready(text):
+            add(missing, "email")
     if re.search(r"please select your title", text, re.I):
         add(missing, "title")
     if re.search(
@@ -3326,8 +3355,11 @@ def _review_continue_blocker(page) -> str:
             "Reply with the passenger name or the missing fields and I'll fill them on this page. "
             "Nothing paid."
         )
-    if _email_input_empty(page) or re.search(
-        r"please enter an email address|please enter (?:a )?valid email", hay, re.I
+    if not ixigo_billing_ready(hay) and (
+        _email_input_empty(page)
+        or re.search(
+            r"please enter an email address|please enter (?:a )?valid email", hay, re.I
+        )
     ):
         return (
             "Contact email is empty — Please enter an email address. "
@@ -5520,7 +5552,10 @@ def contact_report(notes: str, page: str) -> str:
         and re.search(r"\bcontinue\b", page or "", re.I)
     )
     # Empty-email validation on the contact/review sheet wins over a stale email:ok log.
-    if please_email and (still_review or not re.search(r"\bemail:ok\b", blob)):
+    # A filled billing sheet has no empty email box — Continue, do not ask again.
+    if please_email and not ixigo_billing_ready(page or "") and (
+        still_review or not re.search(r"\bemail:ok\b", blob)
+    ):
         return (
             "Contact email is empty — Please enter an email address. "
             "Reply continue and I'll type the saved email again, then Continue. Nothing paid."

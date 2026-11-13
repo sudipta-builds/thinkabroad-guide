@@ -287,6 +287,27 @@ def capture_page_shot(page) -> str:
         return ""
 
 
+def shot_page_url(path: str | Path) -> str:
+    """The page that was open when this traveller screenshot was taken."""
+    try:
+        url = Path(str(path) + ".url").read_text(encoding="utf-8").strip().split()[0]
+    except Exception:
+        return ""
+    if url.startswith(("http://", "https://")):
+        return url[:2000]
+    return ""
+
+
+def _remember_shot_url(path: Path, url: str) -> None:
+    cleaned = (url or "").strip()
+    if not cleaned.startswith(("http://", "https://")):
+        return
+    try:
+        Path(str(path) + ".url").write_text(cleaned, encoding="utf-8")
+    except Exception:
+        pass
+
+
 def capture_user_shot(page, *, dest: str | Path = "", tag: str = "user") -> str:
     """Clean traveller-facing viewport shot — no debug overlays, no text selection.
 
@@ -320,12 +341,18 @@ def capture_user_shot(page, *, dest: str | Path = "", tag: str = "user") -> str:
             "quality": 92,
         }
         try:
+            page_url = str(page.url or "").strip()
+        except Exception:
+            page_url = ""
+        try:
             page.screenshot(**kwargs, animations="disabled", caret="hide")
         except TypeError:
             page.screenshot(**kwargs)
         if path.is_file() and path.stat().st_size > 200:
+            _remember_shot_url(path, page_url)
             return str(path)
         path.unlink(missing_ok=True)
+        Path(str(path) + ".url").unlink(missing_ok=True)
         return ""
     except Exception as exc:
         logger.info("user screenshot skipped: %s", type(exc).__name__)

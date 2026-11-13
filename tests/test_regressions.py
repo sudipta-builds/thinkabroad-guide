@@ -577,6 +577,44 @@ class DateAndMemory(unittest.TestCase):
         self.assertNotIn("http", _clean(dumped, []))
         self.assertNotIn("also open", _clean(dumped, []).lower())
 
+    def test_screenshot_message_includes_the_page_it_shows(self) -> None:
+        from app.travel_agent import _clean, _fit_message_with_page_links, attach_shot_page_links
+        from app.vision_agent import capture_user_shot, shot_page_url
+
+        self.assertNotIn("http", _clean("You can also open https://www.ixigo.com/flight/booking/old", []))
+
+        class _Page:
+            url = "https://www.ixigo.com/search/result/flight?from=GAU&to=DEL&date=10122026"
+
+            def evaluate(self, *_a, **_k):
+                return None
+
+            def wait_for_timeout(self, _n):
+                return None
+
+            def screenshot(self, **kw):
+                Path(kw["path"]).write_bytes(b"x" * 300)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "fares.jpg"
+            path = capture_user_shot(_Page(), dest=dest, tag="fares")
+            self.assertEqual(shot_page_url(path), _Page.url)
+            spoken = attach_shot_page_links(
+                "Ixigo sent a login code to your mobile. The screenshot is that screen. Nothing paid.",
+                [path],
+            )
+            self.assertTrue(spoken.endswith(_Page.url))
+            self.assertNotIn("booking/old", spoken)
+            blank = Path(tmp) / "blank.jpg"
+            blank.write_bytes(b"x" * 300)
+            Path(str(blank) + ".url").write_text("about:blank", encoding="utf-8")
+            self.assertEqual(shot_page_url(blank), "")
+            self.assertNotIn("about:blank", attach_shot_page_links("The screenshot is this page.", [blank]))
+            long_body = "Review. " * 900
+            fitted = _fit_message_with_page_links(long_body + "\n" + _Page.url)
+            self.assertLessEqual(len(fitted), 3900)
+            self.assertTrue(fitted.endswith(_Page.url))
+
     def test_form_is_ready_only_when_title_and_email_stick(self) -> None:
         from app.page_agent import _passenger_missing, _passenger_ready
 
@@ -6080,6 +6118,17 @@ class DirectIxigoCheckoutTests(unittest.TestCase):
         self.assertFalse(
             ixigo_filled_review("Amount To Be Paid ₹10,328 Pay via any UPI app Credit/Debit card")
         )
+        filled_billing = (
+            "Review & Traveller Details Hey ixigoer Fare Summary Total Amount ₹10,063 "
+            "Billing Address Pincode 785001 Address Ixigo, Delhi City Jorhat State Assam "
+            "Please enter an email address Continue"
+        )
+        from app.page_agent import ixigo_billing_ready
+        from app.travel_agent import field_correction_line
+
+        self.assertTrue(ixigo_billing_ready(filled_billing))
+        self.assertTrue(ixigo_filled_review(filled_billing))
+        self.assertEqual(field_correction_line({"email": "sudipta@example.com"}, filled_billing), "")
         self.assertNotEqual(
             contact_report("email:ok | phone:ok", popup),
             "I typed the contact details. Nothing paid.",

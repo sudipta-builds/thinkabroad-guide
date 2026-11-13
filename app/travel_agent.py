@@ -730,6 +730,8 @@ def handle_turn(
             )
         db.add_message(phone, "assistant", reply)
         return Reply.of(reply, emoji="✈️")
+    if wants_payment_page(text) and state.get("origin") and state.get("destination"):
+        return _begin_payment_page(phone, text, state)
     if _hold_live(state, text, busy=busy, changed=changed):
         reply = _live_hold_reply(state, text)
         db.add_message(phone, "assistant", reply)
@@ -759,6 +761,12 @@ def handle_turn(
         if tap:
             arm_pending_step(state, str(state.get("stuck_page") or ""), str(turn.get("kind") or "other"), tap=tap)
         spoken = str(plan.get("reply") or format_turn_reply(turn))
+        from app.page_agent import payment_sheet_open
+
+        if claims_payment_page(spoken) and not payment_sheet_open(
+            str(state.get("stuck_page") or ""), str(state.get("stuck_kind") or "")
+        ):
+            return _begin_payment_page(phone, text, state)
         state["last_stuck"] = spoken
         _save(phone, state)
         db.add_message(phone, "assistant", spoken)
@@ -2558,8 +2566,36 @@ def _defer_live_browse(state: dict[str, Any]) -> bool:
     return _busy(state) and _LOCK.locked()
 
 
+def wants_payment_page(text: str) -> bool:
+    """The traveller wants the real pay sheet, or is saying this page is not it."""
+    raw = (text or "").strip()
+    return bool(
+        re.search(
+            r"\bpaym\w{0,6}\s+page\b|"
+            r"\bnot (?:on|in) (?:the )?payment\b|"
+            r"\b(?:show|open|send) (?:me )?(?:the )?payment page\b|"
+            r"\b(?:take me to|go to) (?:the )?payment\b",
+            raw,
+            re.I,
+        )
+    )
+
+
+def claims_payment_page(spoken: str) -> bool:
+    """A sentence that says the pay sheet is already open."""
+    return bool(
+        re.search(
+            r"at the payment page|on the payment page|payment page for\s*₹|we are at the payment",
+            spoken or "",
+            re.I,
+        )
+    )
+
+
 def _hold_live(state: dict[str, Any], text: str, *, busy: bool, changed: bool) -> bool:
     """A running search stays up. A new route, or a request for the Ixigo form, replaces it."""
+    if wants_payment_page(text):
+        return False
     if _asks_for_filled_form(text) or named_seller_from(text) == "ixigo":
         return False
     if state.get("book_quotes_busy") and _flight_hint(text):
@@ -3393,6 +3429,54 @@ def wants_direct_ixigo_checkout(text: str, state: dict[str, Any]) -> bool:
     if until and until != str(route.get("depart") or ""):
         return False
     return not passenger_gaps(state)
+
+
+def _begin_payment_page(phone: str, text: str, state: dict[str, Any]) -> Reply:
+    """Open the real Ixigo pay sheet and send that screenshot. Do not claim it is already open."""
+    from app.kernel_otp import kernel_configured
+    from app.page_agent import ixigo_header_needs_login
+
+    page = str(state.get("stuck_page") or "")
+    hint = str(state.get("selected_hint") or _flight_hint(text) or "").strip()
+    which = f" for the {hint}" if hint else ""
+    state["seller"] = "ixigo"
+    state["preferred_seller"] = "ixigo"
+    state["kernel_seller"] = "ixigo"
+    state["direct_checkout"] = True
+    state["chosen_tap"] = "Continue"
+    state.pop("book_quotes_busy", None)
+    state.pop("awaiting_book_site", None)
+    state.pop("awaiting_ixigo_time", None)
+    if re.search(r"review details|billing address|contact details", page, re.I) and not ixigo_header_needs_login(page):
+        state["kernel_logged_in"] = state.get("kernel_logged_in") or "ixigo"
+        state.pop("require_otp", None)
+    if _busy(state) or _LOCK.locked():
+        state["pending_tap"] = "Continue"
+        state["pending_text"] = (text or "")[:200]
+        _save(phone, state)
+        reply = (
+            f"Still opening the payment page{which}. "
+            "I'll send that screenshot when it loads. Nothing paid."
+        )
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply, emoji="✈️")
+    if not kernel_configured():
+        state.pop("busy_at", None)
+        _save(phone, state)
+        reply = "Ixigo checkout needs the browser, and it isn't available right now. Nothing paid."
+        db.add_message(phone, "assistant", reply)
+        return Reply.of(reply, emoji="⚠️")
+    state["busy_at"] = f"{time.time():.3f}"
+    _save(phone, state)
+    threading.Thread(
+        target=_run_browse,
+        args=(phone, text, state.get("busy_at"), "book"),
+        name="guide-browse",
+        daemon=True,
+    ).start()
+    reply = f"Opening the payment page{which} on Ixigo. I'll send the screenshot. Nothing paid."
+    db.add_message(phone, "assistant", reply)
+    return Reply.of(reply, emoji="✈️")
 
 
 def direct_checkout_ack(state: dict[str, Any]) -> str:

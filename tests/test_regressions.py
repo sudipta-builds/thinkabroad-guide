@@ -6235,6 +6235,16 @@ class DirectIxigoCheckoutTests(unittest.TestCase):
         self.assertTrue(arm_ixigo_flight_selection(incomplete, "14:20"))
         self.assertFalse(incomplete.get("direct_checkout"))
         self.assertFalse(_hold_live(state, "10:45", busy=True, changed=False))
+        from app.travel_agent import claims_payment_page, wants_payment_page
+
+        self.assertTrue(wants_payment_page("payment page"))
+        self.assertTrue(wants_payment_page("paymnet page"))
+        self.assertTrue(wants_payment_page("we are not in the payment page"))
+        self.assertFalse(wants_payment_page("8:15"))
+        self.assertFalse(_hold_live(state, "payment page", busy=True, changed=False))
+        self.assertFalse(_hold_live(state, "we are not in the payment page", busy=True, changed=False))
+        self.assertTrue(claims_payment_page("We are at the payment page for ₹10,063. Nothing paid."))
+        self.assertFalse(claims_payment_page("Opening the payment page for the 8:15. I'll send the screenshot."))
         quoted = {**state, "book_quotes_busy": True, "selected_hint": "10:45"}
         self.assertTrue(_hold_live(quoted, "10:45", busy=True, changed=False))
         self.assertIn("Cleartrip, Ixigo, and EaseMyTrip", _live_hold_reply(quoted, "10:45"))

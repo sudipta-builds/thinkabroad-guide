@@ -144,6 +144,16 @@ def _results_url(url: str) -> bool:
     return bool(re.search(r"flightlist|flight-select|search/result/flight|/flights/results", url or "", re.I))
 
 
+def _clocks_before_marker(text: str, pattern: str, window: int = 240) -> list[str]:
+    """Clocks in the short block above an airport label, in reading order."""
+    cleaned = _without_time_ranges(text or "")
+    marker = re.search(pattern, cleaned, re.I)
+    if not marker:
+        return []
+    chunk = cleaned[max(0, marker.start() - window):marker.start()]
+    return re.findall(r"\b(\d{1,2}:\d{2})\b", chunk)
+
+
 def extract_trip_facts(text: str, url: str = "") -> dict[str, str]:
     """Pull flight number, clocks, route codes, and total from a booking page."""
     hay = f"{text or ''}\n{url or ''}"
@@ -153,12 +163,28 @@ def extract_trip_facts(text: str, url: str = "") -> dict[str, str]:
         flight = re.sub(r"[\s-]+", "", m.group(1).upper())
     depart_time = ""
     arrive_time = ""
-    dm = re.search(r"(\d{1,2}:\d{2})\s*(?:\n|\s)+(?:GAU\b|Guwahati)", text or "", re.I)
-    if dm:
-        depart_time = dm.group(1)
-    am = re.search(r"(\d{1,2}:\d{2})\s*(?:\n|\s)+(?:DEL\b|New Delhi)", text or "", re.I)
-    if am:
-        arrive_time = am.group(1)
+    # Ixigo lays the two clocks on one row, then the airports on the next:
+    # "18:20  2h 45m  21:05" / "GAU - Guwahati". The arrival is the clock
+    # sitting on GAU. The departure is the earlier clock in that block.
+    origin_clocks = _clocks_before_marker(text or "", r"\bGAU\b\s*[-–]\s*Guwahati")
+    if not origin_clocks:
+        origin_clocks = _clocks_before_marker(text or "", r"\bGAU\b\s*[-–]")
+    if origin_clocks:
+        depart_time = origin_clocks[0]
+    dest_clocks = _clocks_before_marker(text or "", r"\bDEL\b\s*[-–]\s*(?:New Delhi|Delhi)")
+    if not dest_clocks:
+        dest_clocks = _clocks_before_marker(text or "", r"\bDEL\b\s*[-–]")
+    if dest_clocks:
+        later = [clock for clock in dest_clocks if clock != depart_time]
+        arrive_time = (later or dest_clocks)[-1]
+    if not depart_time:
+        dm = re.search(r"(\d{1,2}:\d{2})\s*(?:\n|\s)+(?:GAU\b|Guwahati)", text or "", re.I)
+        if dm:
+            depart_time = dm.group(1)
+    if not arrive_time:
+        am = re.search(r"(\d{1,2}:\d{2})\s*(?:\n|\s)+(?:DEL\b|New Delhi)", text or "", re.I)
+        if am:
+            arrive_time = am.group(1)
     if not depart_time:
         times = re.findall(r"\b\d{1,2}:\d{2}\b", text or "")
         if times:

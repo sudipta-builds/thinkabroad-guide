@@ -4734,6 +4734,33 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertFalse(bad)
         self.assertTrue(problems)
 
+    def test_ixigo_review_row_uses_departure_not_the_arrival_beside_gau(self) -> None:
+        """18:20 and 21:05 share a row; GAU is on the next line. 21:05 is the arrival."""
+        text = (
+            "Flight Selection Review & Traveller Details Add-ons Payment Hey ixigoer "
+            "Guwahati to New Delhi Thu, 10 Dec Non-stop 2h 45m Economy SAVER "
+            "IndiGo | 6E 6133 100% On-time "
+            "Thu, 10 Dec 18:20 2h 45m Thu, 10 Dec 21:05 "
+            "GAU - Guwahati Lokpriya Gopinath Bordoloi International Airport Terminal 2 "
+            "DEL - New Delhi Indira Gandhi International Airport Terminal 1 "
+            "Refund on Cancellation GAU - DEL Now 10:52 07 Dec 04:50 10 Dec 01:50 "
+            "Departure 10 Dec, 04:50 Add Free Cancellation to your trip "
+            "Fare Summary Total Amount ₹9,813 Continue"
+        )
+        facts = extract_trip_facts(text, "https://www.ixigo.com/flight/booking/1")
+        self.assertEqual(facts["depart_time"], "18:20")
+        self.assertEqual(facts["arrive_time"], "21:05")
+        self.assertEqual(facts["flight"], "6E6133")
+        ok, problems = verify_trip_facts(
+            facts, expect_hint="18:20", expect_origin="GAU", expect_dest="DEL"
+        )
+        self.assertTrue(ok, problems)
+        bad, problems = verify_trip_facts(
+            facts, expect_hint="09:10", expect_origin="GAU", expect_dest="DEL"
+        )
+        self.assertFalse(bad)
+        self.assertTrue(any("depart=" in item for item in problems))
+
     def test_review_continues_and_pay_is_done_only(self) -> None:
         self.assertEqual(deterministic_action("review", hint="1:15", recovers=0)["action"], "review_continue")
         self.assertEqual(deterministic_action("addons", hint="10:45", recovers=0)["action"], "click")

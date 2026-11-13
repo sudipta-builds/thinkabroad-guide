@@ -952,6 +952,9 @@ class TypingAndSpeed(unittest.TestCase):
         self.assertIn("q=", day)
         self.assertIn("Guwahati", day)
         self.assertIn("Delhi", day)
+        hands = Path("app/browser_hands.py").read_text(encoding="utf-8")
+        self.assertIn("max(goto_timeout, 35000)", hands)
+        self.assertIn("accept all", hands)
         self.assertIn("December", day)
         self.assertIn("2026", day)
         self.assertNotIn("tfs=", day)
@@ -5842,6 +5845,11 @@ class DirectIxigoCheckoutTests(unittest.TestCase):
             "Send a time",
             ixigo_time_question("book a flight from ghy to delhi 4th dec in ixigo", self._ready()),
         )
+        dated = {**self._ready(), "selected_hint": "4th dec"}
+        not_a_clock = ixigo_time_question("book a flight from ghy to delhi 4th dec in ixigo", dated)
+        self.assertNotIn("Book the 4th", not_a_clock)
+        self.assertIn("14:20", not_a_clock)
+        self.assertNotIn("selected_hint", dated)
 
     def test_book_phrase_parses_ghy_delhi_4_dec(self) -> None:
         from app.intent import parse_updates

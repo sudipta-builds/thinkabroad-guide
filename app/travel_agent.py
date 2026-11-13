@@ -563,7 +563,7 @@ def handle_turn(
         if not hinted and re.fullmatch(
             r"same|that(?: one)?|yes|yep|yeah|ok|okay", (text or "").strip(), re.I
         ):
-            hinted = str(state.get("selected_hint") or "")
+            hinted = _flight_hint(str(state.get("selected_hint") or ""))
         if hinted:
             state.pop("awaiting_ixigo_time", None)
             state["selected_hint"] = hinted
@@ -573,6 +573,26 @@ def handle_turn(
             if not ixigo_checkout_gaps(state):
                 state["direct_checkout"] = True
             _save(phone, state)
+        else:
+            from app.intent import explicit_date
+
+            state["seller"] = "ixigo"
+            state["preferred_seller"] = "ixigo"
+            state["kernel_seller"] = "ixigo"
+            state.pop("busy_at", None)
+            when = explicit_date(text or "")
+            if when:
+                reply = (
+                    f"{_spoken_date_short(when)} is the travel date. "
+                    "Send the departure time, like 14:20, and I'll book that flight on Ixigo. Nothing paid."
+                )
+            else:
+                reply = (
+                    "Send the departure time, like 14:20, and I'll book that flight on Ixigo. Nothing paid."
+                )
+            _save(phone, state)
+            db.add_message(phone, "assistant", reply)
+            return Reply.of(reply, emoji="✈️")
     step = ixigo_checkout_step(text, state)
     if step:
         from app.kernel_otp import kernel_configured as _kernel_ready
@@ -1834,7 +1854,7 @@ def resolve_intent(text: str, state: dict[str, Any], prior: list[dict[str, Any]]
             "I'm on the open booking page — say what you want: click a saved name, "
             "delete a profile, continue, or skip. Nothing paid."
         )
-    hint = str(data.get("flight_hint") or "").strip()
+    hint = _flight_hint(str(data.get("flight_hint") or ""))
     if hint and kind != "details":
         state["selected_hint"] = hint[:40]
     if wanted and _mid_booking(state) and kind == "book":
@@ -3847,10 +3867,18 @@ def _publish_fares(
         if page_blocked(result) or not (options or prices):
             trip = _trip_line(saved) or "that trip"
             label = seller.get("label") or _seller_label(seller["id"])
-            next_hint = "Say another day, or name Cleartrip." if seller["id"] in NOT_BOOKABLE else "Say another day, or name a different site."
+            next_hint = "Say another day, or name Ixigo." if seller["id"] in NOT_BOOKABLE else "Say another day, or name a different site."
+            thin = len(re.sub(r"\s+", " ", result or "")) < 500 and not page_blocked(result)
+            if thin:
+                spoken_miss = (
+                    f"{label} opened {trip}, but the fare list had not finished painting. "
+                    f"The screenshot is that page. {next_hint}"
+                )
+            else:
+                spoken_miss = f"{label} didn't paint a fare for {trip}. The screenshot is the page. {next_hint}"
             _deliver(
                 phone,
-                f"{label} didn't paint a fare for {trip}. The screenshot is the page. {next_hint}",
+                spoken_miss,
                 session,
                 secrets,
             )
@@ -4328,7 +4356,9 @@ def ixigo_time_question(text: str, state: dict[str, Any]) -> str:
         return ""
     if not (state.get("origin") and state.get("destination") and state.get("depart")):
         return ""
-    hint = str(state.get("selected_hint") or "").strip()
+    hint = _flight_hint(str(state.get("selected_hint") or ""))
+    if str(state.get("selected_hint") or "").strip() and not hint:
+        state.pop("selected_hint", None)
     if hint:
         clock = _spoken_clock(hint) or hint
         return (

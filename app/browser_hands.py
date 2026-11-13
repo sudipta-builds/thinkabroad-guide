@@ -428,8 +428,10 @@ class BrowserSession:
         if not allowed:
             return "That address is not a public web page, so it was not opened."
         assert self.page is not None
+        google_flights = "google.com/travel/flights" in allowed
+        open_timeout = max(goto_timeout, 35000) if google_flights else goto_timeout
         try:
-            self.page.goto(allowed, wait_until="domcontentloaded", timeout=goto_timeout)
+            self.page.goto(allowed, wait_until="domcontentloaded", timeout=open_timeout)
         except Exception as exc:
             timed_out = "Timeout" in type(exc).__name__
             proxy_down = self.use_proxy and re.search(r"PROXY|TUNNEL|CONNECTION_RESET|CONNECTION_CLOSED", str(exc), re.I)
@@ -448,13 +450,14 @@ class BrowserSession:
             )
         )
         if flight_host:
+            fare_wait = max(airline_wait, 22000) if google_flights else airline_wait
             try:
                 self.page.wait_for_selector(
-                    "text=/SpiceJet|IndiGo|Air India|Akasa Air|No flights|couldn.?t find|sold out|₹|Rs\\.?\\s*\\d/i",
-                    timeout=airline_wait,
+                    "text=/SpiceJet|IndiGo|Air India|Akasa Air|No flights|couldn.?t find|sold out|₹|Rs\\.?\\s*\\d|Where from/i",
+                    timeout=fare_wait,
                 )
             except Exception:
-                self.page.wait_for_timeout(2000)
+                self.page.wait_for_timeout(3000 if google_flights else 2000)
             # Cleartrip paints chrome first; Book buttons often land ~30–45s later.
             if "cleartrip.com" in allowed:
                 try:
@@ -470,7 +473,17 @@ class BrowserSession:
                 self.page.wait_for_selector("text=/₹|Rs\\.?\\s*\\d|INR\\s*\\d|\\$\\s*\\d/", timeout=price_wait)
             except Exception:
                 self.page.wait_for_timeout(1200)
-        return self._observe(shoot=True)
+        observed = self._observe(shoot=not google_flights)
+        if google_flights and not prices_in(observed):
+            try:
+                self.page.wait_for_timeout(5000)
+            except Exception:
+                pass
+            self._dismiss()
+            observed = self._observe(shoot=True)
+        elif google_flights:
+            observed = self._observe(shoot=True)
+        return observed
 
     def fill_google_route(self, origin: str, destination: str, depart: str) -> str:
         """Type the route when Google left the search form empty."""
@@ -874,7 +887,10 @@ class BrowserSession:
         try:
             self.page.evaluate(
                 """() => {
-                    const labels = new Set(['accept', 'i agree', 'got it', 'ok', 'close']);
+                    const labels = new Set([
+                      'accept', 'accept all', 'i agree', 'i accept', 'agree',
+                      'reject all', 'got it', 'ok', 'close',
+                    ]);
                     for (const button of document.querySelectorAll('button')) {
                         const text = (button.innerText || '').trim().toLowerCase();
                         if (labels.has(text)) button.click();

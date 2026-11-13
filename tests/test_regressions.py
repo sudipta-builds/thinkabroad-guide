@@ -4772,6 +4772,19 @@ class SellerChoiceAndProxy(unittest.TestCase):
         self.assertIn("incorrect", otp_failure_detail(boxes_open=True).lower())
         self.assertIn("new code", otp_failure_detail(boxes_open=True).lower())
         self.assertIn("Log in", otp_failure_detail(boxes_open=False))
+        from app.kernel_otp import _ixigo_otp_finished_on_fares
+
+        self.assertTrue(
+            _ixigo_otp_finished_on_fares(
+                "Guwahati Delhi 18:20 Book 17:40 Book IndiGo Fare"
+            )
+        )
+        self.assertFalse(
+            _ixigo_otp_finished_on_fares(
+                "Enter the OTP sent to your mobile Verify",
+                "https://www.ixigo.com/?loginVisible=true",
+            )
+        )
         self.assertIn("checking", otp_failure_detail(boxes_open=False, verifying=True))
         self.assertTrue(keep_kernel_otp_session("still_otp"))
         waiting_live = {"kernel_awaiting_otp": True, "kernel_session_id": "sess", "kernel_seller": "ixigo"}

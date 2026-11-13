@@ -158,6 +158,19 @@ def viewport_click(metrics: dict[str, float], box: dict[str, Any]) -> tuple[int,
     return (int(float(box["x"])), int(float(box["y"])))
 
 
+def _ixigo_otp_finished_on_fares(text: str, url: str = "") -> bool:
+    """The code drawer closed onto the fare list. That is a finished login, not a new code."""
+    if re.search(r"loginVisible=true", url or "", re.I):
+        return False
+    if re.search(
+        r"enter the otp|enter otp|verify your mobile|otp sent|log in to ixigo|enter mobile number",
+        text or "",
+        re.I,
+    ):
+        return False
+    return bool(re.search(r"\bBook\b", text or "") and re.search(r"\b\d{1,2}:\d{2}\b", text or ""))
+
+
 def otp_failure_detail(*, boxes_open: bool, verifying: bool = False) -> str:
     if boxes_open:
         return (
@@ -1315,7 +1328,9 @@ def _apply_otp(client, session_id: str, page, seller: str, code: str) -> dict[st
             still = False
             empty_rounds = 0
             continue
-        if _logged_in(page, seller):
+        if _logged_in(page, seller) or (
+            seller == "ixigo" and _ixigo_otp_finished_on_fares(text, _url)
+        ):
             logged = True
             verifying = False
             break
@@ -1348,8 +1363,9 @@ def _apply_otp(client, session_id: str, page, seller: str, code: str) -> dict[st
             continue
         still = False
         if verifying:
+            # The account name replaces Log in a moment after the spinner. Keep waiting.
             verifying = False
-            break
+            continue
     # Stay on the open flight. A hop to the Ixigo homepage drops the chosen fare
     # and leaves WhatsApp silent until that navigation finishes.
     shot = _shot(page, seller, session_id, "otp-after")

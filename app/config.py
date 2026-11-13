@@ -43,7 +43,7 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("GEMINI_API_KEY", "Gemini_API_KEY"),
     )
-    gemini_model: str = "gemini-flash-latest"
+    gemini_model: str = "gemini-pro-latest"
     # Vision on every booking step when Gemini is set. GUIDE_VISION=0 to disable.
     guide_vision: bool = Field(default=True, validation_alias=AliasChoices("GUIDE_VISION"))
     # LLM/vision checkout brain for form/unknown replies. GUIDE_CHECKOUT_BRAIN=0 to force rules only.

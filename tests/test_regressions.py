@@ -954,17 +954,18 @@ class TypingAndSpeed(unittest.TestCase):
         self.assertEqual(payload["messageId"], "SMabc123")
         self.assertLessEqual(TYPING_REFRESH_SECONDS, 25)
 
-    def test_gemini_default_is_flash(self) -> None:
+    def test_gemini_default_is_pro(self) -> None:
         root = Path(__file__).resolve().parents[1]
         config = (root / "app" / "config.py").read_text(encoding="utf-8")
         llm = (root / "app" / "llm.py").read_text(encoding="utf-8")
         render = (root / "render.yaml").read_text(encoding="utf-8")
-        self.assertIn('gemini_model: str = "gemini-flash-latest"', config)
+        self.assertIn('gemini_model: str = "gemini-pro-latest"', config)
         self.assertNotIn("gemini-flash-lite-latest", config)
+        self.assertNotIn("gemini-flash-latest", config)
         self.assertNotIn("gemini-flash-lite-latest", llm)
-        self.assertIn("gemini-flash-latest", llm)
-        self.assertIn("gemini-flash-latest", render)
-        self.assertNotIn("gemini-flash-lite-latest", render)
+        self.assertIn("gemini-pro-latest", llm)
+        self.assertIn("gemini-pro-latest", render)
+        self.assertNotIn("gemini-flash-latest", render)
 
     def test_typing_is_on_while_the_reply_is_written(self) -> None:
         import app.twilio_wa as wa

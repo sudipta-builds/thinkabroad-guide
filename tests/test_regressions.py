@@ -5829,6 +5829,20 @@ class DirectIxigoCheckoutTests(unittest.TestCase):
         self.assertEqual(mentioned_places("5th dec"), [])
         self.assertIn("dec", mentioned_places("guwahati to dec"))
 
+    def test_ixigo_book_without_a_time_asks_same_or_different(self) -> None:
+        from app.travel_agent import ixigo_time_question
+
+        state = {**self._ready(), "selected_hint": "14:20", "seller": "google"}
+        asked = ixigo_time_question("book a flight from ghy to delhi 4th dec in ixigo", state)
+        self.assertIn("14:20", asked)
+        self.assertIn("different", asked.lower())
+        self.assertEqual(ixigo_time_question("Ixigo", state), "")
+        self.assertEqual(ixigo_time_question("book the 14:20 from ghy to delhi on ixigo", state), "")
+        self.assertIn(
+            "Send a time",
+            ixigo_time_question("book a flight from ghy to delhi 4th dec in ixigo", self._ready()),
+        )
+
     def test_book_phrase_parses_ghy_delhi_4_dec(self) -> None:
         from app.intent import parse_updates
 

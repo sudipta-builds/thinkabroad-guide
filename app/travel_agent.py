@@ -548,6 +548,31 @@ def handle_turn(
         clear_checkout_memory(state)
         state.pop("selected_hint", None)
         _save(phone, state)
+    time_question = ixigo_time_question(text, state)
+    if time_question:
+        state["awaiting_ixigo_time"] = True
+        state["seller"] = "ixigo"
+        state["preferred_seller"] = "ixigo"
+        state["kernel_seller"] = "ixigo"
+        state.pop("busy_at", None)
+        _save(phone, state)
+        db.add_message(phone, "assistant", time_question)
+        return Reply.of(time_question, emoji="✈️")
+    if state.get("awaiting_ixigo_time"):
+        hinted = _flight_hint(text)
+        if not hinted and re.fullmatch(
+            r"same|that(?: one)?|yes|yep|yeah|ok|okay", (text or "").strip(), re.I
+        ):
+            hinted = str(state.get("selected_hint") or "")
+        if hinted:
+            state.pop("awaiting_ixigo_time", None)
+            state["selected_hint"] = hinted
+            state["seller"] = "ixigo"
+            state["preferred_seller"] = "ixigo"
+            state["kernel_seller"] = "ixigo"
+            if not ixigo_checkout_gaps(state):
+                state["direct_checkout"] = True
+            _save(phone, state)
     step = ixigo_checkout_step(text, state)
     if step:
         from app.kernel_otp import kernel_configured as _kernel_ready
@@ -4288,6 +4313,35 @@ def ixigo_profile_reply(state: dict[str, Any]) -> str:
     )
 
 
+def ixigo_time_question(text: str, state: dict[str, Any]) -> str:
+    """Ask before booking when the Ixigo message names no departure.
+
+    Bare "Ixigo" after a quote confirms that quoted time. A new "book … in ixigo"
+    sentence does not, so a remembered 14:20 must be confirmed or replaced.
+    """
+    raw = (text or "").strip()
+    if _flight_hint(raw) or re.fullmatch(r"ixigo\??", raw, re.I):
+        return ""
+    from app.search import named_seller
+
+    if named_seller(raw) != "ixigo" or not re.search(r"\bbook\b", raw, re.I):
+        return ""
+    if not (state.get("origin") and state.get("destination") and state.get("depart")):
+        return ""
+    hint = str(state.get("selected_hint") or "").strip()
+    if hint:
+        clock = _spoken_clock(hint) or hint
+        return (
+            f"Book the {clock}, or a different departure? "
+            f"Reply {hint} for that one, or send another time. "
+            "I won't open Ixigo until you pick. Nothing paid."
+        )
+    return (
+        "Which departure should I book on Ixigo? Send a time like 14:20. "
+        "I won't choose a flight for you. Nothing paid."
+    )
+
+
 def ixigo_checkout_step(text: str, state: dict[str, Any]) -> str:
     """phone, login, profile, or pay when this message chooses Ixigo. Empty otherwise."""
     raw = (text or "").strip()
@@ -5872,7 +5926,7 @@ def _run_kernel_login(
     if loaded.get("direct_checkout"):
         sellers_to_try = ["ixigo", "ixigo"]
 
-    # No clock yet: read the Ixigo list, keep the cheapest, then book that row.
+    # No clock yet: show the Ixigo list and wait. Do not book the cheapest unseen.
     if loaded.get("direct_checkout") and not hint:
         try:
             preview = begin_login(
@@ -5906,15 +5960,12 @@ def _run_kernel_login(
                 held_state["direct_alt"] = _slim_option(alt_fare)
             else:
                 held_state.pop("direct_alt", None)
-            held_state["selected_hint"] = str(best.get("depart") or "")
             held_state["seller"] = "ixigo"
-            held_state["direct_checkout"] = True
+            held_state.pop("direct_checkout", None)
+            held_state["awaiting_ixigo_time"] = True
             _save(phone, held_state)
-            hint = held_state["selected_hint"]
-            session_id = str(preview.get("session_id") or session_id)
-            chosen_tap = "Book"
-            loaded["selected_hint"] = hint
-            seller = "ixigo"
+            result = preview
+            sellers_to_try = []
         elif preview:
             result = preview
             sellers_to_try = []

@@ -989,6 +989,8 @@ def ixigo_filled_review(text: str) -> bool:
         return False
     if not re.search(r"\bcontinue\b", hay, re.I):
         return False
+    if re.search(r"contact details|gst details", hay, re.I) and re.search(r"fare summary", hay, re.I):
+        return True
     return bool(re.search(r"\breview details\b|billing address", hay, re.I))
 
 

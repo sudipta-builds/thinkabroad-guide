@@ -4285,10 +4285,13 @@ def ixigo_should_require_otp(state: dict[str, Any], text: str) -> bool:
     if on_review and not ixigo_header_needs_login(page) and not indian_national(raw):
         return False
     sent = indian_national(raw)
-    if not sent and not ixigo_header_needs_login(page):
-        return False
     number = sent or indian_national(str(state.get("login_phone") or state.get("phone") or ""))
-    return bool(number) and not ixigo_session_for_number(state, number)
+    if not number or ixigo_session_for_number(state, number):
+        return False
+    # A new mobile, a Log in/Sign up page, or a chosen departure with no proven session.
+    if sent or ixigo_header_needs_login(page) or _flight_hint(raw):
+        return True
+    return False
 
 
 def ixigo_session_for_number(state: dict[str, Any], national: str) -> bool:

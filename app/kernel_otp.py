@@ -828,9 +828,13 @@ def begin_login(
                     from app.page_agent import _click_ixigo_header_login, ixigo_header_needs_login
 
                     text, url = _read_visible(page)
-                    if ixigo_header_needs_login(text):
+                    # A saved mobile must reach the OTP sheet. Click Log in even when
+                    # the fare text did not include the header words.
+                    if require_otp or ixigo_header_needs_login(text):
                         _click_ixigo_header_login(page)
-                        page.wait_for_timeout(800)
+                        page.wait_for_timeout(1000)
+                        text, url = _read_visible(page)
+                        stage = classify_page(text, url, book_count=_book_count(page))
                         hunt_otp = True
                         national = indian_national(explicit) or national
                 if hint and checkout and should_hunt_login(classify_page(*_read_visible(page), book_count=_book_count(page))):
@@ -984,12 +988,30 @@ def begin_login(
                         if send:
                             _click(client, sid, page, send)
                         client.browsers.computer.press_key(sid, keys=["Return"])
-                    for _ in range(30):
+                    for _ in range(45):
                         page = _latest(page)
                         if _otp_visible(page, seller):
                             ok = True
                             break
                         page.wait_for_timeout(400)
+                    if not ok and require_otp:
+                        from app.page_agent import _click_ixigo_header_login, _fill_ixigo_login_phone
+
+                        _click_ixigo_header_login(page)
+                        page.wait_for_timeout(800)
+                        note = _fill_ixigo_login_phone(page, national)
+                        if str(note).startswith("filled_mobile"):
+                            send = _find(page, "send", seller)
+                            if send:
+                                _click(client, sid, page, send)
+                            else:
+                                client.browsers.computer.press_key(sid, keys=["Return"])
+                        for _ in range(30):
+                            page = _latest(page)
+                            if _otp_visible(page, seller):
+                                ok = True
+                                break
+                            page.wait_for_timeout(400)
                 elif should_hunt_login(stage):
                     outcome = {
                         "status": "held",

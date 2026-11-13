@@ -6340,6 +6340,23 @@ class DirectIxigoCheckoutTests(unittest.TestCase):
         }
         self.assertFalse(ixigo_should_require_otp(review, "confirm"))
         self.assertFalse(ixigo_should_require_otp(review, "ixigo"))
+        self.assertFalse(ixigo_should_require_otp(review, "14:20"))
+        unsigned = {
+            "seller": "ixigo",
+            "phone": "8638586171",
+            "login_phone": "+918638586171",
+            "origin": "Guwahati",
+            "destination": "Delhi",
+            "depart": "2026-12-04",
+            "stuck_page": "",
+        }
+        self.assertTrue(ixigo_should_require_otp(unsigned, "14:20"))
+        self.assertFalse(
+            ixigo_should_require_otp(
+                {**unsigned, "kernel_logged_in": "ixigo", "kernel_login_phone": "+918638586171"},
+                "14:20",
+            )
+        )
         from app.travel_agent import ixigo_checkout_step
 
         known = {

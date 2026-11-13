@@ -4690,6 +4690,20 @@ class SellerChoiceAndProxy(unittest.TestCase):
             classify_page(text, "https://www.ixigo.com/flight/booking/1?loginVisible=true"),
             "login",
         )
+        # The same query on a closed drawer must stay the fare list so checkout can book.
+        fares = "Guwahati Delhi 18:20 Book ₹9,763 17:40 Book ₹10,112 Sign in with Google"
+        self.assertEqual(
+            classify_page(
+                fares,
+                "https://www.ixigo.com/search/result/flight?from=GAU&to=DEL&loginVisible=true",
+            ),
+            "results",
+        )
+        toast = "OTP sent Guwahati Delhi 18:20 Book ₹9,763 17:40 Book ₹10,112"
+        self.assertEqual(
+            classify_page(toast, "https://www.ixigo.com/search/result/flight?loginVisible=true"),
+            "results",
+        )
 
     def test_otp_page_stops_without_paying(self) -> None:
         self.assertEqual(classify_page("Enter OTP OTP sent to your mobile Resend OTP", "https://www.ixigo.com/"), "otp")
@@ -4779,9 +4793,28 @@ class SellerChoiceAndProxy(unittest.TestCase):
                 "Guwahati Delhi 18:20 Book 17:40 Book IndiGo Fare"
             )
         )
+        # Ixigo leaves loginVisible=true after the drawer closes onto the fare list.
+        self.assertTrue(
+            _ixigo_otp_finished_on_fares(
+                "Log in/Sign up Guwahati Delhi 18:20 BOOK 17:40 BOOK IndiGo ₹9,763",
+                "https://www.ixigo.com/search/result/flight?from=GAU&to=DEL&loginVisible=true",
+            )
+        )
+        self.assertTrue(
+            _ixigo_otp_finished_on_fares(
+                "OTP sent to your mobile Guwahati 18:20 Book ₹9,763 17:40 Book ₹10,112",
+                "https://www.ixigo.com/search/result/flight?loginVisible=true",
+            )
+        )
         self.assertFalse(
             _ixigo_otp_finished_on_fares(
                 "Enter the OTP sent to your mobile Verify",
+                "https://www.ixigo.com/?loginVisible=true",
+            )
+        )
+        self.assertFalse(
+            _ixigo_otp_finished_on_fares(
+                "Enter the OTP sent to your mobile Verify Book 18:20",
                 "https://www.ixigo.com/?loginVisible=true",
             )
         )

@@ -280,13 +280,24 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
     # Empty Cleartrip/Ixigo search home — before pay. Footer "Payment options" is not checkout.
     if re.search(r"first time flying|popular destinations|where from|search flights", hay, re.I):
         return "home"
+    def _fare_rows() -> bool:
+        body = text or ""
+        return bool(
+            re.search(r"\b\d{1,2}:\d{2}\b", body)
+            and re.search(r"₹\s*[0-9]", body)
+            and (book_count >= 2 or len(re.findall(r"\bbook\b", body, re.I)) >= 2)
+        )
+
     if re.search(
         r"enter otp|enter the otp|otp sent|otp received|verify your mobile|"
         r"one.?time password|resend otp|resend in \d+",
         hay,
         re.I,
     ):
-        return "otp"
+        # A toast left on the fare list is not the code drawer.
+        drawer = bool(re.search(r"enter the otp|verify your mobile|resend otp|resend in \d+", text or "", re.I))
+        if not (_fare_rows() and not drawer):
+            return "otp"
     # Cleartrip contact validation says "Please enter Mobile Number" — that is not login.
     if re.search(r"add contact details|email address", hay, re.I) and re.search(
         r"\+91|continue|review traveller", hay, re.I
@@ -322,7 +333,16 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
     if re.search(r"log in to ixigo|loginVisible=true", hay, re.I) and re.search(
         r"continue|google", hay, re.I
     ) and not re.search(r"fare summary|review & traveller|total amount", hay, re.I):
-        return "login"
+        # Ixigo leaves loginVisible=true on the results URL after the drawer closes.
+        open_drawer = bool(
+            re.search(
+                r"log in to ixigo|enter mobile number|enter the otp|verify your mobile",
+                text or "",
+                re.I,
+            )
+        )
+        if not (_fare_rows() and not open_drawer):
+            return "login"
     if (
         re.search(r"enter mobile number", hay, re.I)
         and re.search(r"continue|google|get otp", hay, re.I)

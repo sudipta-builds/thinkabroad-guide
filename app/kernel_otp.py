@@ -159,16 +159,28 @@ def viewport_click(metrics: dict[str, float], box: dict[str, Any]) -> tuple[int,
 
 
 def _ixigo_otp_finished_on_fares(text: str, url: str = "") -> bool:
-    """The code drawer closed onto the fare list. That is a finished login, not a new code."""
-    if re.search(r"loginVisible=true", url or "", re.I):
-        return False
-    if re.search(
-        r"enter the otp|enter otp|verify your mobile|otp sent|log in to ixigo|enter mobile number",
-        text or "",
-        re.I,
-    ):
-        return False
-    return bool(re.search(r"\bBook\b", text or "") and re.search(r"\b\d{1,2}:\d{2}\b", text or ""))
+    """The code drawer closed onto the fare list. That is a finished login, not a new code.
+
+    Ixigo keeps loginVisible=true on the results URL after the drawer closes.
+    That query, and a Log in header, must not veto a visible fare list.
+    Callers still ignore this while the OTP boxes are on screen: the list
+    behind an open drawer also has Book rows.
+    """
+    del url
+    hay = text or ""
+    drawer = bool(
+        re.search(
+            r"enter the otp|verify your mobile|otp sent to|enter mobile number|log in to ixigo",
+            hay,
+            re.I,
+        )
+    )
+    books = len(re.findall(r"\bbook\b", hay, re.I))
+    clocks = bool(re.search(r"\b\d{1,2}:\d{2}\b", hay))
+    if books >= 1 and clocks and not drawer:
+        return True
+    # Leftover drawer copy in the same text loses to several Book rows.
+    return bool(books >= 2 and clocks)
 
 
 def otp_failure_detail(*, boxes_open: bool, verifying: bool = False) -> str:
@@ -1328,9 +1340,18 @@ def _apply_otp(client, session_id: str, page, seller: str, code: str) -> dict[st
             still = False
             empty_rounds = 0
             continue
-        if _logged_in(page, seller) or (
-            seller == "ixigo" and _ixigo_otp_finished_on_fares(text, _url)
-        ):
+        fares_after_code = False
+        if seller == "ixigo":
+            try:
+                boxes_open = _code_boxes_open(page, seller)
+            except Exception:
+                boxes_open = True
+            if not boxes_open:
+                try:
+                    fares_after_code = _ixigo_otp_finished_on_fares(text, _url) or _book_count(page) >= 2
+                except Exception:
+                    fares_after_code = _ixigo_otp_finished_on_fares(text, _url)
+        if _logged_in(page, seller) or fares_after_code:
             logged = True
             verifying = False
             break
@@ -1366,6 +1387,23 @@ def _apply_otp(client, session_id: str, page, seller: str, code: str) -> dict[st
             # The account name replaces Log in a moment after the spinner. Keep waiting.
             verifying = False
             continue
+    # The list can paint after the last read. One more look before calling it a failed login.
+    if not logged and seller == "ixigo":
+        try:
+            boxes_open = _code_boxes_open(page, seller)
+        except Exception:
+            boxes_open = True
+        if not boxes_open:
+            try:
+                text, _url = _read_visible(page)
+            except Exception:
+                text, _url = "", ""
+            try:
+                on_fares = _ixigo_otp_finished_on_fares(text, _url) or _book_count(page) >= 2
+            except Exception:
+                on_fares = _ixigo_otp_finished_on_fares(text, _url)
+            if on_fares:
+                logged = True
     # Stay on the open flight. A hop to the Ixigo homepage drops the chosen fare
     # and leaves WhatsApp silent until that navigation finishes.
     shot = _shot(page, seller, session_id, "otp-after")

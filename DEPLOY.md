@@ -25,7 +25,7 @@ Branch `main` is pushed.
 | `TWILIO_WHATSAPP_FROM` | Same as ThinkAbroad (or a new Guide number) |
 | `DEEPSEEK_API_KEY` | Same as ThinkAbroad — chat/CV |
 | `GEMINI_API_KEY` | Same as ThinkAbroad `Gemini_API_KEY` — live job search |
-| `GEMINI_MODEL` | `gemini-flash-lite-latest` |
+| `GEMINI_MODEL` | `gemini-flash-latest` |
 | `VAULT_SECRET_KEY` | New long random string (or Render generate) |
 | `GUIDE_DB_PATH` | Prefer `/var/data/guide.db` **only if** you attached a disk at `/var/data`. Otherwise use `data/guide.db` (or omit — Guide falls back automatically). |
 | `PYTHON_VERSION` | `3.12.8` (optional but recommended) |

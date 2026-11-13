@@ -173,7 +173,7 @@ def gemini_chat(prompt: str, *, timeout: float = 8.0, max_tokens: int = 220) -> 
     settings = get_settings()
     if not settings.gemini_api_key:
         return ""
-    model = (settings.gemini_model or "gemini-flash-lite-latest").strip()
+    model = (settings.gemini_model or "gemini-flash-latest").strip()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     body: dict[str, Any] = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -226,7 +226,7 @@ def vision_chat(
         ".webp": "image/webp",
         ".gif": "image/gif",
     }.get(suffix, "image/jpeg")
-    model = (settings.gemini_model or "gemini-flash-lite-latest").strip()
+    model = (settings.gemini_model or "gemini-flash-latest").strip()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     body: dict[str, Any] = {
         "contents": [
@@ -307,7 +307,7 @@ def gemini_search(prompt: str) -> str:
     settings = get_settings()
     if not settings.gemini_api_key:
         return ""
-    model = (settings.gemini_model or "gemini-flash-lite-latest").strip()
+    model = (settings.gemini_model or "gemini-flash-latest").strip()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     body: dict[str, Any] = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],

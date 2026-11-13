@@ -24,7 +24,7 @@ services:
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_MODEL
-        value: gemini-flash-lite-latest
+        value: gemini-flash-latest
       - key: VAULT_SECRET_KEY
         generateValue: true
       - key: GUIDE_PUBLIC_URL

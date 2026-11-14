@@ -265,8 +265,35 @@ def site_error_page(text: str, url: str = "") -> bool:
     return bool(_SITE_ERROR.search(hay))
 
 
+def review_details_confirm_open(page: str) -> bool:
+    """The Review Details confirm dialog is still on screen.
+
+    A payments URL or "amount to be paid" in the same DOM does not close it.
+    The saved-traveller list, which also says Continue, is not this dialog.
+    """
+    from app.step_read import is_name_confirm, is_saved_traveller_sheet
+
+    hay = page or ""
+    if is_name_confirm(hay):
+        return True
+    if not re.search(r"\breview details\b", hay, re.I):
+        return False
+    if not re.search(r"\bconfirm\b", hay, re.I):
+        return False
+    # Saved list / billing uses Continue. A filled name modal still says Confirm.
+    if is_saved_traveller_sheet(hay) and not re.search(r"first\s*&\s*middle\s*name", hay, re.I):
+        return False
+    return bool(
+        re.search(r"first\s*&\s*middle\s*name", hay, re.I)
+        and re.search(r"\blast name\b", hay, re.I)
+        and re.search(r"\b(?:title|mr|ms|mrs|mx)\b", hay, re.I)
+    )
+
+
 def payment_sheet_open(hay: str, stage: str) -> bool:
     """Payment wording counts only on a pay sheet, never on a homepage or a site error."""
+    if review_details_confirm_open(hay):
+        return False
     if re.search(r"first time flying|popular destinations|acting up|go to home", hay or "", re.I):
         return False
     # Contact / traveller contact is never pay — sidebar "Payment options" used to false-trigger.
@@ -334,6 +361,9 @@ def classify_page(text: str, url: str, *, book_count: int = 0) -> str:
         r"enter mobile number|continue|google", hay, re.I
     ) and not re.search(r"verify your mobile|enter the otp|enter otp|otp sent", hay, re.I):
         return "login"
+    # Confirm dialog stays review even when the payments URL is already loaded behind it.
+    if review_details_confirm_open(text or ""):
+        return "review"
     # Empty title / name form beats review stepper copy ("Review & Traveller Details").
     if re.search(r"please select your title|first & middle name|first name|last name", hay, re.I) and re.search(
         r"\bcontinue\b|male|female|title|nationality|mobile", hay, re.I
@@ -3833,6 +3863,9 @@ def _press_confirm_then_addons(page, log: list[str]) -> CheckoutOutcome | None:
         """Dismiss Secure My Trip, skip Add-ons, stop at payment when possible."""
         _dismiss_post_confirm_secure_trip(page, log)
         text, url, stage, facts = _snap()
+        if review_details_confirm_open(text):
+            log.append("confirm_dialog_still_open")
+            return None
         if stage == "pay" or payment_sheet_open(text, stage):
             return _pay_outcome(text, url, stage, facts, why="reached_pay_after_confirm")
         # Sheet may clear onto Add-ons, or still need one forward Continue.
@@ -3880,8 +3913,12 @@ def _press_confirm_then_addons(page, log: list[str]) -> CheckoutOutcome | None:
         return None
 
     text, url, stage, facts = _snap()
+    # The confirm dialog can sit on a page whose URL is already /payments.
+    # Click Confirm. Do not treat that as the pay sheet and do not press Pay.
+    if review_details_confirm_open(text):
+        stage = "review"
     # Already past Confirm (or landed on Add-ons / pay after a prior Continue).
-    if _on_addons_page(text, stage) or stage in {"addons", "pay"} or payment_sheet_open(text, stage):
+    elif _on_addons_page(text, stage) or stage in {"addons", "pay"} or payment_sheet_open(text, stage):
         walked = _after_confirm_walk()
         if walked is not None:
             return walked
@@ -3891,7 +3928,7 @@ def _press_confirm_then_addons(page, log: list[str]) -> CheckoutOutcome | None:
         log.append("reached_addons_after_confirm")
         return None
 
-    if not (is_name_confirm(text) or stage == "name_confirm"):
+    if not (is_name_confirm(text) or stage == "name_confirm" or review_details_confirm_open(text)):
         # Confirm already gone; Secure My Trip may be the next sheet.
         if _ixigo_buy_this_visible(page):
             walked = _after_confirm_walk()
@@ -6341,6 +6378,24 @@ def run_checkout_agent(
         page = _latest(page)
         text, url, stage, facts = _snapshot()
         log.append(f"{step}:stage:{stage}")
+        # Review Details confirm dialog: press Confirm, skip add-ons, stop. Never Pay.
+        if seller == "ixigo" and review_details_confirm_open(text):
+            tries = sum(1 for line in log if line.startswith("review_confirm_click"))
+            if tries < 2:
+                walked = _press_confirm_then_addons(page, log)
+                log.append(f"review_confirm_click:{int(walked is not None)}")
+                if walked is not None:
+                    return walked
+                continue
+            return CheckoutOutcome(
+                "review",
+                text,
+                url,
+                log,
+                facts=facts,
+                checks=checks,
+                handoff="Review Details is still open. Confirm is not payment. Nothing charged.",
+            )
         # Saved travellers are already on the review. Tick one and Continue to payment.
         if seller == "ixigo" and ixigo_saved_traveller_sheet(text):
             tries = sum(1 for line in log if line.startswith("saved_traveller_advance"))

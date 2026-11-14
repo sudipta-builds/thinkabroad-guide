@@ -6159,7 +6159,7 @@ class DirectIxigoCheckoutTests(unittest.TestCase):
         lines = checkout_ready_lines(self._ready(), page)
         self.assertIn(
             "Ready to pay on Ixigo, nothing charged. Cheapest on 4 Dec: IndiGo, "
-            "leaves Guwahati 9:10 AM, lands Delhi 12:00 PM, nonstop. "
+            "leaves Guwahati 9:10 AM, lands Delhi 12:00 PM, nonstop, Sudipta Saikia. "
             "Total Rs 10,328 (GST and convenience fee included, after a Rs 450 saving).",
             lines[0],
         )
@@ -6198,6 +6198,123 @@ class DirectIxigoCheckoutTests(unittest.TestCase):
         self.assertNotIn("8,190", " ".join(lines))
         self.assertIn("Approve Rs 10,328", lines[-1])
         self.assertTrue(any("Air India Express" in line for line in lines))
+
+    def test_payment_page_phrase_does_not_replace_the_saved_name(self) -> None:
+        from app.travel_agent import absorb_details, wants_payment_page
+
+        saved = {"name": "Sudipta Saikia", "phone": "8638586171"}
+        for phrase in ("paymnet page", "payment page", "show the payment page"):
+            got = absorb_details(saved, phrase)
+            self.assertEqual(got.get("name"), "Sudipta Saikia", phrase)
+            self.assertEqual(got.get("phone"), "8638586171", phrase)
+            self.assertTrue(wants_payment_page(phrase), phrase)
+        named = absorb_details(saved, "my name is Sudipta Saikia, open the payment page")
+        self.assertEqual(named.get("name"), "Sudipta Saikia")
+        self.assertTrue(wants_payment_page("open the payment page"))
+        fresh = absorb_details({}, "Sudipta Saikia")
+        self.assertEqual(fresh.get("name"), "Sudipta Saikia")
+        refused = absorb_details({}, "my name is paymnet page")
+        self.assertNotIn("name", refused)
+
+    def test_review_details_confirm_is_not_ready_to_pay(self) -> None:
+        from app.page_agent import classify_page, payment_sheet_open, review_details_confirm_open
+        from app.travel_agent import _checkout_summary_open
+
+        dialog = (
+            "Review & Traveller Details Review Details Title Mr "
+            "First & Middle Name Sudipta Last Name Saikia "
+            "Adult 1 - Sudipta Saikia Edit Confirm "
+            "Fare total ₹9,813 Amount to be paid ₹10,328 "
+            "Pay via any UPI app Credit/Debit card"
+        )
+        pay_url = (
+            "https://www.ixigo.com/payments/view/home/1/0/1M7B99"
+            "?flowType=PAYMENT_SDK&productType=FLIGHT"
+        )
+        self.assertTrue(review_details_confirm_open(dialog))
+        self.assertEqual(classify_page(dialog, pay_url), "review")
+        self.assertFalse(payment_sheet_open(dialog, "pay"))
+        self.assertFalse(_checkout_summary_open(dialog, "pay"))
+        self.assertFalse(_checkout_summary_open(dialog, "review"))
+        saved_list = (
+            "Review Details Traveller Details Adult 1 Mr Sudipta Saikia Ms Anita Continue Confirm"
+        )
+        self.assertFalse(review_details_confirm_open(saved_list))
+        real_pay = "Amount To Be Paid ₹10,328 Pay via any UPI app Credit/Debit card"
+        self.assertFalse(review_details_confirm_open(real_pay))
+        self.assertTrue(payment_sheet_open(real_pay, "pay"))
+        self.assertTrue(_checkout_summary_open(real_pay, "pay"))
+
+    def test_caption_quotes_the_fare_and_name_on_the_sheet(self) -> None:
+        from app.travel_agent import checkout_ready_lines
+
+        page = (
+            "Review Details Title Mr First & Middle Name Sudipta Last Name Saikia "
+            "Adult 1 - Sudipta Saikia Confirm Edit "
+            "Your Flight Fri, 07 Dec IndiGo 18:20 GAU 21:05 DEL Non-Stop "
+            "Fare total ₹9,813 base ₹8,241 taxes ₹2,022 instant off ₹450 "
+            "Amount to be paid ₹10,328 Pay via any UPI app"
+        )
+        state = {
+            **self._ready(),
+            "depart": "2026-12-07",
+            "direct_pick": {
+                "airline": "IndiGo",
+                "depart": "18:20",
+                "arrive": "21:05",
+                "stops": "Non-stop",
+                "price_n": 10328,
+            },
+            "last_vision": {"kind": "pay", "best_price": "₹10,328", "what": "payment page"},
+        }
+        lines = checkout_ready_lines(state, page)
+        blob = " ".join(lines)
+        self.assertIn("Sudipta Saikia", lines[0])
+        self.assertIn("Rs 9,813", lines[0])
+        self.assertIn("Approve Rs 9,813", lines[-1])
+        self.assertNotIn("10,328", blob)
+        self.assertNotIn("Paymnet", blob)
+        loose = "IndiGo 18:20 GAU 21:05 DEL Non-Stop Total ₹10,328"
+        seen = checkout_ready_lines(
+            {**self._ready(), "depart": "2026-12-07", "last_vision": {"best_price": "₹9,813", "kind": "review"}},
+            loose,
+        )
+        self.assertIn("Rs 9,813", seen[0])
+        self.assertNotIn("10,328", " ".join(seen))
+
+    def test_confirm_dialog_does_not_attach_the_payments_url(self) -> None:
+        from unittest.mock import patch
+
+        from app.travel_agent import attach_shot_page_links
+        from app.vision_agent import classify_with_vision
+
+        dialog = (
+            "Review Details Title Mr First & Middle Name Sudipta Last Name Saikia "
+            "Adult 1 - Sudipta Saikia Edit Confirm Fare total ₹9,813"
+        )
+        pay_url = (
+            "https://www.ixigo.com/payments/view/home/1/0/1M7B99"
+            "?showHeader=true&flowType=PAYMENT_SDK&productType=FLIGHT"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            shot = Path(tmp) / "review.jpg"
+            shot.write_bytes(b"x" * 300)
+            Path(str(shot) + ".url").write_text(pay_url, encoding="utf-8")
+            held = attach_shot_page_links("Review Details is still open.", [shot], page=dialog)
+            self.assertNotIn("http", held)
+            self.assertNotIn("payments", held)
+            search = "https://www.ixigo.com/search/result/flight?from=GAU&to=DEL"
+            Path(str(shot) + ".url").write_text(search, encoding="utf-8")
+            kept = attach_shot_page_links("The fare list.", [shot], page=dialog)
+            self.assertTrue(kept.endswith(search))
+            opened = attach_shot_page_links("Ready to pay on Ixigo, nothing charged.", [shot], page="")
+            self.assertTrue(opened.endswith(search))
+        with patch("app.vision_agent.see_step", return_value={"kind": "pay", "best_price": "₹10,328", "tap": "Pay", "auto": "1"}):
+            stage, seen = classify_with_vision("pay", "missing.jpg", page_text=dialog)
+        self.assertEqual(stage, "review")
+        self.assertEqual((seen or {}).get("kind"), "review")
+        self.assertEqual((seen or {}).get("tap"), "Confirm")
+        self.assertNotEqual((seen or {}).get("tap"), "Pay")
 
     def test_a_time_after_google_asks_the_three_book_sites(self) -> None:
         from app.travel_agent import _hold_live, _live_hold_reply, _quote_time_after_search

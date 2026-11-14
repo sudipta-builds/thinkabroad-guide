@@ -394,7 +394,7 @@ def classify_with_vision(
         "fare_sheet": "fare_sheet",
     }
     mapped = stage_map.get(kind, dom_stage)
-    from app.page_agent import site_error_page
+    from app.page_agent import review_details_confirm_open, site_error_page
     from app.step_read import addons_sheet
 
     if site_error_page(page_text or "", ""):
@@ -403,6 +403,12 @@ def classify_with_vision(
         seen["recommend"] = "start fresh or search again"
         seen["tap"] = ""
         return "error", seen
+    # Vision may name the step. It must not turn an open Confirm dialog into pay.
+    if review_details_confirm_open(page_text or ""):
+        seen["kind"] = "review"
+        seen["tap"] = "Confirm"
+        seen["auto"] = ""
+        return "review", seen
     if re.search(r"review your itinerary", page_text or "", re.I):
         seen["kind"] = "review"
         seen["tap"] = "Continue" if re.search(r"\bcontinue\b", page_text or "", re.I) else seen.get("tap") or ""

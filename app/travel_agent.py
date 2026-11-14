@@ -2922,6 +2922,16 @@ def _looks_like_birth_depart(depart: str, dob: str = "") -> bool:
     return year < 2016
 
 
+def _payment_page_name(candidate: str) -> bool:
+    """A payment-page request is not a passenger name, even with a typo like paymnet."""
+    text = re.sub(r"\s+", " ", (candidate or "")).strip(" .")
+    if not text:
+        return False
+    if wants_payment_page(text):
+        return True
+    return bool(re.search(r"\bpaym\w{0,6}\s+page\b", text, re.I))
+
+
 def absorb_details(state: dict[str, Any], text: str) -> dict[str, Any]:
     data = dict(state)
     raw = text or ""
@@ -2950,14 +2960,19 @@ def absorb_details(state: dict[str, Any], text: str) -> dict[str, Any]:
         data["gender"] = gender.group(1).title()
     name = _NAME.search(raw)
     if name:
-        data["name"] = name.group(1).strip(" .")
-    else:
+        captured = name.group(1).strip(" .")
+        # "my name is Sudipta" still wins. "my name is paymnet page" does not.
+        if not _payment_page_name(captured):
+            data["name"] = captured
+    elif not wants_payment_page(raw):
         head = re.split(r"[,;|]", _EMAIL.sub(" ", raw), maxsplit=1)[0]
         head = _DOB.sub(" ", head)
         head = _GENDER.sub(" ", head)
         words = re.findall(r"[A-Za-z]{2,}", head)
         if 2 <= len(words) <= 4:
-            data["name"] = " ".join(word.title() for word in words)
+            candidate = " ".join(word.title() for word in words)
+            if not _payment_page_name(candidate):
+                data["name"] = candidate
         else:
             leftover = _GENDER.sub(" ", _DOB.sub(" ", _EMAIL.sub(" ", raw)))
             leftover = re.sub(r"[,;|/]+", " ", leftover)
@@ -2965,7 +2980,7 @@ def absorb_details(state: dict[str, Any], text: str) -> dict[str, Any]:
             titled = re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}", leftover) or re.fullmatch(
                 r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}", raw.strip()
             )
-            if titled:
+            if titled and not _payment_page_name(titled.group(0)):
                 data["name"] = titled.group(0)
     if _looks_like_birth_depart(str(data.get("depart") or ""), str(data.get("dob") or "")):
         data["depart"] = "2026-12-04"
@@ -3534,6 +3549,80 @@ def _arm_direct_ixigo_checkout(state: dict[str, Any], text: str) -> None:
         state.pop("selected_hint", None)
 
 
+def _vision_rupees(raw: str) -> int:
+    """A price the screenshot reader reported. Too small to be a fare is ignored."""
+    match = re.search(r"([0-9][0-9,]{2,})", str(raw or ""))
+    if not match:
+        return 0
+    amount = int(re.sub(r"[^\d]", "", match.group(1)) or "0")
+    return amount if amount >= 3000 else 0
+
+
+def _labelled_payable(page: str) -> int:
+    """The total printed on the sheet. Fare total wins over a different DOM figure."""
+    fare_total = _first_inr(page, r"fare\s+total\s*(?:₹|rs\.?)?\s*([0-9,]{3,})")
+    if fare_total:
+        return fare_total
+    return _first_inr(
+        page,
+        r"(?:amount to be paid|total\s+amount|you pay)\s*(?:₹|rs\.?)?\s*([0-9,]{4,})",
+    )
+
+
+def _clip_person(name: str) -> str:
+    clipped = re.split(
+        r"\b(?:fare|total|amount|review|confirm|continue|edit|adult|base|taxes|phone|email|pay)\b",
+        name or "",
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    clipped = re.sub(r"\s+", " ", clipped).strip(" .,-")
+    words = [word for word in clipped.split() if word]
+    if not 2 <= len(words) <= 4 or any(re.search(r"\d", word) for word in words):
+        return ""
+    return " ".join(words)
+
+
+def _visible_traveller(page: str) -> str:
+    """The traveller name printed on the sheet, not a name stored from an earlier turn."""
+    text = page or ""
+    fields = re.search(
+        r"First\s*&\s*Middle\s*Name\s+([A-Za-z][A-Za-z']+(?:\s+[A-Za-z][A-Za-z']+){0,2})"
+        r"\s+Last\s*Name\s+([A-Za-z][A-Za-z']+)",
+        text,
+        re.I,
+    )
+    if fields:
+        shown = _clip_person(f"{fields.group(1)} {fields.group(2)}")
+        if shown:
+            return shown
+    chip = re.search(
+        r"Adult\s*1\s*[-–—:]\s*((?:Mr|Ms|Mrs|Mx)\.?\s+)?"
+        r"([A-Za-z][A-Za-z']+(?:\s+[A-Za-z][A-Za-z']+){0,3})",
+        text,
+        re.I,
+    )
+    if chip:
+        shown = _clip_person(f"{chip.group(1) or ''} {chip.group(2)}")
+        if shown:
+            return shown
+    listed = re.search(
+        r"Travellers?\s+\d+\.\s*((?:Mr|Ms|Mrs|Mx)\.?\s+)?([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})",
+        text,
+    )
+    if listed:
+        shown = _clip_person(f"{listed.group(1) or ''} {listed.group(2)}")
+        if shown:
+            return shown
+    titled = re.search(
+        r"\b((?:Mr|Ms|Mrs|Mx)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b",
+        text,
+    )
+    if titled:
+        return _clip_person(titled.group(1))
+    return ""
+
+
 def checkout_ready_lines(state: dict[str, Any], page: str = "") -> list[str]:
     """WhatsApp bubbles once Ixigo is on the fare summary and nothing is charged."""
     pick = dict(state.get("direct_pick") or {}) if isinstance(state.get("direct_pick"), dict) else {}
@@ -3578,13 +3667,17 @@ def checkout_ready_lines(state: dict[str, Any], page: str = "") -> list[str]:
             via = f", {pick.get('stops')}"
         else:
             via = ""
-    total = _first_inr(
-        page,
-        r"(?:amount to be paid|total(?:\s+amount|\s+fare)?|you pay)\s*₹?\s*([0-9,]{4,})",
-    )
+    # Labelled fare total is what the screenshot shows. Do not replace it with a
+    # larger stray DOM price, a stored list fare, or a vision price that disagrees.
+    total = _labelled_payable(page)
+    if not total:
+        vision = state.get("last_vision") if isinstance(state.get("last_vision"), dict) else {}
+        total = _vision_rupees(str(vision.get("best_price") or ""))
     if not total:
         amounts = [n for n in prices_in(page) if n >= 3000]
         total = max(amounts) if amounts else int(pick.get("price_n") or 0)
+    who = _visible_traveller(page)
+    who_bit = f", {who}" if who else ""
     fee = _first_inr(page, r"(?:convenience|ixigo|service)\s+fee\s*₹?\s*([0-9,]{2,})")
     if not fee:
         fee = _first_inr(page, r"\bfee\s*₹\s*([0-9,]{2,})")
@@ -3609,7 +3702,7 @@ def checkout_ready_lines(state: dict[str, Any], page: str = "") -> list[str]:
     ready = re.sub(
         r"\s+",
         " ",
-        f"Ready to pay on Ixigo, nothing charged. Cheapest{when_bit}: {airline}, {leaves}{lands}{via}.{total_bit}{bag_bit}",
+        f"Ready to pay on Ixigo, nothing charged. Cheapest{when_bit}: {airline}, {leaves}{lands}{via}{who_bit}.{total_bit}{bag_bit}",
     ).strip()
     lines = [ready]
     list_price = int(pick.get("price_n") or 0)
@@ -3678,8 +3771,11 @@ def _checkout_summary_open(page: str, shown: str) -> bool:
         re.I,
     ):
         return False
-    from app.page_agent import _on_addons_page, payment_sheet_open
+    from app.page_agent import _on_addons_page, payment_sheet_open, review_details_confirm_open
 
+    # Confirm is still on screen. Pay-sheet words behind the dialog are not payment.
+    if review_details_confirm_open(page):
+        return False
     # Seat map still has a fare summary sidebar. That is not the payment page.
     if _on_addons_page(page, shown):
         return False
@@ -3728,12 +3824,16 @@ def _send_checkout_ready(
     secrets: list[str],
     shots: list[str] | None,
 ) -> None:
+    from app.page_agent import review_details_confirm_open
+
+    if review_details_confirm_open(page):
+        return
     lines = checkout_ready_lines(state, page)
     if not lines:
         return
-    # Screenshot first, then the fare recommendation under it.
-    _deliver(phone, "Ready to pay on Ixigo, nothing charged.", None, secrets, shot_paths=shots)
-    for line in lines:
+    # The bubble with the screenshot names the traveller and the fare on that shot.
+    _deliver(phone, lines[0], None, secrets, shot_paths=shots, page=page)
+    for line in lines[1:]:
         _deliver(phone, line, None, secrets)
 
 
@@ -5564,9 +5664,7 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
     state = _load(phone)
     signed_in = str(result.get("status") or "") == "already_logged_in"
     page_url = str(result.get("url") or "")
-    from app.page_agent import classify_page
-
-    from app.page_agent import payment_sheet_open, site_error_page
+    from app.page_agent import classify_page, payment_sheet_open, review_details_confirm_open, site_error_page
 
     shown = classify_page(text, page_url)
     if site_error_page(text, page_url):
@@ -5596,6 +5694,7 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
                         "what": vision_seen.get("what") or "",
                         "tap": vision_seen.get("tap") or "",
                         "recommend": vision_seen.get("recommend") or "",
+                        "best_price": vision_seen.get("best_price") or "",
                         "shot": shot,
                     }
         except Exception:
@@ -5610,6 +5709,8 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
             state.pop("stuck_kind", None)
     if site_error_page(text, page_url):
         shown = "error"
+    if review_details_confirm_open(text):
+        shown = "review"
     if str(result.get("status") or "") in {"already_logged_in", "held"}:
         if shown in {"home", "cookie", "login", "otp", "error"}:
             state.pop("kernel_logged_in", None)
@@ -5651,7 +5752,7 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
             "The fare list didn't finish. The screenshot is the page."
         )
         intro = f"You're already logged in on {label}.\n" if signed_in else ""
-        _deliver(phone, f"{intro}{body}", None, secrets, shot_paths=shots)
+        _deliver(phone, f"{intro}{body}", None, secrets, shot_paths=shots, page=text)
         return
     state["stuck_page"] = text[:4000]
     state["stage"] = remember_booking_page(state, seller, page_url, text)
@@ -5678,7 +5779,7 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         state["last_stuck"] = spoken
         state.pop("live", None)
         _save(phone, state)
-        _deliver(phone, spoken, None, secrets, shot_paths=shots)
+        _deliver(phone, spoken, None, secrets, shot_paths=shots, page=text)
         return
     if shown == "error" or site_error_page(text, page_url):
         # Prefer silent reopen from _run_kernel_login; never WhatsApp the stumped sheet.
@@ -5732,7 +5833,7 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         if shown:
             state["stuck_kind"] = shown
         _save(phone, state)
-        _deliver(phone, first_note[:500], None, secrets, shot_paths=shots)
+        _deliver(phone, first_note[:500], None, secrets, shot_paths=shots, page=text)
         return
     # Confirm → No Thanks → Add-ons may log reached_addons then keep walking to pay.
     # Prefer payment / left-addons handoff over a sticky "reached add-ons" ask.
@@ -5741,6 +5842,13 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         notes,
         re.I,
     ):
+        if review_details_confirm_open(text):
+            spoken = "Review Details is still open. Nothing charged."
+            state["stuck_kind"] = "review"
+            state["last_stuck"] = spoken
+            _save(phone, state)
+            _deliver(phone, spoken, None, secrets, shot_paths=shots, page=text)
+            return
         state["stage"] = "payment"
         state["stuck_kind"] = "pay"
         state.pop("pending_step", None)
@@ -5763,7 +5871,7 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         )
         state["last_stuck"] = spoken[:500]
         _save(phone, state)
-        _deliver(phone, spoken[:500], None, secrets, shot_paths=shots)
+        _deliver(phone, spoken[:500], None, secrets, shot_paths=shots, page=text)
         return
     if re.search(r"reached_addons_after_confirm|^Reached the Add-ons page", notes, re.I):
         # Auto-skip is in progress (post-confirm No Thanks / leave add-ons) — don't ask the user.
@@ -5793,14 +5901,14 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
                 state["last_stuck"] = spoken[:500]
                 state.pop("pending_step", None)
                 _save(phone, state)
-                _deliver(phone, spoken[:500], None, secrets, shot_paths=shots)
+                _deliver(phone, spoken[:500], None, secrets, shot_paths=shots, page=text)
                 return
     if notes.startswith("Skip add-ons is on screen") and shown in {"addons", ""}:
         spoken = notes.split(" | ")[0][:500]
         state["stuck_kind"] = "addons"
         state["last_stuck"] = spoken
         _save(phone, state)
-        _deliver(phone, spoken, None, secrets, shot_paths=shots)
+        _deliver(phone, spoken, None, secrets, shot_paths=shots, page=text)
         return
     filled = (
         re.search(r"first:(?:ok|typed)\b", notes)
@@ -5829,7 +5937,7 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         state["last_stuck"] = spoken
         shots = _form_ask_shots(state, shots)
         _save(phone, state)
-        _deliver(phone, spoken, None, secrets, shot_paths=shots)
+        _deliver(phone, spoken, None, secrets, shot_paths=shots, page=text)
         return
     report = contact_report(notes, text)
     correction = field_correction_line(state, text)
@@ -5841,7 +5949,7 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         shots = _form_ask_shots(state, shots)
         state["last_stuck"] = correction[:500]
         _save(phone, state)
-        _deliver(phone, correction, None, secrets, shot_paths=shots)
+        _deliver(phone, correction, None, secrets, shot_paths=shots, page=text)
         return
     from app.step_read import form_sheet as _form_open
 
@@ -5858,7 +5966,7 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         shots = _form_ask_shots(state, shots)
         state["last_stuck"] = asked[:500]
         _save(phone, state)
-        _deliver(phone, asked, None, secrets, shot_paths=shots)
+        _deliver(phone, asked, None, secrets, shot_paths=shots, page=text)
         return
     _save(phone, state)
     waiting = _form_ask_if_needed(state)
@@ -5907,7 +6015,7 @@ def _deliver_signed_in_page(phone: str, seller: str, result: dict[str, Any], sec
         if shots and "screenshot" not in spoken.lower():
             spoken = spoken.rstrip() + " The screenshot is this page."
     _save(phone, state)
-    _deliver(phone, spoken, None, secrets, shot_paths=shots)
+    _deliver(phone, spoken, None, secrets, shot_paths=shots, page=text)
 
 
 def _kernel_result_is_site_error(result: dict[str, Any]) -> bool:
@@ -6273,7 +6381,7 @@ def _run_kernel_login(
                 _deliver(phone, spoken, None, secrets)
             else:
                 shots = [result["screenshot"]] if result.get("screenshot") else None
-                _deliver(phone, spoken, None, secrets, shot_paths=shots)
+                _deliver(phone, spoken, None, secrets, shot_paths=shots, page=page)
         else:
             from app.kernel_otp import kernel_failure_line
 
@@ -6871,14 +6979,25 @@ def _fit_message_with_page_links(spoken: str, limit: int = 3900) -> str:
     return body[:room].rstrip() + extra
 
 
-def attach_shot_page_links(spoken: str, shot_paths: list[str | Path]) -> str:
-    """Add the URL captured with each screenshot. Other links stay stripped."""
+_IXIGO_PAYMENT_URL = re.compile(r"ixigo\.com/payments/|/payments/view/|flowType=PAYMENT", re.I)
+
+
+def attach_shot_page_links(spoken: str, shot_paths: list[str | Path], *, page: str = "") -> str:
+    """Add the URL captured with each screenshot. Other links stay stripped.
+
+    A payments URL stays off the message while the Review Details confirm dialog
+    is still the screen in the shot.
+    """
+    from app.page_agent import review_details_confirm_open
     from app.vision_agent import shot_page_url
 
+    hold_payment = review_details_confirm_open(page)
     links: list[str] = []
     body = spoken or ""
     for raw in shot_paths or []:
         link = shot_page_url(raw)
+        if hold_payment and link and _IXIGO_PAYMENT_URL.search(link):
+            continue
         if link and link not in links and link not in body:
             links.append(link)
     if not links:
@@ -6894,6 +7013,7 @@ def _deliver(
     session: BrowserSession | None,
     secrets: list[str],
     shot_paths: list[str] | None = None,
+    page: str = "",
 ) -> None:
     from app.reply import for_send, strip_leading_emoji
     from app.twilio_wa import inbound_sid, send_reaction, send_whatsapp
@@ -6917,7 +7037,7 @@ def _deliver(
         if public:
             urls.append(public)
     if had_shot:
-        spoken = attach_shot_page_links(spoken, shot_files)
+        spoken = attach_shot_page_links(spoken, shot_files, page=page)
     if had_shot and not urls:
         spoken += "\nI have the live screenshot, but this server has no public URL set, so WhatsApp cannot show the image."
         logger.warning("Screenshot saved but GUIDE_PUBLIC_URL is empty")
